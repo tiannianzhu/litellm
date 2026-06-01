@@ -9,6 +9,7 @@ import litellm
 from litellm._logging import print_verbose, verbose_logger
 from litellm.constants import (
     MAX_S3_OBJECT_DOWNLOAD_FILENAME_BYTES,
+    MAX_S3_OBJECT_FILE_NAME_BYTES,
     MAX_S3_OBJECT_KEY_BYTES,
     S3_BOUNDED_OBJECT_KEY_HEAD_BYTES,
     S3_PREFIX_DIGEST_CHARS,
@@ -255,7 +256,10 @@ def get_s3_object_key(
     date_segment: Final = start_time.strftime("%Y-%m-%d") + "/"
     # we need the s3 key to include the time, so we log cache hits too
     s3_object_key: Final = configured_prefix + date_segment + sanitized_s3_file_name + ".json"
-    if len(s3_object_key.encode("utf-8")) <= MAX_S3_OBJECT_KEY_BYTES:
+    if (
+        len(s3_object_key.encode("utf-8")) <= MAX_S3_OBJECT_KEY_BYTES
+        and len((sanitized_s3_file_name + ".json").encode("utf-8")) <= MAX_S3_OBJECT_FILE_NAME_BYTES
+    ):
         return s3_object_key
 
     # shorten the response id first and only trim the configured prefix if that is what does not
