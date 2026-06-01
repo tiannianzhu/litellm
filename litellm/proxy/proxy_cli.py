@@ -1358,6 +1358,12 @@ def run_server(
                         flush=True,
                     )
                     sys.exit(1)
+            from litellm.proxy.db.prisma_client import should_update_prisma_schema
+
+            disable_schema_update: Final = general_settings.get("disable_prisma_schema_update")
+            should_update_schema: Final = should_update_prisma_schema(
+                disable_schema_update if isinstance(disable_schema_update, (bool, str)) else None
+            )
             from litellm.secret_managers.main import get_secret
 
             env_disable_prepared_statements: Final = token_auth_flag_enabled(
@@ -1439,65 +1445,58 @@ def run_server(
             )
             from litellm_proxy_extras.prisma_toolchain import prisma_cli_available
 
-            is_prisma_runnable: Final = prisma_cli_available()
+            is_prisma_runnable: Final = prisma_cli_available() if should_update_schema else None
 
-            if is_prisma_runnable:
-                from litellm.proxy.db.check_migration import check_prisma_schema_diff
-                from litellm.proxy.db.prisma_client import (
-                    PrismaManager,
-                    should_update_prisma_schema,
+            if is_prisma_runnable is True:
+                from litellm.proxy.db.prisma_client import PrismaManager
+
+                use_v2_resolver: Final = resolve_v2_migration_resolver(
+                    use_legacy_flag=use_legacy_migration_resolver,
+                    env_value=os.getenv("USE_V2_MIGRATION_RESOLVER"),
                 )
-
-                if should_update_prisma_schema(general_settings.get("disable_prisma_schema_update")) is False:
-                    check_prisma_schema_diff(db_url=None)
-                else:
-                    use_v2_resolver: Final = resolve_v2_migration_resolver(
-                        use_legacy_flag=use_legacy_migration_resolver,
-                        env_value=os.getenv("USE_V2_MIGRATION_RESOLVER"),
+                if deprecated_v2_flag_passed_on_cli() and use_v2_resolver:
+                    print(
+                        "\033[1;33mLiteLLM Proxy: --use_v2_migration_resolver is "
+                        "deprecated and has no effect, because the v2 migration "
+                        "resolver is now the default. You can safely remove it. To "
+                        "opt back into the legacy v1 resolver, pass "
+                        "--use_legacy_migration_resolver.\033[0m"
                     )
-                    if deprecated_v2_flag_passed_on_cli() and use_v2_resolver:
-                        print(
-                            "\033[1;33mLiteLLM Proxy: --use_v2_migration_resolver is "
-                            "deprecated and has no effect, because the v2 migration "
-                            "resolver is now the default. You can safely remove it. To "
-                            "opt back into the legacy v1 resolver, pass "
-                            "--use_legacy_migration_resolver.\033[0m"
-                        )
-                    if not use_v2_resolver:
-                        print(
-                            "\033[1;33mLiteLLM Proxy: Using the legacy (v1) migration "
-                            "resolver. It performs the diff-and-force recovery that can "
-                            "cause schema thrashing during rolling deploys where two "
-                            "LiteLLM versions contend for the same DB.\033[0m"
-                        )
-                    try:
-                        migrated: Final = PrismaManager.setup_database(
-                            use_migrate=not use_prisma_db_push,
-                            use_v2_resolver=use_v2_resolver,
-                        )
-                        setup_ok: Final = migrated and (
-                            not skip_server_startup or PrismaManager.build_request_log_indexes()
-                        )
-                        if migrated and not skip_server_startup:
-                            PrismaManager.start_request_log_index_build()
-                    except RuntimeError as e:
-                        # Raised on unrecoverable migration errors: the v2
-                        # resolver's non-idempotent failures and permission
-                        # issues, and any `prisma db push` against a
-                        # partitioned LiteLLM_SpendLogs.
-                        print(
-                            f"\033[1;31mLiteLLM Proxy: Database migration cannot proceed. {e}\033[0m",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        sys.exit(2)
-                    if not setup_ok:
-                        print(
-                            "\033[1;31mLiteLLM Proxy: Database setup failed after multiple retries. "
-                            "The proxy cannot start safely. Please check your database connection and migration status.\033[0m"
-                        )
-                        sys.exit(1)
-            else:
+                if not use_v2_resolver:
+                    print(
+                        "\033[1;33mLiteLLM Proxy: Using the legacy (v1) migration "
+                        "resolver. It performs the diff-and-force recovery that can "
+                        "cause schema thrashing during rolling deploys where two "
+                        "LiteLLM versions contend for the same DB.\033[0m"
+                    )
+                try:
+                    migrated: Final = PrismaManager.setup_database(
+                        use_migrate=not use_prisma_db_push,
+                        use_v2_resolver=use_v2_resolver,
+                    )
+                    setup_ok: Final = migrated and (
+                        not skip_server_startup or PrismaManager.build_request_log_indexes()
+                    )
+                    if migrated and not skip_server_startup:
+                        PrismaManager.start_request_log_index_build()
+                except RuntimeError as e:
+                    # Raised on unrecoverable migration errors: the v2
+                    # resolver's non-idempotent failures and permission
+                    # issues, and any `prisma db push` against a
+                    # partitioned LiteLLM_SpendLogs.
+                    print(
+                        f"\033[1;31mLiteLLM Proxy: Database migration cannot proceed. {e}\033[0m",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(2)
+                if not setup_ok:
+                    print(
+                        "\033[1;31mLiteLLM Proxy: Database setup failed after multiple retries. "
+                        "The proxy cannot start safely. Please check your database connection and migration status.\033[0m"
+                    )
+                    sys.exit(1)
+            elif is_prisma_runnable is False:
                 print(
                     "\033[1;31mLiteLLM Proxy: a database URL is set but the prisma CLI is neither on PATH nor importable "
                     "as a package, so the database cannot be set up. Install it with `pip install 'litellm[extra_proxy]'` "
@@ -1519,10 +1518,10 @@ def run_server(
                 )
                 sys.exit(1)
             export_pooled_database_url(pooled_database_url)
-        if port == 4000 and ProxyInitializationHelpers.is_port_in_use(port):
-            port = random.randint(1024, 49152)
         if prometheus_metrics_port == port:
             raise click.UsageError("--prometheus_metrics_port must differ from --port")
+        if port == 4000 and ProxyInitializationHelpers.is_port_in_use(port):
+            port = random.randint(1024, 49152)
 
         import litellm
 

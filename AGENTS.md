@@ -56,6 +56,10 @@ Python max line length is 120, not 88
 
 The four lint gates (`scripts/ruff_strict_gate.py`, `scripts/type_discipline_gate.py`, `scripts/test_quality_gate.py`, `scripts/type_check_gate.py`) compare each rule's codebase count on your branch against the count at its merge-base with the default branch, and a rule may not grow. There are no budget files to edit or ratchet: when a gate fails, fix the violations the branch introduced or remove at least as many of that rule elsewhere in the tree. The one exception is `reportAny` / `reportExplicitAny`, which share a fixed codebase-wide cap in `ANY_CAPS` in `scripts/type_check_gate.py` because Any spreads past the lines you touch. A branch may add Anys while the total stays under that cap. Only lower `ANY_CAPS`, and only in its own PR to the default branch, never raise it on a feature branch
 
+For this fork, `make check` evaluates the complete local patch stack against its merge-base with `upstream/main`. The working tree must contain exactly the changes being evaluated
+
+Local checks resolve their base through `scripts/default_branch.py`: explicit `--base` takes precedence over `BASE_REF`, then the default is local `upstream/main`. The ref must have a merge-base with `HEAD`; resolution never fetches. Use `make check BASE_REF=<ref>` or a standalone gate's `--base <ref>` to override it. Run `make lint-fetch-base` explicitly to update `upstream/main`
+
 `make check` (f.k.a. `make pre-commit`, which still works identically as an alias) saves its complete output to a log file in .git (overwriting previous logs) and prints that path as its first and last output lines. To inspect a run, read or grep that log instead of re-running the multi-minute checks just to see a different slice
 
 `make check`, `make lint`, `scripts/pre_commit_lint.sh`, and the standalone lint gates (`scripts/ruff_strict_gate.py`, `scripts/type_discipline_gate.py`, `scripts/type_check_gate.py`) each hold one of 2 machine-wide slots, so when other sessions or worktrees on the same box are already running heavy work, yours prints "all N machine-wide slots are busy; queueing" and then stays quiet until a slot frees. Give the command a long timeout and let it wait rather than killing it, retrying it, or assuming it hung. Don't change the # of machine-wide slots or make it unlimited by setting `LITELLM_GATE_SLOTS=0`
@@ -66,7 +70,11 @@ If you get an LIT001 fail, refactor the code to follow functional programming be
 
 Every lint or type suppression must name the exact rule inside brackets and carry a reason comment, e.g. `# pyright: ignore[reportArgumentType]  # stubs lack async overload` or `# noqa: TID251  # <reason>`. `# type: ignore` is banned (LIT009): pyrightconfig.json sets `enableTypeIgnoreComments` to false, so it silently does nothing
 
-Commit and push your work when you're done without asking
+Validate changes and obtain independent review of the final diff. Fix findings, then revalidate and get the revised diff reviewed again
+
+Commit and push only after validation and review pass, following the user's instructions. Tests and lint do not replace review
+
+Respect ignore rules. Track ignored files only with explicit user authorization
 
 When referencing or running models (coding, QA'ing, writing docs, writing tests, etc.), use the latest model in that model family unless otherwise specified; treat your training knowledge, memories, configs, and tests as stale, and determine the family's latest with model_prices_and_context_window.json or the web
 

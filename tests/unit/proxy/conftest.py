@@ -15,6 +15,13 @@ import yaml
 from fastapi.testclient import TestClient
 from prisma.errors import ClientNotConnectedError
 
+_proxy_ui_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+if "LITELLM_UI_PATH" not in os.environ:
+    _proxy_ui_temp_dir = tempfile.TemporaryDirectory(prefix="litellm-proxy-tests-ui-")
+    os.environ["LITELLM_UI_PATH"] = (  # test-quality-ok: set before proxy_server import; use a temporary UI directory
+        _proxy_ui_temp_dir.name
+    )
+
 import litellm
 import litellm.proxy.proxy_server
 from litellm._service_logger import ServiceTypes

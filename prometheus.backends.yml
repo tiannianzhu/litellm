@@ -1,0 +1,55 @@
+scrape_configs:
+  - job_name: "vllm"
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["gpuh201.cmpdc.internal:8000"]
+        labels:
+          host: "gpuh201+gpuh202"
+          service: "kimi-k3"
+
+      - targets: ["gpuh203.cmpdc.internal:8000"]
+        labels:
+          host: "gpuh203"
+          service: "deepseek-v4.1-flash"
+
+      - targets: ["gpuh204.cmpdc.internal:8000"]
+        labels:
+          host: "gpuh204"
+          service: "glm-5.3"
+
+      - targets: ["gpuh204.cmpdc.internal:8001"]
+        labels:
+          host: "gpuh204"
+          service: "glm-5.3-flash"
+
+      - targets: ["gpuh2002.cmpdc.internal:8000"]
+        labels:
+          host: "gpuh2002"
+          service: "mimo-v2.6-pro"
+
+  - job_name: "vllm-aux"
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["gpu003.cmpdc.internal:80"]
+        labels:
+          __metrics_path__: /tts/metrics
+          host: "gpu003"
+          service: "qwen3-tts"
+
+      - targets: ["gpu003.cmpdc.internal:80"]
+        labels:
+          __metrics_path__: /asr/metrics
+          host: "gpu003"
+          service: "qwen3-asr"
+
+      - targets: ["gpu003.cmpdc.internal:80"]
+        labels:
+          __metrics_path__: /embedding/metrics
+          host: "gpu003"
+          service: "qwen3-embedding-8b"
+
+      - targets: ["gpu003.cmpdc.internal:80"]
+        labels:
+          __metrics_path__: /reranker/metrics
+          host: "gpu003"
+          service: "qwen3-reranker-8b"

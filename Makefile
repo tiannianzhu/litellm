@@ -28,12 +28,13 @@ help:
 	@echo "  make format             - Apply ruff format code formatting"
 	@echo "  make format-check       - Check ruff format code formatting (matches CI)"
 	@echo "  make lint               - Run all linting (Ruff, basedpyright, format check, circular imports, import safety)"
+	@echo "  make lint-fetch-base    - Explicitly fetch upstream/main before checking or syncing"
 	@echo "  make lint-ruff          - Run Ruff linting only"
 	@echo "  make lint-basedpyright  - Run basedpyright strict, gated by per-rule error counts"
 	@echo "  make lint-e2e-basedpyright - Run basedpyright over tests/e2e and tests/e2e_harness (zero errors allowed)"
 	@echo "  make lint-format        - Check ruff format formatting (matches CI)"
 	@echo "  make lint-ruff-strict   - Gate each strict ruff rule's codebase total against its merge-base count"
-	@echo "  make lint-gate        - Strict ruff gate in CI-parity mode (fetches the default branch, simulates the merge)"
+	@echo "  make lint-gate        - Strict Ruff gate against the configured local merge-base"
 	@echo "  make lint-test-quality  - Gate the test suite's TQ counts against their merge-base counts"
 	@echo "  make check-circular-imports - Check for circular imports"
 	@echo "  make check-import-safety - Check import safety"
@@ -135,7 +136,7 @@ format-check: install-dev
 	cd litellm && $(UV_RUN) ruff format --check --exclude '/enterprise/' . && cd ..
 
 lint-fetch-base:
-	@$(RESOLVE_BASE)
+	git fetch upstream main
 
 # Mirror test-linting.yml's python job environment: the proxy-dev group plus a generated
 # Prisma client, so `basedpyright tests/e2e` resolves the same modules CI does. The
@@ -241,8 +242,8 @@ check-import-safety: $(LINT_DEP_INSTALL)
 # runs the diff-scoped ruff format check, whole-tree ruff check, the strict-rule /
 # type-discipline / basedpyright gates as a delta vs the base, then the circular-import
 # and import-safety checks. Steps that compare against the base resolve it the same way CI
-# does (merge-base with origin's current default branch). Setup (env sync, Prisma client,
-# base fetch) runs once up front; the checks themselves are independent, so a sub-make
+# does (merge-base with the configured local ref). Setup (env sync, Prisma client,
+# base resolution) runs once up front; the checks themselves are independent, so a sub-make
 # fans them out with -j and the fast ones finish under basedpyright's shadow.
 lint:
 	@$(GATE_SLOT_LOCK) $(MAKE) lint-inner

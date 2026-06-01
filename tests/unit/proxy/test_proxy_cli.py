@@ -851,10 +851,12 @@ class TestProxyInitializationHelpers:
             mock_uvicorn_run.assert_called_once()
 
             mock_uvicorn_run.reset_mock()
-            result = runner.invoke(
-                run_server,
-                ["--local", "--port", "4000", "--prometheus_metrics_port", "4000"],
-            )
+            with patch("socket.socket") as mock_socket, patch("random.randint", return_value=4002):
+                mock_socket.return_value.__enter__.return_value.connect_ex.return_value = 0
+                result = runner.invoke(
+                    run_server,
+                    ["--local", "--port", "4000", "--prometheus_metrics_port", "4000"],
+                )
             assert result.exit_code == 2
             assert "--prometheus_metrics_port must differ from --port" in result.output
             mock_popen.assert_not_called()
@@ -2327,6 +2329,61 @@ class TestRunServerDbSetup:
         else:
             assert "prisma CLI" not in out
             assert "Setup complete" in out
+
+    @patch("subprocess.run")
+    @patch("atexit.register")
+    @patch("litellm.proxy.db.prisma_client.PrismaManager.setup_database")
+    @patch(  # test-quality-ok: startup branch must force the schema predicate; no injection seam
+        "litellm.proxy.db.prisma_client.should_update_prisma_schema", return_value=False
+    )
+    def test_disabled_schema_update_skips_db_setup(  # test-quality-ok: only observable contract is no DB setup
+        self,
+        mock_should_update_schema,
+        mock_setup_database,
+        mock_atexit_register,
+        mock_subprocess_run,
+    ):
+        from litellm.proxy.proxy_cli import run_server
+
+        mock_subprocess_run.return_value = MagicMock(returncode=0)
+
+        mock_proxy_module = MagicMock(
+            app=MagicMock(),
+            ProxyConfig=MagicMock(),
+            KeyManagementSettings=MagicMock(),
+            save_worker_config=MagicMock(),
+        )
+
+        clean_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("DATABASE_URL", "DIRECT_URL")
+        }
+        clean_env["DATABASE_URL"] = "postgresql://test:test@localhost:5432/test"
+
+        with (
+            patch.dict(os.environ, clean_env, clear=True),
+            patch.dict(
+                "sys.modules",
+                {
+                    "proxy_server": mock_proxy_module,
+                    "litellm.proxy.proxy_server": mock_proxy_module,
+                },
+            ),
+            patch(  # test-quality-ok: startup argument construction has no injection seam
+                "litellm.proxy.proxy_cli.ProxyInitializationHelpers._get_default_unvicorn_init_args"
+            ) as mock_get_args,
+        ):
+            mock_get_args.return_value = {
+                "app": "litellm.proxy.proxy_server:app",
+                "host": "localhost",
+                "port": 8000,
+            }
+
+            run_server.main(["--local", "--skip_server_startup"], standalone_mode=False)
+
+        mock_setup_database.assert_not_called()
+        mock_subprocess_run.assert_not_called()
 
     @patch("subprocess.run")
     @patch("atexit.register")
