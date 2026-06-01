@@ -147,7 +147,7 @@ def cmd_check(base: str) -> None:
 
 def main() -> None:
     parser: Final = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument(
         "--emit-counts-dir",
         type=Path,

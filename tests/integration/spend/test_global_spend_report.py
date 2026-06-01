@@ -1,10 +1,13 @@
+import re
 import uuid
 from hashlib import sha256
+from pathlib import Path
 from typing import Final
 
 import pytest
 from integration._support.client import Gateway, eventually, object_value, string_value
 from integration._support.database import read_rows
+from psycopg import Connection, sql
 from pydantic import JsonValue
 
 COST_PER_REQUEST: Final = 20 * 0.001 + 20 * 0.002
@@ -71,3 +74,31 @@ def test_default_report_groups_each_days_spend_by_team_with_per_key_breakdown(ga
         assert filtered.status_code == 200, filtered.text
         only: Final = filtered.json()
         assert len(only) == 1 and [object_value(team)["team_name"] for team in only[0]["teams"]] == [quiet_alias], only
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    (
+        ("Cannot connect to host worker.invalid:9000 ssl:default [socket unavailable]", "backend_unavailable"),
+        ("Connect call failed ('192.0.2.1', 9000)", "backend_unavailable"),
+        ("Cannot connect to host worker.invalid:9000 [Connection timed out]", "backend_timeout"),
+        ("Provider returned an internal error", "backend_5xx"),
+    ),
+)
+def test_spendlogs_report_classifies_wrapped_connection_errors(
+    postgresql_connection: Connection[tuple[object, ...]], message: str, expected: str
+) -> None:
+    script: Final = (
+        Path(__file__).resolve().parents[3] / ".agents/skills/inspect-errors/scripts/spendlogs_report.sh"
+    ).read_text()
+    classification: Final = re.search(
+        r"SELECT \$classification\$(.*?)\$classification\$ AS classification_sql", script, re.DOTALL
+    )
+    assert classification is not None
+    result: Final = postgresql_connection.execute(
+        sql.SQL(
+            "WITH failures(message, error_class, error_code) AS "
+            "(VALUES ({}::text, 'InternalServerError', '500')) SELECT {} FROM failures"
+        ).format(sql.Literal(message), sql.SQL(classification.group(1))),
+    ).fetchone()
+    assert result == (expected,)

@@ -1,15 +1,97 @@
+import asyncio
 import os
 import uuid
 from contextlib import ExitStack
+from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from typing import Final
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import psycopg
 import pytest
+from prisma import Prisma
 from psycopg import sql
 
+from callbacks.openwebui_alias import OpenWebUIAlias
 from integration._support.client import Gateway
 from integration._support.database import read_rows
+from litellm._logging import verbose_proxy_logger
+from litellm.proxy import proxy_server
+from tests._support.postgresql import PostgresTestDatabase
+from tests.integration._support.prisma_clients import connected_prisma
+
+
+@dataclass(frozen=True, slots=True)
+class _AliasDatabase:
+    db: Prisma
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", (False, True), ids=("concurrent-create", "preserve-existing"))
+async def test_concurrent_end_user_alias_sync_preserves_accounting(
+    postgresql_database: PostgresTestDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    existing: bool,
+) -> None:
+    connection: Final = postgresql_database.connection
+    connection.execute("""
+        CREATE TABLE "LiteLLM_EndUserTable" (
+            user_id TEXT PRIMARY KEY, alias TEXT, spend DOUBLE PRECISION NOT NULL DEFAULT 0,
+            blocked BOOLEAN NOT NULL DEFAULT false, budget_id TEXT, object_permission_id TEXT,
+            allowed_model_region TEXT, default_model TEXT, models TEXT[] NOT NULL DEFAULT '{}'
+        )
+    """)
+    if existing:
+        connection.execute("""
+            INSERT INTO "LiteLLM_EndUserTable" (user_id, alias, spend, blocked, budget_id)
+            VALUES ('alias-user', 'Old Alias', 7, true, 'retained-budget')
+        """)
+    connection.commit()
+    parsed: Final = urlsplit(postgresql_database.url)
+    url: Final = parsed._replace(query=urlencode({**dict(parse_qsl(parsed.query)), "connection_limit": "2"})).geturl()
+    now: Final = datetime(2026, 1, 1)
+    kwargs: Final = {
+        "litellm_params": {
+            "metadata": {"user_api_key_end_user_id": "alias-user"},
+            "proxy_server_request": {"headers": {"x-openwebui-user-name": "New Alias"}},
+        }
+    }
+    verbose_proxy_logger.addHandler(caplog.handler)
+    try:
+        async with connected_prisma(url) as database:
+            monkeypatch.setattr(proxy_server, "prisma_client", _AliasDatabase(database))
+            connection.execute('LOCK TABLE "LiteLLM_EndUserTable" IN SHARE MODE')
+            calls: Final = asyncio.gather(
+                *(OpenWebUIAlias().async_log_success_event(kwargs, {}, now, now) for _ in range(2))
+            )
+            try:
+                async with (
+                    await psycopg.AsyncConnection.connect(postgresql_database.dsn, autocommit=True) as observer,
+                    asyncio.timeout(10),
+                ):
+                    while True:
+                        cursor: Final = await observer.execute(
+                            "SELECT COUNT(*) FROM pg_locks WHERE relation = %s::regclass "
+                            "AND mode = 'RowExclusiveLock' AND NOT granted",
+                            (f'"{postgresql_database.schema}"."LiteLLM_EndUserTable"',),
+                        )
+                        if await cursor.fetchone() == (2,):
+                            break
+                        await asyncio.sleep(0.01)
+            finally:
+                connection.rollback()
+                await asyncio.wait_for(calls, timeout=10)
+            row: Final = await database.litellm_endusertable.find_unique(where={"user_id": "alias-user"})
+            assert row is not None
+            assert row.alias == "New Alias"
+            assert (row.spend, row.blocked, row.budget_id) == (
+                (7.0, True, "retained-budget") if existing else (0.0, False, None)
+            )
+            assert not [record for record in caplog.records if record.levelname == "ERROR"], caplog.text
+    finally:
+        verbose_proxy_logger.removeHandler(caplog.handler)
 
 
 @pytest.mark.covers("other.database.access_group.failed_second_write_rolls_back_first")
