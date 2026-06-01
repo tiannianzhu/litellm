@@ -47,7 +47,7 @@ REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 CHECKER: Final = REPO_ROOT / "scripts" / "check_test_quality.py"
 BUDGET_PATH: Final = REPO_ROOT / "test-quality-budget.json"
 TARGET: Final = "tests"
-DEFAULT_BASE: Final = "origin/litellm_internal_staging"
+DEFAULT_BASE: Final = "upstream/main"
 
 _HUNK: Final = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 _FILE_HEADER: Final = re.compile(r"^\+\+\+ b/(.+)$", re.MULTILINE)

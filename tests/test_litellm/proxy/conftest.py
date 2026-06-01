@@ -21,6 +21,15 @@ _PROXY_MODULE_GLOBALS_TO_ISOLATE = (
     "llm_router",
 )
 
+# proxy_server applies SERVER_ROOT_PATH replacements when it is imported. Keep
+# those test-time mutations out of the tracked packaged UI directory.
+_proxy_ui_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+if "LITELLM_UI_PATH" not in os.environ:
+    _proxy_ui_temp_dir = tempfile.TemporaryDirectory(prefix="litellm-proxy-tests-ui-")
+    os.environ["LITELLM_UI_PATH"] = (  # test-quality-ok: set before proxy_server import; use a temporary UI directory
+        _proxy_ui_temp_dir.name
+    )
+
 
 class StubClientNotConnectedError(ClientNotConnectedError):
     pass

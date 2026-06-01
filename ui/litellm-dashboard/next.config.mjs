@@ -4,6 +4,8 @@ import { fileURLToPath } from "url";
 /** @type {import('next').NextConfig} */
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const normalizedPath = (process.env.SERVER_ROOT_PATH ?? "").trim().replace(/^\/+|\/+$/g, "");
+const serverRootPath = normalizedPath === "" ? "" : `/${normalizedPath}`;
 
 const nextConfig = {
   output: "export",
@@ -16,7 +18,11 @@ const nextConfig = {
     unoptimized: true,
   },
   basePath: "",
-  assetPrefix: "/litellm-asset-prefix",
+  assetPrefix: serverRootPath,
+  env: {
+    NEXT_PUBLIC_LITELLM_FAVICON_PATH: `${serverRootPath}/get_favicon`,
+    NEXT_PUBLIC_LITELLM_UI_CONFIG_PATH: `${serverRootPath}/.well-known/litellm-ui-config`,
+  },
   trailingSlash: true,
   turbopack: {
     // Must be absolute; "." is no longer allowed

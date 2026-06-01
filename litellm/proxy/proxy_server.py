@@ -1989,12 +1989,19 @@ try:
     if not _validate_ui_directory(ui_path):
         verbose_proxy_logger.error("Selected UI path %s is invalid or incomplete. UI may not work correctly.", ui_path)
 
+    is_ui_root_path_baked: Final = os.path.isfile(os.path.join(ui_path, ".litellm_ui_root_path_baked"))
+
     # Only modify files if a custom server root path is set AND filesystem is writable
     if server_root_path and server_root_path != "/":
         # Check if UI path is writable
         is_writable = os.access(ui_path, os.W_OK)
 
-        if not is_writable:
+        if is_ui_root_path_baked:
+            verbose_proxy_logger.info(
+                "Using UI with build-time server_root_path=%s",
+                server_root_path,
+            )
+        elif not is_writable:
             verbose_proxy_logger.warning(
                 "Cannot apply server_root_path replacements to UI at %s: path is not writable. Ensure server_root_path is '/' or pre-process UI files in Dockerfile with custom server_root_path.",
                 ui_path,

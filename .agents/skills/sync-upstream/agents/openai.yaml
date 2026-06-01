@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sync Upstream"
+  short_description: "Rebase upstream without losing local intent"
+  default_prompt: "Use $sync-upstream to merge upstream/main and keep the local patch stack on top."

@@ -7,7 +7,7 @@
 #   - anything staged -> scope is the staged files; changed-but-unstaged files
 #     whose checks were skipped are called out
 #   - nothing staged  -> scope is the working tree's diff against the merge base
-#     with origin/litellm_internal_staging, untracked files included
+#     with upstream/main, untracked files included
 # The per-area checks:
 #   - litellm/ Python  -> `make lint` (test-linting.yml's lint job)
 #   - tests/e2e Python -> `make lint-e2e-basedpyright` (test-linting.yml's e2e type-check step)
@@ -61,20 +61,20 @@ untracked=$(git ls-files --others --exclude-standard)
 if [ -n "$staged" ]; then
     scope=$staged
 else
-    git fetch --quiet origin litellm_internal_staging 2>/dev/null || true
-    merge_base=$(git merge-base origin/litellm_internal_staging HEAD 2>/dev/null) || {
-        echo "check: cannot resolve the merge base with origin/litellm_internal_staging." >&2
-        echo "  Fix: git fetch origin litellm_internal_staging" >&2
+    git fetch --quiet upstream main 2>/dev/null || true
+    merge_base=$(git merge-base upstream/main HEAD 2>/dev/null) || {
+        echo "check: cannot resolve the merge base with upstream/main." >&2
+        echo "  Fix: git fetch upstream main" >&2
         echo "check: FAIL"
         exit 1
     }
     scope=$(printf '%s\n' "$(git diff --name-only --diff-filter=ACMRD "$merge_base")" "$untracked" | sed '/^$/d' | sort -u)
     if [ -z "$scope" ]; then
-        echo "check: nothing to check (no staged files, no working-tree changes, no branch changes vs origin/litellm_internal_staging)"
+        echo "check: nothing to check (no staged files, no working-tree changes, no branch changes vs upstream/main)"
         echo "check: PASS"
         exit 0
     fi
-    echo "check: nothing staged; scoping to the working tree's diff against the merge base with origin/litellm_internal_staging:"
+    echo "check: nothing staged; scoping to the working tree's diff against the merge base with upstream/main:"
     printf '%s\n' "$scope" | sed 's/^/    /'
 fi
 

@@ -31,6 +31,7 @@ CONTAINER_NAME="litellm-e2e-postgres-$$"
 MOCK_PID=""
 PROXY_PID=""
 PROXY_LOG=""
+E2E_UI_DIR=""
 
 # Ports, overridable so two checkouts can run this harness at the same time --
 # otherwise a second run aborts on "port 4000 is in use" and the only way out is
@@ -84,6 +85,7 @@ cleanup() {
   [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
   [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
   [ -n "$PROXY_LOG" ] && rm -f "$PROXY_LOG" || true
+  [ -n "$E2E_UI_DIR" ] && rm -rf -- "$E2E_UI_DIR"
   if [ "$IS_CI" = "false" ]; then
     docker stop "$CONTAINER_NAME" 2>/dev/null || true
   fi
@@ -170,18 +172,21 @@ cd "$DASHBOARD_DIR"
 # because the deps that provide `next` were never installed.
 npm install
 npm run build
-# Copy the fresh build to the proxy's static UI directory
-cp -r "$DASHBOARD_DIR/out/" "$REPO_ROOT/litellm/proxy/_experimental/out/"
+
+# Keep test artifacts out of the tracked packaged UI directory.
+E2E_UI_DIR="$(mktemp -d "${TMPDIR:-/tmp}/litellm-e2e-ui.XXXXXX")"
+export LITELLM_UI_PATH="$E2E_UI_DIR"
+cp -r "$DASHBOARD_DIR/out/." "$E2E_UI_DIR/"
 
 # Restructure HTML files so extensionless routes work (e.g. /ui/login)
 # Next.js export produces login.html; the proxy expects login/index.html
-find "$REPO_ROOT/litellm/proxy/_experimental/out" -name '*.html' ! -name 'index.html' | while read -r htmlfile; do
+find "$E2E_UI_DIR" -name '*.html' ! -name 'index.html' | while read -r htmlfile; do
   target_dir="${htmlfile%.html}"
   target_path="$target_dir/index.html"
   mkdir -p "$target_dir"
   mv "$htmlfile" "$target_path"
 done
-echo "UI build copied and restructured"
+echo "UI build copied to $E2E_UI_DIR and restructured"
 
 # --- Python environment ---
 echo "=== Setting up Python environment ==="

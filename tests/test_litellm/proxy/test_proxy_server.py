@@ -765,11 +765,11 @@ def test_admin_ui_export_serves_nested_extensionless_routes():
     assert "<html" in landed.text.lower()
 
 
-def test_restructure_always_happens(monkeypatch):
+def test_restructure_skips_packaged_ui(monkeypatch):
     """
-    Test that restructuring logic always executes regardless of LITELLM_NON_ROOT setting.
-    In development (is_non_root=False), restructuring happens directly in _experimental/out.
-    In non-root Docker (is_non_root=True), restructuring happens in /var/lib/litellm/ui.
+    Test that restructuring logic only mutates a separate runtime UI path.
+    In development (is_non_root=False), packaged UI is served without modifying _experimental/out.
+    In non-root Docker (is_non_root=True), restructuring can happen in /var/lib/litellm/ui.
     """
     # Test Case 1: is_non_root is True - restructuring happens in /var/lib/litellm/ui
     monkeypatch.setenv("LITELLM_NON_ROOT", "true")
@@ -784,14 +784,13 @@ def test_restructure_always_happens(monkeypatch):
     else:
         ui_path = packaged_ui_path
 
-    # Restructuring always happens now, regardless of ui_path vs packaged_ui_path
-    should_restructure = True
+    should_restructure = ui_path != packaged_ui_path
 
     assert is_non_root is True
     assert should_restructure is True
     assert ui_path == runtime_ui_path
 
-    # Test Case 2: is_non_root is False - restructuring happens directly in packaged_ui_path
+    # Test Case 2: is_non_root is False - packaged UI is not mutated
     monkeypatch.delenv("LITELLM_NON_ROOT", raising=False)
 
     # Simulate the logic from proxy_server.py
@@ -801,11 +800,10 @@ def test_restructure_always_happens(monkeypatch):
     else:
         ui_path = packaged_ui_path
 
-    # Restructuring always happens now, even when ui_path == packaged_ui_path
-    should_restructure = True
+    should_restructure = ui_path != packaged_ui_path
 
     assert is_non_root is False
-    assert should_restructure is True
+    assert should_restructure is False
     assert ui_path == packaged_ui_path
 
 

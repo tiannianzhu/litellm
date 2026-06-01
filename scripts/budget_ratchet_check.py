@@ -42,7 +42,7 @@ else:
     import tomli as tomllib
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_BASE = "origin/litellm_internal_staging"
+DEFAULT_BASE = "upstream/main"
 DEFAULT_BUDGETS: tuple[str, ...] = (
     "ruff-strict-budget.json",
     "type-discipline-budget.json",

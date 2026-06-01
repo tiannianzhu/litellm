@@ -25,8 +25,16 @@ WORKDIR /ui
 COPY ui/litellm-dashboard/package.json ui/litellm-dashboard/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --prefer-offline
 
+ARG SERVER_ROOT_PATH
+ENV SERVER_ROOT_PATH=$SERVER_ROOT_PATH
+
 COPY ui/litellm-dashboard/ ./
-RUN npm run build
+COPY enterprise/enterprise_ui/ /tmp/enterprise_ui/
+RUN --mount=type=cache,target=/ui/.next/cache \
+    if [ -f /tmp/enterprise_ui/enterprise_colors.json ]; then cp /tmp/enterprise_ui/enterprise_colors.json ui_colors.json; fi && \
+    npm run build && \
+    touch /ui/out/.litellm_ui_ready && \
+    touch /ui/out/.litellm_ui_root_path_baked
 
 # Builder stage
 FROM $LITELLM_BUILD_IMAGE AS builder
@@ -60,7 +68,8 @@ COPY enterprise/pyproject.toml enterprise/
 COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
-RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
@@ -69,21 +78,24 @@ RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-gr
     --extra bedrock-realtime \
     --extra mongodb \
     --python python3.13
+
+COPY schema.prisma ./
+RUN --mount=type=cache,target=/root/.npm \
+    HOME=/opt/prisma XDG_CACHE_HOME=/opt/prisma/.cache PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
+    prisma generate --schema=./schema.prisma
 
 # Copy full source tree
 COPY . .
 
-# Replace the committed UI bundle with the one built from this exact source.
-# Clearing first drops the committed bundle's content-hashed chunks that COPY
-# would otherwise leave behind alongside the fresh ones.
-RUN rm -rf litellm/proxy/_experimental/out
+# Install the UI built from this exact source.
 COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 
-# Build Admin UI before final sync (applies the enterprise color override when present)
-RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
-
 # Install project and workspace packages (fast - deps already cached)
-RUN uv sync --frozen --no-default-groups --no-editable \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/litellm-rust/target \
+    uv sync --frozen --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
@@ -92,10 +104,6 @@ RUN uv sync --frozen --no-default-groups --no-editable \
     --extra bedrock-realtime \
     --extra mongodb \
     --python python3.13
-
-RUN HOME=/opt/prisma XDG_CACHE_HOME=/opt/prisma/.cache PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
-    npm_config_cache=/root/.npm \
-    prisma generate --schema=./schema.prisma
 
 RUN sed -i 's/\r$//' docker/entrypoint.sh && chmod +x docker/entrypoint.sh && \
     sed -i 's/\r$//' docker/prod_entrypoint.sh && chmod +x docker/prod_entrypoint.sh

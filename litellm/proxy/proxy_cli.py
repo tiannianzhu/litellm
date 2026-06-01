@@ -1247,6 +1247,7 @@ def run_server(
                 unsupported_db_scheme,
                 unsupported_db_scheme_message,
             )
+            from litellm.proxy.db.prisma_client import should_update_prisma_schema
 
             for _db_env in ("DATABASE_URL", "DIRECT_URL"):
                 _candidate_url = os.getenv(_db_env)
@@ -1260,6 +1261,11 @@ def run_server(
                         flush=True,
                     )
                     sys.exit(1)
+            disable_schema_update: Final = general_settings.get("disable_prisma_schema_update")
+            should_update_schema: Final = should_update_prisma_schema(
+                disable_schema_update if isinstance(disable_schema_update, (bool, str)) else None
+            )
+            is_prisma_runnable: bool | None = None  # rebind-ok: probe result is assigned by try/except branches
             try:
                 from litellm.secret_managers.main import get_secret
 
@@ -1323,60 +1329,54 @@ def run_server(
                             lifetime_params,
                         )
                     )
-                subprocess.run(["prisma"], capture_output=True)
-                is_prisma_runnable = True
+                if should_update_schema:
+                    subprocess.run(  # mutable-ok: subprocess argv contract requires a list
+                        ["prisma"], capture_output=True
+                    )
+                    is_prisma_runnable = True  # rebind-ok: successful probe updates the branch result
             except FileNotFoundError:
                 is_prisma_runnable = False
 
-            if is_prisma_runnable:
-                from litellm.proxy.db.check_migration import check_prisma_schema_diff
-                from litellm.proxy.db.prisma_client import (
-                    PrismaManager,
-                    should_update_prisma_schema,
-                )
+            if is_prisma_runnable is True:
+                from litellm.proxy.db.prisma_client import PrismaManager
 
-                if should_update_prisma_schema(general_settings.get("disable_prisma_schema_update")) is False:
-                    check_prisma_schema_diff(db_url=None)
-                else:
-                    if not use_v2_migration_resolver:
+                if not use_v2_migration_resolver:
+                    print(
+                        "\033[1;33mLiteLLM Proxy: Using default (v1) migration resolver. "
+                        "If your deployment has seen schema thrashing during rolling "
+                        "deploys, try --use_v2_migration_resolver (safer: avoids the "
+                        "diff-and-force recovery that caused the thrash).\033[0m"
+                    )
+                try:
+                    setup_ok: Final = PrismaManager.setup_database(
+                        use_migrate=not use_prisma_db_push,
+                        use_v2_resolver=use_v2_migration_resolver,
+                    )
+                except RuntimeError as e:
+                    # Raised on unrecoverable migration errors: the v2
+                    # resolver's non-idempotent failures and permission
+                    # issues, and any `prisma db push` against a
+                    # partitioned LiteLLM_SpendLogs.
+                    print(
+                        f"\033[1;31mLiteLLM Proxy: Database migration cannot proceed. {e}\033[0m",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(2)
+                if not setup_ok:
+                    if enforce_prisma_migration_check:
                         print(
-                            "\033[1;33mLiteLLM Proxy: Using default (v1) migration resolver. "
-                            "If your deployment has seen schema thrashing during rolling "
-                            "deploys, try --use_v2_migration_resolver (safer: avoids the "
-                            "diff-and-force recovery that caused the thrash).\033[0m"
+                            "\033[1;31mLiteLLM Proxy: Database setup failed after multiple retries. "
+                            "The proxy cannot start safely. Please check your database connection and migration status.\033[0m"
                         )
-                    try:
-                        setup_ok: Final = PrismaManager.setup_database(
-                            use_migrate=not use_prisma_db_push,
-                            use_v2_resolver=use_v2_migration_resolver,
-                        )
-                    except RuntimeError as e:
-                        # Raised on unrecoverable migration errors: the v2
-                        # resolver's non-idempotent failures and permission
-                        # issues, and any `prisma db push` against a
-                        # partitioned LiteLLM_SpendLogs.
+                        sys.exit(1)
+                    else:
                         print(
-                            f"\033[1;31mLiteLLM Proxy: Database migration cannot proceed. {e}\033[0m",
-                            file=sys.stderr,
-                            flush=True,
+                            "\033[1;33mLiteLLM Proxy: Database migration failed but continuing startup. "
+                            "Set --enforce_prisma_migration_check or ENFORCE_PRISMA_MIGRATION_CHECK=true to exit on failure.\033[0m"
                         )
-                        sys.exit(2)
-                    if not setup_ok:
-                        if enforce_prisma_migration_check:
-                            print(
-                                "\033[1;31mLiteLLM Proxy: Database setup failed after multiple retries. "
-                                "The proxy cannot start safely. Please check your database connection and migration status.\033[0m"
-                            )
-                            sys.exit(1)
-                        else:
-                            print(
-                                "\033[1;33mLiteLLM Proxy: Database migration failed but continuing startup. "
-                                "Set --enforce_prisma_migration_check or ENFORCE_PRISMA_MIGRATION_CHECK=true to exit on failure.\033[0m"
-                            )
-            else:
-                print(
-                    f"Unable to connect to DB. DATABASE_URL found in environment, but prisma package not found."  # noqa: F541
-                )
+            elif is_prisma_runnable is False:
+                print("Unable to connect to DB. DATABASE_URL found in environment, but prisma package not found.")
         if port == 4000 and ProxyInitializationHelpers._is_port_in_use(port):
             port = random.randint(1024, 49152)
         if prometheus_metrics_port == port:
