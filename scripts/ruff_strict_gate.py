@@ -4,9 +4,9 @@
 Each rule has a hard ``limit`` in ruff-strict-budget.json. The gate counts each
 rule across the whole tree and fails when a rule is both over its limit and
 higher than the base it merges into, so a change is blamed for the violations it
-adds, never for drift that already exists in the base. ``--update`` ratchets each
-rule's limit down by the number of violations this branch fixed relative to its
-branch point (the merge-base).
+adds, never for drift that already exists in the base. ``--update`` computes each
+limit from the budget at the merge-base, subtracting cumulative fixes once and
+preserving stricter local limits. Rules absent from the base budget stay unchanged.
 """
 
 import argparse
@@ -17,8 +17,14 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, NamedTuple
+
+if __package__ is None:
+    from budget_ratchet_check import load_base_budget, ratcheted_budget
+else:
+    from scripts.budget_ratchet_check import load_base_budget, ratcheted_budget
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STRICT_CONFIG = REPO_ROOT / "ruff-strict.toml"
@@ -177,19 +183,8 @@ def cmd_check(base: str) -> None:
     raise SystemExit(1)
 
 
-def ratcheted_budget(budget: dict, current: dict, base: dict) -> dict:
-    """Each rule's limit lowered by the violations `current` fixed vs `base`.
-
-    `base` is the count at the branch point (the commit this branch diverged
-    from). The drop is clamped to what was actually cleared (a rule that grew
-    stays put), so the limit only ever falls.
-    """
-    return {
-        rule: {
-            "limit": max(0, spec["limit"] - max(0, base.get(rule, 0) - current.get(rule, 0)))
-        }
-        for rule, spec in sorted(budget.items())
-    }
+def _base_budget(base_point: str) -> Mapping[str, Mapping[str, int]]:
+    return load_base_budget(REPO_ROOT, base_point, BUDGET_PATH.name)
 
 
 def cmd_update(base_ref: str) -> None:
@@ -201,9 +196,8 @@ def cmd_update(base_ref: str) -> None:
     """
     budget = json.loads(BUDGET_PATH.read_text())
     base_point = resolve_base_point(base_ref)
-    updated = ratcheted_budget(
-        budget, count_by_rule(head_violations()), base_counts(base_point)
-    )
+    base_budget: Final = _base_budget(base_point)
+    updated = ratcheted_budget(budget, count_by_rule(head_violations()), base_counts(base_point), base_budget)
     BUDGET_PATH.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
     cleared = sum(budget[rule]["limit"] - updated[rule]["limit"] for rule in updated)
     print(f"Ratcheted strict-rule limits down by {cleared} violations this branch fixed")
@@ -211,7 +205,7 @@ def cmd_update(base_ref: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("--update", action="store_true")
     args = parser.parse_args()
     from default_branch import resolve_base_ref

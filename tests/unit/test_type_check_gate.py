@@ -4,6 +4,9 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Final
+
+import pytest
 
 _MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "type_check_gate.py"
 _spec = importlib.util.spec_from_file_location("type_check_gate", _MODULE_PATH)
@@ -132,6 +135,16 @@ def test_run_basedpyright_fails_loudly_on_a_crash_exit_code(tmp_path):
         gate.run_basedpyright(cwd=tmp_path, env_dir=env_dir)
 
 
+@pytest.mark.parametrize("payload", ('{"generalDiagnostics": [], "summary": {"errorCount": 0}}\n', "invalid output"))
+def test_save_diagnostics_preserves_raw_output(
+    payload: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path: Final = tmp_path / "basedpyright-diagnostics.json"
+    gate.save_diagnostics(payload, path)
+    assert path.read_text() == payload
+    assert capsys.readouterr().out == f"Saved basedpyright diagnostics to {path}\n"
+
+
 def test_at_or_under_ceiling_passes():
     budget = {"no-any-return": {"limit": 5}}
     assert gate.evaluate({"no-any-return": 5}, {}, budget) == []
@@ -205,24 +218,18 @@ def test_update_ratchets_a_limit_down_by_what_the_branch_fixed():
     # limit of 100 falls to 90 -- the granted headroom (60) is preserved, not the
     # raw count.
     budget = {"reportAny": {"limit": 100}}
-    assert gate.ratcheted_budget(budget, {"reportAny": 30}, {"reportAny": 40}) == {
-        "reportAny": {"limit": 90}
-    }
+    assert gate.ratcheted_budget(budget, {"reportAny": 30}, {"reportAny": 40}, budget) == {"reportAny": {"limit": 90}}
 
 
 def test_update_never_raises_a_limit_when_a_rule_grows():
     # Adding violations must not loosen the ceiling; the limit holds flat.
     budget = {"reportAny": {"limit": 100}}
-    assert gate.ratcheted_budget(budget, {"reportAny": 55}, {"reportAny": 40}) == {
-        "reportAny": {"limit": 100}
-    }
+    assert gate.ratcheted_budget(budget, {"reportAny": 55}, {"reportAny": 40}, budget) == {"reportAny": {"limit": 100}}
 
 
 def test_update_clamps_a_limit_at_zero_never_negative():
     budget = {"reportAny": {"limit": 5}}
-    assert gate.ratcheted_budget(budget, {"reportAny": 0}, {"reportAny": 40}) == {
-        "reportAny": {"limit": 0}
-    }
+    assert gate.ratcheted_budget(budget, {"reportAny": 0}, {"reportAny": 40}, budget) == {"reportAny": {"limit": 0}}
 
 
 def test_malformed_basedpyright_json_exits_loudly_not_as_zero_errors():

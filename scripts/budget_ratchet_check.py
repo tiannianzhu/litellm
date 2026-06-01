@@ -37,6 +37,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Final, NamedTuple
@@ -99,6 +100,44 @@ def _load_base(rel: str, ref: str) -> dict | None:
     if proc.returncode != 0:
         return None
     return json.loads(proc.stdout)
+
+
+def load_base_budget(repo_root: Path, base_point: str, name: str) -> dict[str, dict[str, int]]:
+    tracked: Final = subprocess.run(
+        ["git", "ls-tree", "--name-only", base_point, "--", name],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if not tracked.stdout.strip():
+        return {}
+    snapshot: Final[Mapping[str, Mapping[str, int]]] = json.loads(
+        subprocess.check_output(["git", "show", f"{base_point}:{name}"], cwd=repo_root, text=True)
+    )
+    return {
+        rule: {"limit": spec["limit"] if "limit" in spec else spec["baseline"] + spec.get("slack", 0)}
+        for rule, spec in snapshot.items()
+    }
+
+
+def ratcheted_budget(
+    budget: Mapping[str, Mapping[str, int]],
+    current: Mapping[str, int],
+    base: Mapping[str, int],
+    base_budget: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    return {
+        rule: {
+            "limit": spec["limit"]
+            if rule not in base_budget
+            else min(
+                spec["limit"],
+                max(0, base_budget[rule]["limit"] - max(0, base.get(rule, 0) - current.get(rule, 0))),
+            )
+        }
+        for rule, spec in sorted(budget.items())
+    }
 
 
 def _ceiling(spec: dict) -> int:
@@ -208,7 +247,7 @@ def regressions_for(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("budgets", nargs="*", help="budget files to check")
     args = parser.parse_args()
     from default_branch import resolve_base_ref

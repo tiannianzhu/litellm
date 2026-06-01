@@ -47,7 +47,7 @@ def test_update_ratchets_limit_down_by_what_the_branch_fixed_never_up():
     # limit holds flat at 10.
     current = {"LIT001": 45, "LIT006": 12}
     base = {"LIT001": 60, "LIT006": 9}
-    assert gate.ratcheted_budget(budget, current, base) == {
+    assert gate.ratcheted_budget(budget, current, base, budget) == {
         "LIT001": {"limit": 85},
         "LIT006": {"limit": 10},
     }
@@ -60,7 +60,7 @@ def test_update_leaves_rules_seeded_on_this_branch_untouched():
     budget = {"LIT001": {"limit": 100}, "LIT010": {"limit": 24600}}
     current = {"LIT001": 45, "LIT010": 16400}
     base = {"LIT001": 60, "LIT010": 40000}
-    assert gate.ratcheted_budget(budget, current, base, frozenset({"LIT010"})) == {
+    assert gate.ratcheted_budget(budget, current, base, {"LIT001": {"limit": 100}}) == {
         "LIT001": {"limit": 85},
         "LIT010": {"limit": 24600},
     }

@@ -26,8 +26,9 @@ that suppresses nothing) is frozen at 0 for the same reason; and LIT007
 LIT010 and LIT011 were seeded at 1.5x the count left after the sweep that
 annotated every never-rebound name with Final, so that headroom is the hard
 line new code cannot cross.
-``--update`` ratchets a limit down by the violations this branch fixed relative
-to its branch point (the merge-base). A rule absent from the budget at the
+``--update`` subtracts cumulative fixes from the budget at the merge-base,
+preserving stricter local limits without charging the same fixes again.
+A rule absent from the budget at the
 merge-base was seeded on this branch; ``--update`` leaves its limit untouched,
 because the base tree predates the rule and its whole grandfathered count would
 otherwise be misread as "fixed", collapsing the deliberate headroom to zero.
@@ -41,8 +42,14 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Final, NamedTuple
+
+if __package__ is None:
+    from budget_ratchet_check import load_base_budget, ratcheted_budget
+else:
+    from scripts.budget_ratchet_check import load_base_budget, ratcheted_budget
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CHECKER = REPO_ROOT / "scripts" / "check_type_discipline.py"
@@ -209,36 +216,8 @@ def cmd_check(base: str) -> None:
     raise SystemExit(1)
 
 
-def ratcheted_budget(budget: dict, current: dict, base: dict, seeded: frozenset = frozenset()) -> dict:
-    """Each rule's limit lowered by the violations `current` fixed vs `base`.
-
-    `base` is the count at the branch point (the commit this branch diverged
-    from). The drop is clamped to what was actually cleared (a rule that grew
-    stays put), so the limit only ever falls. Rules in `seeded` were introduced
-    on this branch with deliberate grandfathered headroom; their limits pass
-    through untouched, since the base predates the rule and comparing against it
-    would misread the entire grandfathered count as fixed.
-    """
-    return {
-        rule: {
-            "limit": spec["limit"]
-            if rule in seeded
-            else max(0, spec["limit"] - max(0, base.get(rule, 0) - current.get(rule, 0)))
-        }
-        for rule, spec in sorted(budget.items())
-    }
-
-
-def _base_budget_rules(base_point: str) -> frozenset:
-    proc = subprocess.run(
-        ["git", "show", f"{base_point}:{BUDGET_PATH.name}"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return frozenset()
-    return frozenset(json.loads(proc.stdout))
+def _base_budget(base_point: str) -> Mapping[str, Mapping[str, int]]:
+    return load_base_budget(REPO_ROOT, base_point, BUDGET_PATH.name)
 
 
 def cmd_update(base_ref: str) -> None:
@@ -250,8 +229,9 @@ def cmd_update(base_ref: str) -> None:
     """
     budget = json.loads(BUDGET_PATH.read_text())
     base_point = resolve_base_point(base_ref)
-    seeded = frozenset(budget) - _base_budget_rules(base_point)
-    updated = ratcheted_budget(budget, count_by_rule(head_violations()), base_counts(base_point), seeded)
+    base_budget: Final = _base_budget(base_point)
+    seeded = frozenset(budget) - frozenset(base_budget)
+    updated = ratcheted_budget(budget, count_by_rule(head_violations()), base_counts(base_point), base_budget)
     BUDGET_PATH.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
     cleared = sum(budget[rule]["limit"] - updated[rule]["limit"] for rule in updated)
     print(f"Ratcheted LIT-rule limits down by {cleared} violations this branch fixed")
@@ -261,7 +241,7 @@ def cmd_update(base_ref: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("--update", action="store_true")
     args = parser.parse_args()
     from default_branch import resolve_base_ref

@@ -39,9 +39,10 @@ branch point pay for it once. A CI workflow publishes every main commit's counts
 an artifact (``--emit-counts-dir`` is its entry point), and on a disk-cache miss
 the gate first tries to download the merge-base's artifact through the ``gh``
 CLI; any fetch failure falls back silently to the local base pass, so the gate
-never gets worse than it was without CI. ``--update`` ratchets each rule's ``limit`` down by the
-number of errors this branch fixed relative to its branch point (the merge-base),
-so the headroom you were granted shrinks by exactly what you cleared and never
+never gets worse than it was without CI. ``--update`` subtracts cumulative fixes
+from the budget at the merge-base, preserving stricter local limits without
+charging the same fixes again. Rules absent from the base budget stay unchanged.
+The headroom you were granted shrinks by what you cleared and never
 grows.
 
 ``--outputjson`` is used rather than text diagnostics because the latter wrap
@@ -66,6 +67,11 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Final, NamedTuple
+
+if __package__ is None:
+    from budget_ratchet_check import load_base_budget, ratcheted_budget
+else:
+    from scripts.budget_ratchet_check import load_base_budget, ratcheted_budget
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BUDGET_PATH = REPO_ROOT / "basedpyright-code-budget.json"
@@ -357,6 +363,11 @@ def scratch_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.{os.getpid()}.tmp")
 
 
+def save_diagnostics(payload: str, path: Path) -> None:
+    path.write_text(payload)
+    print(f"Saved basedpyright diagnostics to {path}")
+
+
 def counts_payload(base_point: str, counts: Mapping[str, int]) -> str:
     return (
         json.dumps(
@@ -556,25 +567,8 @@ def is_vacuous_run(
     return not counts and any(spec["limit"] for spec in budget.values())
 
 
-def ratcheted_budget(
-    budget: Mapping[str, Mapping[str, int]],
-    current: Mapping[str, int],
-    base: Mapping[str, int],
-) -> dict[str, dict[str, int]]:
-    """Each rule's limit lowered by the errors `current` fixed vs `base`.
-
-    `base` is the count at the branch point (the commit this branch diverged
-    from). The drop is clamped to what was actually cleared (a rule that grew
-    stays put), so the limit only ever falls. Rules absent from the budget are
-    dropped: a genuinely new error category is added to the JSON deliberately,
-    not on update.
-    """
-    return {
-        code: {
-            "limit": max(0, spec["limit"] - max(0, base.get(code, 0) - current.get(code, 0)))
-        }
-        for code, spec in sorted(budget.items())
-    }
+def _base_budget(base_point: str) -> Mapping[str, Mapping[str, int]]:
+    return load_base_budget(REPO_ROOT, base_point, BUDGET_PATH.name)
 
 
 def cmd_update(current: Mapping[str, int], base_ref: str) -> None:
@@ -587,13 +581,11 @@ def cmd_update(current: Mapping[str, int], base_ref: str) -> None:
     """
     budget = json.loads(BUDGET_PATH.read_text()) if BUDGET_PATH.exists() else {}
     base_point = resolve_base_point(base_ref)
-    updated = ratcheted_budget(budget, current, base_counts_cached(base_point))
+    base_budget: Final = _base_budget(base_point)
+    updated = ratcheted_budget(budget, current, base_counts_cached(base_point), base_budget)
     BUDGET_PATH.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
     cleared = sum(budget[code]["limit"] - updated[code]["limit"] for code in updated)
-    print(
-        f"Ratcheted basedpyright limits down by {cleared} errors this branch fixed "
-        f"across {len(updated)} rules"
-    )
+    print(f"Ratcheted basedpyright limits down by {cleared} errors this branch fixed across {len(updated)} rules")
 
 
 def cmd_emit_counts(head: Mapping[str, int], directory: Path, head_sha: str) -> None:
@@ -665,7 +657,7 @@ def cmd_check(head: Mapping[str, int], base_ref: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--emit-counts-dir", type=Path)
     args = parser.parse_args()
@@ -675,7 +667,12 @@ def main() -> None:
     base_ref: Final = None if args.emit_counts_dir is not None else resolve_base_ref(args.base, REPO_ROOT)
     with held_slot():
         ensure_typecheck_env()
-        head = count_basedpyright(run_basedpyright())
+        diagnostics_path: Final = REPO_ROOT / _run(
+            ["git", "rev-parse", "--git-path", "basedpyright-diagnostics.json"]
+        ).strip()
+        diagnostics: Final = run_basedpyright()
+        save_diagnostics(diagnostics, diagnostics_path)
+        head = count_basedpyright(diagnostics)
         if args.emit_counts_dir is not None:
             cmd_emit_counts(
                 head, args.emit_counts_dir, _run(["git", "rev-parse", "HEAD"]).strip()
