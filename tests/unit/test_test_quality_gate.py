@@ -69,23 +69,46 @@ def test_over_ceiling_is_empty_when_everything_fits():
 
 
 def test_ratchet_lowers_a_limit_by_what_the_branch_fixed():
-    updated = gate.ratcheted_budget(_BUDGET, {"TQ001": 6}, {"TQ001": 10})
+    updated = gate.ratcheted_budget(_BUDGET, {"TQ001": 6}, {"TQ001": 10}, _BUDGET)
     assert updated["TQ001"]["limit"] == 6
 
 
 def test_ratchet_never_raises_a_limit_when_violations_grew():
-    updated = gate.ratcheted_budget(_BUDGET, {"TQ001": 20}, {"TQ001": 10})
+    updated = gate.ratcheted_budget(_BUDGET, {"TQ001": 20}, {"TQ001": 10}, _BUDGET)
     assert updated["TQ001"]["limit"] == 10
 
 
 def test_ratchet_never_goes_below_zero():
-    updated = gate.ratcheted_budget({"TQ001": {"limit": 2}}, {"TQ001": 0}, {"TQ001": 100})
+    updated = gate.ratcheted_budget({"TQ001": {"limit": 2}}, {"TQ001": 0}, {"TQ001": 100}, {"TQ001": {"limit": 2}})
     assert updated["TQ001"]["limit"] == 0
 
 
-def test_ratchet_lowers_a_rule_introduced_on_this_branch_like_any_other():
-    updated = gate.ratcheted_budget(_BUDGET, {"TQ001": 4}, {"TQ001": 10})
-    assert updated["TQ001"]["limit"] == 4
+def test_ratchet_preserves_a_rule_introduced_on_this_branch():
+    updated = gate.ratcheted_budget(_BUDGET, {"TQ001": 4}, {"TQ001": 10}, {})
+    assert updated == _BUDGET
+
+
+def test_a_branch_that_cleared_violations_must_lower_the_ceiling():
+    stale = gate.unratcheted({"TQ001": 6}, {"TQ001": 10}, _BUDGET)
+    assert [(b.rule, b.total, b.cap, b.added) for b in stale] == [("TQ001", 6, 10, -4)]
+
+
+def test_headroom_already_in_the_base_is_not_blamed_on_this_branch():
+    assert gate.unratcheted({"TQ001": 6}, {"TQ001": 6}, _BUDGET) == ()
+
+
+def test_a_branch_that_cleared_down_to_the_ceiling_exactly_is_clean():
+    assert gate.unratcheted({"TQ001": 10}, {"TQ001": 12}, _BUDGET) == ()
+
+
+def test_a_branch_that_added_violations_is_not_a_ratchet_finding():
+    assert gate.unratcheted({"TQ001": 14}, {"TQ001": 10}, _BUDGET) == ()
+
+
+def test_the_ratchet_finding_survives_the_update_that_answers_it():
+    cleared = {"TQ001": 6}
+    updated = gate.ratcheted_budget(_BUDGET, cleared, {"TQ001": 10}, _BUDGET)
+    assert gate.unratcheted(cleared, {"TQ001": 10}, updated) == ()
 
 
 def test_parse_changed_lines_groups_hunks_under_their_own_file():
