@@ -6,6 +6,7 @@ tests/e2e/.fixtures/
 .venv-mutmut
 mutants/
 .env
+.env.production
 .claude
 CLAUDE.local.md
 .newenv
@@ -95,6 +96,8 @@ litellm/proxy/migrations/*config.yaml
 litellm/proxy/migrations/*
 litellm/proxy/to_delete_loadtest_work/*
 config.yaml
+model_prices.local.json
+prometheus.local.yml
 tests/litellm/litellm_core_utils/llm_cost_calc/log.txt
 tests/test_custom_dir/*
 test.py

@@ -1,0 +1,239 @@
+groups:
+  - name: litellm-gateway-health
+    rules:
+      - alert: LiteLLMProxyDown
+        expr: up{job="litellm"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: litellm
+        annotations:
+          summary: "LiteLLM proxy metrics scrape is down"
+          description: "Prometheus cannot scrape LiteLLM at {{ $labels.instance }} for more than 1 minute."
+
+      - alert: LiteLLMDeploymentUnhealthy
+        expr: |
+          (
+            max by (litellm_model_name, model_id, api_base, service, instance) (
+              litellm_deployment_state{job="litellm", model_id!="", litellm_model_name!="", api_base!=""}
+            ) == 2
+          )
+          or
+          (
+            max by (litellm_model_name, model_id, api_base, service, instance) (
+              litellm_deployment_state{job="litellm", model_id!="", litellm_model_name!="", api_base!=""}
+            ) == 1
+            and on (litellm_model_name, model_id, api_base)
+            sum by (litellm_model_name, model_id, api_base) (
+              increase(litellm_deployment_failure_responses_total{job="litellm", litellm_model_name!="", model_id!="", api_base!="", exception_status!~"4.."}[10m])
+            ) >= 10
+          )
+        for: 5m
+        labels:
+          severity: critical
+          component: litellm
+        annotations:
+          summary: "LiteLLM deployment unhealthy: {{ $labels.litellm_model_name }}"
+          description: "Deployment {{ $labels.litellm_model_name }} at {{ $labels.api_base }} has state {{ $value }}. LiteLLM uses 0=healthy, 1=partial outage, 2=complete outage."
+
+      - alert: LiteLLMDeploymentFailures
+        expr: |
+          (
+            sum by (litellm_model_name, model_id, api_base) (
+              increase(litellm_deployment_failure_responses_total{job="litellm", litellm_model_name!="", model_id!="", api_base!="", exception_status!~"4.."}[15m])
+            ) >= 20
+          )
+          and on (litellm_model_name, model_id, api_base)
+          (
+            sum by (litellm_model_name, model_id, api_base) (
+              increase(litellm_deployment_failure_responses_total{job="litellm", litellm_model_name!="", model_id!="", api_base!="", exception_status!~"4.."}[15m])
+            )
+            /
+            clamp_min(
+              sum by (litellm_model_name, model_id, api_base) (
+                increase(litellm_deployment_total_requests_total{job="litellm", litellm_model_name!="", model_id!="", api_base!=""}[15m])
+              ),
+              1
+            )
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: litellm
+        annotations:
+          summary: "LiteLLM deployment failures: {{ $labels.litellm_model_name }}"
+          description: "{{ $labels.litellm_model_name }} at {{ $labels.api_base }} returned at least 20 non-4xx failures in 15 minutes and failure ratio is above 5%."
+
+      - alert: LiteLLMLowOutputThroughput
+        expr: |
+          (
+            sum by (model, model_id) (
+              rate(litellm_output_tokens_metric_total{job="litellm", model!="", model_id!="", model!~".*(embedding|reranker|tts|asr).*"}[5m])
+            )
+            /
+            clamp_min(
+              sum by (model, model_id) (
+                rate(litellm_llm_api_latency_metric_sum{job="litellm", model!="", model_id!="", model!~".*(embedding|reranker|tts|asr).*"}[5m])
+              ),
+              0.001
+            )
+          ) < 5
+          and on (model, model_id)
+          sum by (model, model_id) (
+            increase(litellm_llm_api_latency_metric_count{job="litellm", model!="", model_id!="", model!~".*(embedding|reranker|tts|asr).*"}[5m])
+          ) >= 10
+        for: 5m
+        labels:
+          severity: warning
+          component: litellm
+        annotations:
+          summary: "LiteLLM low output throughput: {{ $labels.model }}"
+          description: "{{ $labels.model }} effective output throughput is below 5 output tokens/sec for 5 minutes, measured from LiteLLM end-to-end API latency."
+
+  - name: vllm-backend-health
+    rules:
+      - alert: VLLMTargetDown
+        expr: |
+          (up{job="vllm"} == 0)
+          unless on (service)
+          (sum by (service) (up{job="vllm"}) == 0)
+        for: 2m
+        labels:
+          severity: warning
+          component: vllm
+        annotations:
+          summary: "vLLM metrics target down: {{ $labels.host }} {{ $labels.instance }}"
+          description: "Prometheus cannot scrape vLLM metrics for {{ $labels.host }} at {{ $labels.instance }} for more than 2 minutes."
+
+      - alert: VLLMServiceDown
+        expr: sum by (service) (up{job="vllm"}) == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: vllm
+        annotations:
+          summary: "All vLLM targets are down: {{ $labels.service }}"
+          description: "Prometheus cannot scrape any vLLM target for {{ $labels.service }} for more than 2 minutes."
+
+      - alert: VLLMEngineStalled
+        expr: |
+          sum by (host, instance, service) (
+            vllm:num_requests_running{job="vllm"}
+          ) > 0
+          and on (host, instance, service)
+          sum by (host, instance, service) (
+            rate(vllm:generation_tokens_total{job="vllm"}[5m])
+          ) == 0
+          and on (host, instance, service)
+          sum by (host, instance, service) (
+            rate(vllm:prompt_tokens_total{job="vllm"}[5m])
+          ) == 0
+          and on (host, instance, service)
+          sum by (host, instance, service) (
+            increase(vllm:request_success_total{job="vllm"}[5m])
+          ) == 0
+        for: 10m
+        labels:
+          severity: critical
+          component: vllm
+        annotations:
+          summary: "vLLM engine appears stalled: {{ $labels.host }} {{ $labels.instance }}"
+          description: "vLLM has running requests but no prompt tokens, generation tokens, or completed requests for 10 minutes. This avoids treating long prefill as an engine stall."
+
+      - alert: VLLMQueueBacklog
+        expr: |
+          sum by (host, instance, service) (
+            vllm:num_requests_waiting{job="vllm"}
+          ) >= 3
+        for: 5m
+        labels:
+          severity: warning
+          component: vllm
+        annotations:
+          summary: "vLLM queue backlog: {{ $labels.host }} {{ $labels.instance }}"
+          description: "vLLM has at least 3 queued requests for more than 5 minutes."
+
+  - name: vllm-router-health
+    rules:
+      - alert: VLLMRouterTargetDown
+        expr: up{job="vllm-router"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: vllm-router
+        annotations:
+          summary: "vLLM router metrics target down: {{ $labels.service }} {{ $labels.instance }}"
+          description: "Prometheus cannot scrape the vLLM router for {{ $labels.service }} at {{ $labels.instance }} for more than 2 minutes."
+
+      - alert: VLLMRouterNoActiveWorkers
+        expr: vllm_router_active_workers{job="vllm-router"} < 1
+        for: 2m
+        labels:
+          severity: critical
+          component: vllm-router
+        annotations:
+          summary: "vLLM router has no active workers: {{ $labels.service }}"
+          description: "The vLLM router at {{ $labels.instance }} has reported no active workers for more than 2 minutes."
+
+      - alert: VLLMRouterCircuitBreakerOpen
+        expr: vllm_router_cb_state{job="vllm-router"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: vllm-router
+        annotations:
+          summary: "vLLM router circuit breaker open: {{ $labels.service }}"
+          description: "The circuit breaker for worker {{ $labels.worker }} on {{ $labels.instance }} has remained open for more than 5 minutes."
+
+      - alert: VLLMRouterHighErrorRate
+        expr: |
+          (
+            sum by (instance, service) (
+              increase(vllm_router_request_errors_total{job="vllm-router"}[15m])
+            ) >= 10
+          )
+          and on (instance, service)
+          (
+            sum by (instance, service) (
+              increase(vllm_router_request_errors_total{job="vllm-router"}[15m])
+            )
+            /
+            clamp_min(
+              sum by (instance, service) (
+                increase(vllm_router_requests_total{job="vllm-router"}[15m])
+              ),
+              1
+            )
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: vllm-router
+        annotations:
+          summary: "vLLM router error rate high: {{ $labels.service }}"
+          description: "The vLLM router at {{ $labels.instance }} returned at least 10 errors in 15 minutes and its error ratio is above 5%."
+
+  - name: vllm-aux-backend-health
+    rules:
+      - alert: VLLMAuxTargetDown
+        expr: up{job="vllm-aux"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: vllm-aux
+        annotations:
+          summary: "Auxiliary vLLM metrics target down: {{ $labels.service }} {{ $labels.instance }}"
+          description: "Prometheus cannot scrape auxiliary vLLM metrics for {{ $labels.service }} at {{ $labels.instance }} for more than 2 minutes."
+
+      - alert: VLLMAuxQueueBacklog
+        expr: |
+          sum by (host, instance, service) (
+            vllm:num_requests_waiting{job="vllm-aux"}
+          ) >= 5
+        for: 5m
+        labels:
+          severity: warning
+          component: vllm-aux
+        annotations:
+          summary: "Auxiliary vLLM queue backlog: {{ $labels.service }} {{ $labels.instance }}"
+          description: "Auxiliary vLLM service {{ $labels.service }} has at least 5 queued requests for more than 5 minutes."

@@ -205,24 +205,18 @@ def test_update_ratchets_a_limit_down_by_what_the_branch_fixed():
     # limit of 100 falls to 90 -- the granted headroom (60) is preserved, not the
     # raw count.
     budget = {"reportAny": {"limit": 100}}
-    assert gate.ratcheted_budget(budget, {"reportAny": 30}, {"reportAny": 40}) == {
-        "reportAny": {"limit": 90}
-    }
+    assert gate.ratcheted_budget(budget, {"reportAny": 30}, {"reportAny": 40}, budget) == {"reportAny": {"limit": 90}}
 
 
 def test_update_never_raises_a_limit_when_a_rule_grows():
     # Adding violations must not loosen the ceiling; the limit holds flat.
     budget = {"reportAny": {"limit": 100}}
-    assert gate.ratcheted_budget(budget, {"reportAny": 55}, {"reportAny": 40}) == {
-        "reportAny": {"limit": 100}
-    }
+    assert gate.ratcheted_budget(budget, {"reportAny": 55}, {"reportAny": 40}, budget) == {"reportAny": {"limit": 100}}
 
 
 def test_update_clamps_a_limit_at_zero_never_negative():
     budget = {"reportAny": {"limit": 5}}
-    assert gate.ratcheted_budget(budget, {"reportAny": 0}, {"reportAny": 40}) == {
-        "reportAny": {"limit": 0}
-    }
+    assert gate.ratcheted_budget(budget, {"reportAny": 0}, {"reportAny": 40}, budget) == {"reportAny": {"limit": 0}}
 
 
 def test_malformed_basedpyright_json_exits_loudly_not_as_zero_errors():

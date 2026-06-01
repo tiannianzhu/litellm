@@ -51,8 +51,17 @@ build/
 **/node_modules
 ui/litellm-dashboard/.next
 ui/litellm-dashboard/out
+litellm/proxy/_experimental/out
 litellm-rust/target/
 litellm/rust_bridge/_native*.so
 *.log
 .env
 .env.local
+.env.production
+
+# Runtime-mounted local configuration
+config.yaml
+callbacks/
+prometheus*.yml
+alertmanager*
+model_prices.local.json

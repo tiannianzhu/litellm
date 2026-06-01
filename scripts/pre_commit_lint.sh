@@ -7,7 +7,7 @@
 #   - anything staged -> scope is the staged files; changed-but-unstaged files
 #     whose checks were skipped are called out
 #   - nothing staged  -> scope is the working tree's diff against the merge base
-#     with origin's current default branch, untracked files included
+#     with upstream/main, untracked files included
 # The per-area checks:
 #   - litellm/ Python  -> `make lint` (test-linting.yml's lint job)
 #   - tests/e2e Python -> `make lint-e2e-basedpyright` (test-linting.yml's e2e type-check step)
@@ -72,7 +72,7 @@ else
     export BASE_REF="$base_ref"
     merge_base=$(git merge-base "$base_ref" HEAD 2>/dev/null) || {
         echo "check: cannot resolve the merge base with $base_ref." >&2
-        echo "  Fix: fetch the base ref and provide BASE_REF=<ref>" >&2
+        echo "  Fix: make lint-fetch-base, or provide BASE_REF=<ref>" >&2
         echo "check: FAIL"
         exit 1
     }

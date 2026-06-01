@@ -6,9 +6,14 @@ brand-new budget file is fine. Each branch is pinned here.
 """
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
+from typing import Final
+
+import pytest
 
 _MODULE_PATH = (
     Path(__file__).resolve().parents[2] / "scripts" / "budget_ratchet_check.py"
@@ -155,4 +160,125 @@ def test_unresolvable_base_ref_exits_nonzero_instead_of_skipping():
         text=True,
     )
     assert proc.returncode == 1
-    assert "does not resolve to a commit" in proc.stderr
+    assert "Cannot resolve the merge base with local definitely-not-a-real-ref-zzz" in proc.stderr
+
+
+def _git_in(repo: Path, *args: str) -> str:
+    return subprocess.check_output(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Budget tests",
+            "-c",
+            "user.email=budget-tests@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            *args,
+        ],
+        text=True,
+    ).strip()
+
+
+@pytest.fixture(params=("ruff_strict_gate", "type_discipline_gate", "type_check_gate", "test_quality_gate"))
+def updater(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    gate_name: Final[str] = request.param
+    spec: Final = importlib.util.spec_from_file_location(
+        f"budget_update_{gate_name}", _MODULE_PATH.parent / f"{gate_name}.py"
+    )
+    assert spec is not None and spec.loader is not None
+    updater: Final = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, updater)
+    spec.loader.exec_module(updater)
+    return updater
+
+
+def test_budget_update_does_not_charge_committed_fixes_twice(
+    updater: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git_in(tmp_path, "init", "-q", "-b", "main")
+    budget_name: Final = updater.BUDGET_PATH.name
+    budget_path: Final = tmp_path / budget_name
+    budget_path.write_text(json.dumps({"EXAMPLE": {"limit": 100}}))
+    _git_in(tmp_path, "add", budget_name)
+    _git_in(tmp_path, "commit", "-qm", "initial budget")
+    base: Final = _git_in(tmp_path, "rev-parse", "HEAD")
+    _git_in(tmp_path, "checkout", "-qb", "local")
+    monkeypatch.setattr(updater, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(updater, "BUDGET_PATH", budget_path)
+    monkeypatch.setattr(updater, "resolve_base_point", lambda ref: _git_in(tmp_path, "merge-base", ref, "HEAD"))
+    if budget_name == "basedpyright-code-budget.json":
+        monkeypatch.setattr(updater, "base_counts_cached", lambda ref: {"EXAMPLE": 100})
+    else:
+        monkeypatch.setattr(updater, "base_counts", lambda ref: {"EXAMPLE": 100})
+        monkeypatch.setattr(updater, "head_violations", lambda: (updater.Violation("sample.py", 1, "EXAMPLE"),) * 95)
+
+    def update() -> None:
+        if budget_name == "basedpyright-code-budget.json":
+            updater.cmd_update({"EXAMPLE": 95}, base)
+        else:
+            updater.cmd_update(base)
+
+    update()
+    once: Final = budget_path.read_bytes()
+    assert json.loads(once) == {"EXAMPLE": {"limit": 95}}
+    _git_in(tmp_path, "add", budget_name)
+    _git_in(tmp_path, "commit", "-qm", "record fixed violations")
+    update()
+    assert budget_path.read_bytes() == once
+
+
+def test_budget_update_counts_additional_fixes_without_loosening_existing_limits(updater: ModuleType) -> None:
+    base_budget: Final = {"EXAMPLE": {"limit": 100}, "STRICT": {"limit": 100}, "REMOVED": {"limit": 0}}
+    budget: Final = {"EXAMPLE": {"limit": 95}, "STRICT": {"limit": 70}, "NEW": {"limit": 150}}
+    base_counts: Final = {"EXAMPLE": 100, "STRICT": 100, "NEW": 1000}
+    updated: Final = updater.ratcheted_budget(budget, {"EXAMPLE": 90, "STRICT": 90, "NEW": 0}, base_counts, base_budget)
+    assert updated == {"EXAMPLE": {"limit": 90}, "STRICT": {"limit": 70}, "NEW": {"limit": 150}}
+    assert (
+        updater.ratcheted_budget(updated, {"EXAMPLE": 98, "STRICT": 110, "NEW": 0}, base_counts, base_budget) == updated
+    )
+
+
+@pytest.mark.parametrize(
+    ("contents", "expected"),
+    (
+        (None, {}),
+        ('{"EXAMPLE": {"limit": 100}}', {"EXAMPLE": {"limit": 100}}),
+        ('{"EXAMPLE": {"baseline": 90, "slack": 10}}', {"EXAMPLE": {"limit": 100}}),
+    ),
+)
+def test_base_budget_reads_the_committed_snapshot(
+    updater: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str | None,
+    expected: dict[str, dict[str, int]],
+) -> None:
+    _git_in(tmp_path, "init", "-q", "-b", "main")
+    budget_path: Final = tmp_path / updater.BUDGET_PATH.name
+    if contents is not None:
+        budget_path.write_text(contents)
+        _git_in(tmp_path, "add", budget_path.name)
+    _git_in(tmp_path, "commit", "-qm", "base snapshot", "--allow-empty")
+    base: Final = _git_in(tmp_path, "rev-parse", "HEAD")
+    budget_path.write_text('{"EXAMPLE": {"limit": 1}}')
+    monkeypatch.setattr(updater, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(updater, "BUDGET_PATH", budget_path)
+    assert updater._base_budget(base) == expected
+
+
+def test_base_budget_does_not_treat_invalid_refs_or_json_as_new_rules(
+    updater: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git_in(tmp_path, "init", "-q", "-b", "main")
+    budget_path: Final = tmp_path / updater.BUDGET_PATH.name
+    budget_path.write_text("invalid JSON")
+    _git_in(tmp_path, "add", budget_path.name)
+    _git_in(tmp_path, "commit", "-qm", "malformed budget")
+    monkeypatch.setattr(updater, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(updater, "BUDGET_PATH", budget_path)
+    with pytest.raises(subprocess.CalledProcessError):
+        updater._base_budget("missing-ref")
+    with pytest.raises(json.JSONDecodeError):
+        updater._base_budget("HEAD")

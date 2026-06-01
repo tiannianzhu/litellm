@@ -76,7 +76,7 @@ def test_update_ratchets_limit_down_by_what_the_branch_fixed_never_up():
     # limit holds flat at 10 (a fix must never loosen a ceiling).
     current = {"ANN001": 80, "C901": 12}
     base = {"ANN001": 100, "C901": 9}
-    assert gate.ratcheted_budget(budget, current, base) == {
+    assert gate.ratcheted_budget(budget, current, base, budget) == {
         "ANN001": {"limit": 130},
         "C901": {"limit": 10},
     }
