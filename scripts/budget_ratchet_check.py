@@ -181,7 +181,7 @@ def regressions_for(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("budgets", nargs="*", help="budget files to check")
     args = parser.parse_args()
     from default_branch import resolve_base_ref

@@ -53,13 +53,14 @@ def remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
     return remote, repo
 
 
-def _resolve(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _resolve(repo: Path, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(ROOT / "scripts" / "default_branch.py"), *args],
         cwd=repo,
         capture_output=True,
         text=True,
         check=False,
+        env={**{key: value for key, value in os.environ.items() if key != "BASE_REF"}, **(extra_env or {})},
     )
 
 
@@ -74,16 +75,16 @@ def _make(repo: Path, target: str, *args: str) -> subprocess.CompletedProcess[st
     )
 
 
-def test_existing_single_branch_clone_follows_remote_switch(remote_and_clone: tuple[Path, Path]) -> None:
+def test_explicit_branch_query_follows_remote_switch_without_fetching(remote_and_clone: tuple[Path, Path]) -> None:
     remote, repo = remote_and_clone
-    before: Final = _resolve(repo)
+    before: Final = _resolve(repo, "--branch")
     assert before.returncode == 0, before.stderr
-    assert before.stdout.strip() == "origin/litellm_internal_staging"
+    assert before.stdout.strip() == "litellm_internal_staging"
     _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
-    after: Final = _resolve(repo)
+    after: Final = _resolve(repo, "--branch")
     assert after.returncode == 0, after.stderr
-    assert after.stdout.strip() == "origin/main"
-    assert _git(repo, "rev-parse", "origin/main") == _git(remote, "rev-parse", "main")
+    assert after.stdout.strip() == "main"
+    assert "refs/remotes/origin/main" not in _git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes")
     assert _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD").endswith("/litellm_internal_staging")
 
 
@@ -97,7 +98,7 @@ def test_unverifiable_default_never_uses_cached_head(
         _git(remote, "symbolic-ref", "HEAD", "refs/heads/missing")
     else:
         _git(repo, "remote", "set-url", "origin", str(remote / "missing"))
-    result: Final = _resolve(repo)
+    result: Final = _resolve(repo, "--branch")
     assert result.returncode != 0
     assert not result.stdout
     assert "explicit base ref" in result.stderr
@@ -121,18 +122,18 @@ def test_explicit_base_works_without_remote_access(
     assert "No changed litellm Python files" in checked.stdout
 
 
-def test_budget_ratchet_compares_against_new_default(remote_and_clone: tuple[Path, Path]) -> None:
+def test_budget_ratchet_compares_against_local_upstream(remote_and_clone: tuple[Path, Path]) -> None:
     remote, repo = remote_and_clone
-    _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(repo, "fetch", "-q", str(remote), "main:refs/remotes/upstream/main")
     resolved: Final = _resolve(repo)
     assert resolved.returncode == 0, resolved.stderr
-    _git(repo, "checkout", "-qb", "litellm_feature", "origin/main")
+    _git(repo, "checkout", "-qb", "litellm_feature", "upstream/main")
     (repo / "ruff-strict-budget.json").write_text('{"C901": {"limit": 1}}\n')
     command: Final = [sys.executable, "scripts/budget_ratchet_check.py"]
     checked: Final = subprocess.run(command, cwd=repo, capture_output=True, text=True, check=False)
     assert checked.returncode == 1
     assert "limit raised 0 -> 1" in checked.stdout
-    assert "base origin/main" in checked.stdout
+    assert "base upstream/main" in checked.stdout
     overridden: Final = subprocess.run(
         [*command, "--base", "origin/litellm_internal_staging"],
         cwd=repo,
@@ -199,7 +200,7 @@ def test_migration_freshness_refuses_unavailable_remote(remote_and_clone: tuple[
         "type_check_gate",
     ],
 )
-def test_each_gate_refuses_an_unverifiable_default(remote_and_clone: tuple[Path, Path], gate: str) -> None:
+def test_each_gate_refuses_a_missing_local_base(remote_and_clone: tuple[Path, Path], gate: str) -> None:
     remote, repo = remote_and_clone
     _git(repo, "remote", "set-url", "origin", str(remote / "missing"))
     result: Final = subprocess.run(
@@ -208,16 +209,19 @@ def test_each_gate_refuses_an_unverifiable_default(remote_and_clone: tuple[Path,
         capture_output=True,
         text=True,
         check=False,
+        env={key: value for key, value in os.environ.items() if key != "BASE_REF"},
     )
     assert result.returncode != 0
-    assert "Cannot verify the base branch against origin" in result.stderr
+    assert "Cannot resolve the merge base with local upstream/main" in result.stderr
+    assert "make lint-fetch-base" in result.stderr
 
 
 @pytest.mark.parametrize(
     "target", ["lint-format-check-changed", "lint-test-quality", "lint-test-quality-budget-update"]
 )
-def test_direct_make_target_fetches_default_once(remote_and_clone: tuple[Path, Path], target: str) -> None:
+def test_direct_make_target_uses_local_base_without_fetching(remote_and_clone: tuple[Path, Path], target: str) -> None:
     _, repo = remote_and_clone
+    _git(repo, "update-ref", "refs/remotes/upstream/main", "HEAD")
     trace: Final = repo.parent / "git-trace.jsonl"
     shutil.copyfile(ROOT / "scripts" / "check_test_quality.py", repo / "scripts" / "check_test_quality.py")
     shutil.copyfile(ROOT / "test-quality-budget.json", repo / "test-quality-budget.json")
@@ -236,5 +240,32 @@ def test_direct_make_target_fetches_default_once(remote_and_clone: tuple[Path, P
         for line in trace.read_text().splitlines()
         if (event := json.loads(line)).get("event") == "start"
     )
-    assert sum(command[0] == "ls-remote" for command in commands) == 1
-    assert sum(command[0] == "fetch" for command in commands) == 1
+    assert not any(command[0] in ("ls-remote", "fetch") for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("args", "environment", "expected"),
+    [
+        ((), {}, "upstream/main"),
+        ((), {"BASE_REF": ""}, "upstream/main"),
+        ((), {"BASE_REF": "HEAD"}, "HEAD"),
+        (("--base", "origin/litellm_internal_staging"), {"BASE_REF": "missing"}, "origin/litellm_internal_staging"),
+        (("--base", ""), {"BASE_REF": "HEAD"}, "HEAD"),
+    ],
+)
+def test_base_precedence_is_offline(
+    remote_and_clone: tuple[Path, Path], args: tuple[str, ...], environment: dict[str, str], expected: str
+) -> None:
+    remote, repo = remote_and_clone
+    _git(repo, "update-ref", "refs/remotes/upstream/main", "HEAD")
+    _git(repo, "remote", "set-url", "origin", str(remote / "missing"))
+    trace: Final = repo.parent / "base-trace.jsonl"
+    result: Final = _resolve(repo, *args, extra_env={**environment, "GIT_TRACE2_EVENT": str(trace)})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+    commands: Final = tuple(
+        event["argv"][1:]
+        for line in trace.read_text().splitlines()
+        if (event := json.loads(line)).get("event") == "start"
+    )
+    assert not any(command[0] in ("ls-remote", "fetch") for command in commands)

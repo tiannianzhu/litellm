@@ -52,7 +52,9 @@ Don't hesitate to use values in .env to get needed API keys and other secrets, a
 
 Python max line length is 120, not 88
 
-Never edit or commit `ruff-strict-budget.json`, `type-discipline-budget.json`, `basedpyright-code-budget.json`, or `test-quality-budget.json` on a PR branch, and don't run `make lint-budget-update` there. A scheduled Devin automation lowers the limits on the default branch in its own PR by exactly what landed since the last ratchet, so concurrent PRs don't fight over the same `"limit"` lines. Keep the hosted automation's target in sync when the repository default changes. If your branch already carries a budget edit, drop it before opening the PR
+Keep lint budget updates in a dedicated maintenance commit, separate from feature and bug fixes. For this fork, `make check` evaluates the complete local patch stack against its merge-base with `upstream/main`. Run `make lint-budget-update` only for budget maintenance: it uses that same commit's budgets and violation counts, accounts for cumulative fixes once, and preserves stricter local limits. After syncing upstream, review the budgets against the new merge-base. The working tree must contain exactly the changes being evaluated
+
+Local checks and budget updates resolve their base through `scripts/default_branch.py`: explicit `--base` takes precedence over `BASE_REF`, then the default is local `upstream/main`. The ref must have a merge-base with `HEAD`; resolution never fetches. Use `make check BASE_REF=<ref>` or a standalone gate's `--base <ref>` to override it. Run `make lint-fetch-base` explicitly to update `upstream/main`
 
 `make check` (f.k.a. `make pre-commit`, which still works identically as an alias) saves its complete output to a log file in .git (overwriting previous logs) and prints that path as its first and last output lines. To inspect a run, read or grep that log instead of re-running the multi-minute checks just to see a different slice
 

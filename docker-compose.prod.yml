@@ -1,0 +1,67 @@
+services:
+  litellm:
+    build:
+      target: runtime
+      args:
+        SERVER_ROOT_PATH: ${SERVER_ROOT_PATH:-/}
+    image: litellm-local:${LITELLM_VERSION:-latest}
+    restart: unless-stopped
+    stop_grace_period: 60s
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./callbacks:/app/callbacks:ro
+      - ./model_prices.local.json:/app/model_prices.local.json:ro
+    command:
+      - "--config=/app/config.yaml"
+    env_file: !override
+      - .env.production
+    environment: !override
+      DATABASE_URL: "postgresql://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:?}"
+      DISABLE_SCHEMA_UPDATE: "true"
+      LITELLM_MODEL_COST_OVERRIDES_PATH: /app/model_prices.local.json
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    restart: unless-stopped
+    container_name: !reset null
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports: !override []
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d ${POSTGRES_DB} -U ${POSTGRES_USER}"]
+
+  prometheus:
+    restart: unless-stopped
+    volumes:
+      - prometheus_data:/prometheus
+      - ./prometheus.local.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus.alerts.yml:/etc/prometheus/prometheus.alerts.yml:ro
+    ports: !override []
+
+  alertmanager:
+    image: prom/alertmanager
+    profiles: ["alerting"]
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+
+  feishu-alert-webhook:
+    image: python:3.13-alpine
+    profiles: ["alerting"]
+    restart: unless-stopped
+    volumes:
+      - ./alertmanager-feishu/feishu_adapter.py:/app/feishu_adapter.py:ro
+    environment:
+      FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+    command: ["python", "/app/feishu_adapter.py"]
+
+volumes:
+  alertmanager_data:

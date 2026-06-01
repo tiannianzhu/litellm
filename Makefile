@@ -29,13 +29,14 @@ help:
 	@echo "  make format             - Apply ruff format code formatting"
 	@echo "  make format-check       - Check ruff format code formatting (matches CI)"
 	@echo "  make lint               - Run all linting (Ruff, basedpyright, format check, circular imports, import safety)"
+	@echo "  make lint-fetch-base    - Explicitly fetch upstream/main before checking or syncing"
 	@echo "  make lint-ruff          - Run Ruff linting only"
 	@echo "  make lint-basedpyright  - Run basedpyright strict, gated by per-rule error counts"
 	@echo "  make lint-e2e-basedpyright - Run basedpyright over tests/e2e (zero errors allowed)"
 	@echo "  make lint-basedpyright-budget-update - Ratchet basedpyright limits down by what this branch fixed"
 	@echo "  make lint-format        - Check ruff format formatting (matches CI)"
 	@echo "  make lint-ruff-budget - Gate the codebase total of each strict ruff rule against its limit"
-	@echo "  make lint-gate        - Strict ruff gate in CI-parity mode (fetches the default branch, simulates the merge)"
+	@echo "  make lint-gate        - Strict Ruff gate against the configured local merge-base"
 	@echo "  make lint-ruff-budget-update - Ratchet ruff-strict-budget.json limits down by what this branch fixed"
 	@echo "  make lint-test-quality  - Gate the test suite against test-quality-budget.json"
 	@echo "  make lint-budget-update - Ratchet all budgets down (ruff + type-discipline + test quality + basedpyright)"
@@ -136,7 +137,7 @@ format-check: install-dev
 	cd litellm && $(UV_RUN) ruff format --check --exclude '/enterprise/' . && cd ..
 
 lint-fetch-base:
-	@$(RESOLVE_BASE)
+	git fetch upstream main
 
 # Mirror test-linting.yml's lint job environment: the proxy-dev group plus a generated
 # Prisma client, so `basedpyright tests/e2e` resolves the same modules CI does. The
@@ -221,7 +222,7 @@ lint-test-quality: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
 	$(UV_RUN) python scripts/test_quality_gate.py --base "$(BASE_REF)"
 
 # --update lowers each limit by what this branch fixed since its branch point, so
-# it needs the base ref fetched to resolve the merge-base.
+# it uses the configured local ref to resolve the merge-base.
 lint-basedpyright-budget-update: install-dev
 	$(UV_RUN) python scripts/type_check_gate.py --update --base "$(BASE_REF)"
 
@@ -258,8 +259,8 @@ check-import-safety: $(LINT_DEP_INSTALL)
 # runs the diff-scoped ruff format check, whole-tree ruff check, the strict-rule /
 # type-discipline / basedpyright budgets as a delta vs the base, then the circular-import
 # and import-safety checks. Steps that compare against the base resolve it the same way CI
-# does (merge-base with origin's current default branch). Setup (env sync, Prisma client,
-# base fetch) runs once up front; the checks themselves are independent, so a sub-make
+# does (merge-base with the configured local ref). Setup (env sync, Prisma client,
+# base resolution) runs once up front; the checks themselves are independent, so a sub-make
 # fans them out with -j and the fast ones finish under basedpyright's shadow.
 lint:
 	@$(GATE_SLOT_LOCK) $(MAKE) lint-inner

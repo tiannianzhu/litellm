@@ -126,6 +126,11 @@ def _sandbox(tmp_path: Path) -> tuple[Path, Path]:
     _write_executable(bin_dir / "uv", UV_STUB)
     _write_executable(bin_dir / "npm", NPM_STUB)
     _write_executable(bin_dir / "node", NODE_STUB)
+    _write_executable(
+        bin_dir / "git",
+        '#!/bin/sh\nif [ "$1" = fetch ]; then\n'
+        '    touch "$STUB_BIN/fetch-attempted"\n    exit 86\nfi\nexec /usr/bin/git "$@"\n',
+    )
     return repo, bin_dir
 
 
@@ -159,12 +164,12 @@ def _commit_all(repo: Path, message: str) -> None:
     )
 
 
-def _set_base_ref(repo: Path, branch: str = "litellm_internal_staging") -> None:
-    remote = repo.parent / "remote.git"
-    subprocess.run(["git", "clone", "-q", "--bare", str(repo), str(remote)], check=True)
-    subprocess.run(["git", "update-ref", f"refs/heads/{branch}", "HEAD"], cwd=remote, check=True)
-    subprocess.run(["git", "symbolic-ref", "HEAD", f"refs/heads/{branch}"], cwd=remote, check=True)
-    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+def _set_base_ref(repo: Path) -> None:
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/upstream/main", "HEAD"],
+        cwd=repo,
+        check=True,
+    )
 
 
 def _stage_file(repo: Path, relative: str, body: str) -> None:
@@ -174,17 +179,17 @@ def _stage_file(repo: Path, relative: str, body: str) -> None:
     subprocess.run(["git", "add", relative], cwd=repo, check=True)
 
 
-@pytest.mark.parametrize("branch", ["litellm_internal_staging", "main"])
-def test_nothing_staged_scopes_to_working_tree_diff_and_runs_checks(tmp_path: Path, branch: str) -> None:
+def test_nothing_staged_scopes_to_working_tree_diff_and_runs_checks(tmp_path: Path) -> None:
     repo, bin_dir = _sandbox(tmp_path)
     _commit_all(repo, "base")
-    _set_base_ref(repo, branch)
+    _set_base_ref(repo)
     (repo / "litellm" / "foo.py").write_text("x = 2\n")
     proc = _run(repo, bin_dir, {})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "nothing staged; scoping to the working tree's diff" in proc.stdout
     assert "litellm/foo.py" in proc.stdout
     assert "linting Python" in proc.stdout
+    assert not (bin_dir / "fetch-attempted").exists()
 
 
 def test_nothing_staged_checks_committed_branch_changes(tmp_path: Path) -> None:
@@ -262,8 +267,8 @@ def test_nothing_staged_without_a_base_ref_fails_with_a_fetch_hint(tmp_path: Pat
     _commit_all(repo, "base")
     proc = _run(repo, bin_dir, {})
     assert proc.returncode == 1
-    assert "Cannot verify the base branch against origin" in proc.stdout
-    assert "explicit base ref" in proc.stdout
+    assert "Cannot resolve the merge base" in proc.stdout
+    assert "make lint-fetch-base" in proc.stdout
     assert "check: FAIL" in proc.stdout
 
 
@@ -636,10 +641,10 @@ def test_explicit_base_scopes_offline_without_a_remote(tmp_path: Path) -> None:
     assert "linting Python" in proc.stdout
 
 
-def test_symlinked_hook_can_resolve_default_branch(tmp_path: Path) -> None:
+def test_symlinked_hook_uses_local_upstream_base(tmp_path: Path) -> None:
     repo, bin_dir = _sandbox(tmp_path)
     _commit_all(repo, "base")
-    _set_base_ref(repo, "main")
+    _set_base_ref(repo)
     hook = repo / ".git" / "hooks" / "pre-commit"
     hook.symlink_to(SCRIPT)
     proc = subprocess.run(
@@ -647,4 +652,4 @@ def test_symlinked_hook_can_resolve_default_branch(tmp_path: Path) -> None:
         env=_env(repo, bin_dir, {}), timeout=120,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "no branch changes vs origin/main" in proc.stdout
+    assert "no branch changes vs upstream/main" in proc.stdout

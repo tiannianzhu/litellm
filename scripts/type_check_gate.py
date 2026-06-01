@@ -39,9 +39,10 @@ branch point pay for it once. A CI workflow publishes every staging commit's cou
 an artifact (``--emit-counts-dir`` is its entry point), and on a disk-cache miss
 the gate first tries to download the merge-base's artifact through the ``gh``
 CLI; any fetch failure falls back silently to the local base pass, so the gate
-never gets worse than it was without CI. ``--update`` ratchets each rule's ``limit`` down by the
-number of errors this branch fixed relative to its branch point (the merge-base),
-so the headroom you were granted shrinks by exactly what you cleared and never
+never gets worse than it was without CI. ``--update`` subtracts cumulative fixes
+from the budget at the merge-base, preserving stricter local limits without
+charging the same fixes again. Rules absent from the base budget stay unchanged.
+The headroom you were granted shrinks by what you cleared and never
 grows.
 
 ``--outputjson`` is used rather than text diagnostics because the latter wrap
@@ -556,24 +557,46 @@ def is_vacuous_run(
     return not counts and any(spec["limit"] for spec in budget.values())
 
 
+def _base_budget(base_point: str) -> Mapping[str, Mapping[str, int]]:
+    tracked: Final = subprocess.run(
+        ["git", "ls-tree", "--name-only", base_point, "--", BUDGET_PATH.name],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if not tracked.stdout.strip():
+        return {}
+    snapshot: Final[Mapping[str, Mapping[str, int]]] = json.loads(
+        subprocess.check_output(
+            ["git", "show", f"{base_point}:{BUDGET_PATH.name}"],
+            cwd=REPO_ROOT,
+            text=True,
+        )
+    )
+    return {
+        rule: {"limit": spec["limit"] if "limit" in spec else spec["baseline"] + spec.get("slack", 0)}
+        for rule, spec in snapshot.items()
+    }
+
+
 def ratcheted_budget(
     budget: Mapping[str, Mapping[str, int]],
     current: Mapping[str, int],
     base: Mapping[str, int],
+    base_budget: Mapping[str, Mapping[str, int]],
 ) -> dict[str, dict[str, int]]:
-    """Each rule's limit lowered by the errors `current` fixed vs `base`.
-
-    `base` is the count at the branch point (the commit this branch diverged
-    from). The drop is clamped to what was actually cleared (a rule that grew
-    stays put), so the limit only ever falls. Rules absent from the budget are
-    dropped: a genuinely new error category is added to the JSON deliberately,
-    not on update.
-    """
+    """Apply cumulative fixes to the base budget, retaining any stricter local limits."""
     return {
-        code: {
-            "limit": max(0, spec["limit"] - max(0, base.get(code, 0) - current.get(code, 0)))
+        rule: {
+            "limit": spec["limit"]
+            if rule not in base_budget
+            else min(
+                spec["limit"],
+                max(0, base_budget[rule]["limit"] - max(0, base.get(rule, 0) - current.get(rule, 0))),
+            )
         }
-        for code, spec in sorted(budget.items())
+        for rule, spec in sorted(budget.items())
     }
 
 
@@ -587,13 +610,11 @@ def cmd_update(current: Mapping[str, int], base_ref: str) -> None:
     """
     budget = json.loads(BUDGET_PATH.read_text()) if BUDGET_PATH.exists() else {}
     base_point = resolve_base_point(base_ref)
-    updated = ratcheted_budget(budget, current, base_counts_cached(base_point))
+    base_budget: Final = _base_budget(base_point)
+    updated = ratcheted_budget(budget, current, base_counts_cached(base_point), base_budget)
     BUDGET_PATH.write_text(json.dumps(updated, indent=2, sort_keys=True) + "\n")
     cleared = sum(budget[code]["limit"] - updated[code]["limit"] for code in updated)
-    print(
-        f"Ratcheted basedpyright limits down by {cleared} errors this branch fixed "
-        f"across {len(updated)} rules"
-    )
+    print(f"Ratcheted basedpyright limits down by {cleared} errors this branch fixed across {len(updated)} rules")
 
 
 def cmd_emit_counts(head: Mapping[str, int], directory: Path, head_sha: str) -> None:
@@ -665,7 +686,7 @@ def cmd_check(head: Mapping[str, int], base_ref: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--emit-counts-dir", type=Path)
     args = parser.parse_args()
