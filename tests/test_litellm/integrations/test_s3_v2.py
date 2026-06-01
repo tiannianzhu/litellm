@@ -1914,7 +1914,7 @@ def test_non_string_key_id_is_dropped_and_valid_algorithm_is_kept(monkeypatch):
 
 _ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE"
 _SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-_KEY_WITH_SPACE = "LOGS/LLM AI Projects/2026-08-04/time-13-01-00-abc.json"
+_KEY_WITH_SPACE = "LOGS/LLM AI Projects/2026-08-04/time-13-01-00-resp_abc==.json"
 
 
 def _signature_for(signer_cls, url: str, method: str, body: bytes | None, headers: dict[str, str]) -> str:

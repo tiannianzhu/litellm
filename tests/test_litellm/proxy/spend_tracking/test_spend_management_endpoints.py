@@ -5786,6 +5786,35 @@ async def test_resolve_payload_fetches_from_cold_storage_when_pg_empty():
 
 
 @pytest.mark.asyncio
+async def test_resolve_payload_projects_responses_input_from_cold_storage():
+    cold_payload = {
+        "messages": [{"role": "user", "content": "summarize this"}],
+        "response": {"output": [{"type": "message", "content": []}]},
+        "model": "openai/gpt-5",
+        "call_type": "responses",
+        "model_parameters": {"tool_choice": "auto"},
+    }
+    handler, _ = _cold_storage_handler(cold_payload)
+    row = {
+        "messages": "{}",
+        "response": "{}",
+        "proxy_server_request": "{}",
+        "metadata": {"cold_storage_object_key": "k/responses.json"},
+    }
+
+    resolved = await spend_management_endpoints._resolve_request_response_payload(
+        row, cold_storage_handler=handler
+    )
+
+    assert resolved.messages is None
+    assert resolved.proxy_server_request == {
+        "tool_choice": "auto",
+        "model": "openai/gpt-5",
+        "input": cold_payload["messages"],
+    }
+
+
+@pytest.mark.asyncio
 async def test_resolve_payload_metadata_as_json_string():
     cold_payload = {"messages": "in", "response": "out", "proxy_server_request": None}
     handler, logger = _cold_storage_handler(cold_payload)
@@ -5947,7 +5976,12 @@ def test_ui_view_request_response_reads_from_cold_storage(client, monkeypatch):
         {
             "messages": [{"role": "user", "content": "hi"}],
             "response": {"choices": [{"message": {"content": "hello"}}]},
-            "proxy_server_request": None,
+            "model": "openai/gpt-4o-mini",
+            "model_group": "chat-model",
+            "call_type": "completion",
+            "model_parameters": {
+                "tools": [{"type": "function", "function": {"name": "lookup"}}]
+            },
         }
     )
     monkeypatch.setattr(litellm, "cold_storage_custom_logger", "s3_v2", raising=False)
@@ -5972,7 +6006,12 @@ def test_ui_view_request_response_reads_from_cold_storage(client, monkeypatch):
         )
         assert response.status_code == 200
         body = response.json()
-        assert body["messages"] == [{"role": "user", "content": "hi"}]
+        assert body["messages"] is None
+        assert body["proxy_server_request"] == {
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "model": "chat-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
         assert body["response"] == {"choices": [{"message": {"content": "hello"}}]}
         assert cold_logger.requested_object_keys == ["k/cold.json"]
     finally:
