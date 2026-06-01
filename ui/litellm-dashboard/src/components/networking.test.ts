@@ -1038,35 +1038,39 @@ describe("getUiConfig runtime backend discovery", () => {
     return { networking, mockFetch };
   };
 
-  it("uses a normalized runtime backend URL for discovery and the management fallback", async () => {
-    const mockFetch = vi
-      .fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ backend_url: "  https://backend.example.com///  " }),
-      } as Response)
-      .mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          ...discoveryConfig(),
-          gateway_base_url: "  https://gateway.example.com/// ",
-        }),
-      } as Response);
-    vi.stubGlobal("fetch", mockFetch);
-    const networking = await loadFreshNetworking();
+  it.each(["/litellm/.well-known/litellm-ui-config", "/custom/ui-config"])(
+    "uses a normalized runtime backend URL with discovery path %s",
+    async (discoveryPath) => {
+      vi.stubEnv("NEXT_PUBLIC_LITELLM_UI_CONFIG_PATH", discoveryPath);
+      const mockFetch = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ backend_url: "  https://backend.example.com///  " }),
+        } as Response)
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            ...discoveryConfig(),
+            gateway_base_url: "  https://gateway.example.com/// ",
+          }),
+        } as Response);
+      vi.stubGlobal("fetch", mockFetch);
+      const networking = await loadFreshNetworking();
 
-    await networking.getUiConfig();
+      await networking.getUiConfig();
 
-    expect(mockFetch).toHaveBeenNthCalledWith(1, "/ui/litellm-runtime-config.json", { cache: "no-store" });
-    expect(mockFetch.mock.calls[1][0]).toBe("https://backend.example.com/litellm/.well-known/litellm-ui-config");
-    expect(networking.getProxyBaseUrl().replace(/\/+$/, "")).toBe("https://backend.example.com");
-    expect(networking.getGatewayBaseUrl()).toBe("https://gateway.example.com");
+      expect(mockFetch).toHaveBeenNthCalledWith(1, "/ui/litellm-runtime-config.json", { cache: "no-store" });
+      expect(mockFetch.mock.calls[1][0]).toBe(`https://backend.example.com${discoveryPath}`);
+      expect(networking.getProxyBaseUrl().replace(/\/+$/, "")).toBe("https://backend.example.com");
+      expect(networking.getGatewayBaseUrl()).toBe("https://gateway.example.com");
 
-    networking.switchToWorkerUrl("https://worker.example.com");
-    expect(networking.getGatewayBaseUrl()).toBe("https://worker.example.com");
-    networking.switchToWorkerUrl(null);
-    expect(networking.getGatewayBaseUrl()).toBe("https://gateway.example.com");
-  });
+      networking.switchToWorkerUrl("https://worker.example.com");
+      expect(networking.getGatewayBaseUrl()).toBe("https://worker.example.com");
+      networking.switchToWorkerUrl(null);
+      expect(networking.getGatewayBaseUrl()).toBe("https://gateway.example.com");
+    },
+  );
 
   it.each([
     ["404", { ok: false }],

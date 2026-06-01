@@ -267,6 +267,11 @@ def environment_fingerprints(
     )
 
 
+def save_diagnostics(payload: str, path: Path) -> None:
+    path.write_text(payload)
+    print(f"Saved basedpyright diagnostics to {path}")
+
+
 def checker_identity(dep_groups: tuple[str, ...] = TYPECHECK_DEP_GROUPS) -> Checker:
     return Checker("basedpyright", environment_fingerprints(dep_groups))
 
@@ -312,7 +317,7 @@ def judge(head: Mapping[str, int], base: Mapping[str, int], base_point: str) -> 
 
 def main() -> None:
     parser: Final = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument(
         "--emit-counts-dir",
         type=Path,
@@ -322,15 +327,19 @@ def main() -> None:
     from default_branch import resolve_base_ref
     from gate_slot_lock import held_slot
 
-    if args.emit_counts_dir is not None:
-        with held_slot():
-            ensure_typecheck_env()
-            emit_counts(checker_identity(), count_basedpyright(run_basedpyright()), args.emit_counts_dir, head_sha())
-        return
-    base_ref: Final = resolve_base_ref(args.base, REPO_ROOT)
+    base_ref: Final = None if args.emit_counts_dir is not None else resolve_base_ref(args.base, REPO_ROOT)
     with held_slot():
         ensure_typecheck_env()
-        cmd_check(count_basedpyright(run_basedpyright()), base_ref)
+        diagnostics_path: Final = REPO_ROOT / _run(
+            ["git", "rev-parse", "--git-path", "basedpyright-diagnostics.json"]
+        ).strip()
+        diagnostics: Final = run_basedpyright()
+        save_diagnostics(diagnostics, diagnostics_path)
+        head: Final = count_basedpyright(diagnostics)
+        if args.emit_counts_dir is not None:
+            emit_counts(checker_identity(), head, args.emit_counts_dir, head_sha())
+        elif base_ref is not None:
+            cmd_check(head, base_ref)
 
 
 if __name__ == "__main__":
