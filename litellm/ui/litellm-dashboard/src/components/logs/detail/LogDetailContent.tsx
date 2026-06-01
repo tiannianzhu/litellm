@@ -90,10 +90,10 @@ export function LogDetailContent({
   const hasClassifierAudit =
     isClassifier && (rawRequest?.classifier_input != null || rawRequest?.originating_request_masked != null);
 
-  const hasMessages = checkHasMessages(logEntry.messages);
+  const hasRequest = checkHasMessages(rawRequest) || checkHasMessages(logEntry.messages);
   const hasResponse = checkHasResponse(logEntry.response);
   // Don't show "missing data" warning while details are still loading
-  const missingData = !hasMessages && !hasResponse && !hasError && !isLoadingDetails;
+  const missingData = !hasRequest && !hasResponse && !hasError && !isLoadingDetails;
 
   // Guardrail data
   const guardrailInfo = metadata?.guardrail_information;

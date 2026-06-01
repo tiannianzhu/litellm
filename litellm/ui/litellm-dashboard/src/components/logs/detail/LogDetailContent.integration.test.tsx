@@ -260,6 +260,19 @@ describe("LogDetailContent", () => {
     expect(screen.getByText("Request/Response Data Not Available")).toBeInTheDocument();
   });
 
+  it("displays an archived request without a missing-data warning when no response was stored", () => {
+    const archive = {
+      call_type: "responses",
+      messages: [],
+      response: null,
+      proxy_server_request: { input: [{ role: "user", content: "An archived request" }] },
+    };
+    render(<LogDetailContent logEntry={createLogEntry(archive)} />);
+
+    expect(screen.getByText("An archived request")).toBeInTheDocument();
+    expect(screen.queryByText("Request/Response Data Not Available")).not.toBeInTheDocument();
+  });
+
   it("should not display ConfigInfoMessage when isLoadingDetails is true even without data", () => {
     render(
       <LogDetailContent
