@@ -172,6 +172,7 @@ const resolveDefaultBase = (fallback: string | null): string | null =>
       ? "http://localhost:4000"
       : fallback;
 const defaultProxyBaseUrl = resolveDefaultBase(null);
+const uiConfigPath = process.env.NEXT_PUBLIC_LITELLM_UI_CONFIG_PATH ?? "/litellm/.well-known/litellm-ui-config";
 const WORKER_URL_KEY = "litellm_worker_url";
 // If a worker URL is in localStorage, use it as the initial proxyBaseUrl.
 // This survives page navigation.
@@ -584,9 +585,7 @@ export const getUiConfig = async () => {
       })();
   runtimeBackendBaseUrl = runtimeBackendUrl;
   const discoveryBaseUrl = defaultProxyBaseUrl ?? runtimeBackendUrl;
-  const url = discoveryBaseUrl
-    ? `${discoveryBaseUrl}/litellm/.well-known/litellm-ui-config`
-    : `/litellm/.well-known/litellm-ui-config`;
+  const url = discoveryBaseUrl ? `${discoveryBaseUrl}${uiConfigPath}` : uiConfigPath;
   const response = await fetch(url);
   const jsonData: LiteLLMWellKnownUiConfig = await response.json();
   /**

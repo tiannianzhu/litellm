@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inspect Errors"
+  short_description: "Classify SpendLogs failures and find service faults"
+  default_prompt: "Use $inspect-errors to review all currently retained failure rows, present the classification table, and identify real service issues."
