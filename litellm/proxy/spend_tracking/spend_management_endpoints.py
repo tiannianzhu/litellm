@@ -23,7 +23,7 @@ from typing import (
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 from typing_extensions import ReadOnly, TypedDict, assert_never
 
 import litellm
@@ -2005,7 +2005,7 @@ async def _resolve_org_spend_report_scope(
 
 @router.get(
     "/key/spend/report",
-    tags=("Budget & Spend Tracking",),
+    tags=["Budget & Spend Tracking"],
 )
 async def get_key_spend_report(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
@@ -2052,7 +2052,7 @@ async def get_key_spend_report(
 
 @router.get(
     "/user/spend/report",
-    tags=("Budget & Spend Tracking",),
+    tags=["Budget & Spend Tracking"],
 )
 async def get_user_spend_report(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
@@ -2094,7 +2094,7 @@ async def get_user_spend_report(
 
 @router.get(
     "/team/spend/report",
-    tags=("Budget & Spend Tracking",),
+    tags=["Budget & Spend Tracking"],
 )
 async def get_team_spend_report(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
@@ -2136,7 +2136,7 @@ async def get_team_spend_report(
 
 @router.get(
     "/organization/spend/report",
-    tags=("Budget & Spend Tracking",),
+    tags=["Budget & Spend Tracking"],
 )
 async def get_organization_spend_report(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
@@ -3260,15 +3260,23 @@ async def _ui_session_grouped_spend_logs(
 
 
 class RequestResponsePayload(NamedTuple):
-    messages: str | list | dict | None
-    response: str | list | dict | None
-    proxy_server_request: str | dict | None
+    messages: str | list[object] | dict[str, object] | None
+    response: str | list[object] | dict[str, object] | None
+    proxy_server_request: str | dict[str, object] | None
 
 
 _EMPTY_SPEND_LOG_VALUES: Final = frozenset({"", "{}", "[]", "null"})
+_SPEND_LOG_FIELD_ADAPTER: Final = TypeAdapter(str | list[object] | dict[str, object] | None)
 
 
-def _spend_log_field_has_content(value: str | list | dict | None) -> bool:
+def _normalize_spend_log_field(value: object) -> str | list[object] | dict[str, object] | None:
+    try:
+        return _SPEND_LOG_FIELD_ADAPTER.validate_python(value)
+    except ValidationError:
+        return None
+
+
+def _spend_log_field_has_content(value: str | list[object] | dict[str, object] | None) -> bool:
     if value is None:
         return False
     if isinstance(value, str):
@@ -3276,6 +3284,21 @@ def _spend_log_field_has_content(value: str | list | dict | None) -> bool:
     if isinstance(value, (list, dict)):
         return len(value) > 0
     return True
+
+
+def _request_from_cold_storage(
+    payload: Mapping[str, object], messages: str | list[object] | dict[str, object] | None
+) -> dict[str, object]:
+    parameters: Final = _normalize_spend_log_field(payload.get("model_parameters"))
+    model_group: Final = payload.get("model_group")
+    model: Final = model_group if isinstance(model_group, str) and model_group else payload.get("model")
+    call_type: Final = payload.get("call_type")
+    content_key: Final = "input" if call_type in ("responses", "aresponses") else "messages"
+    return {
+        **(parameters if isinstance(parameters, dict) else {}),
+        **({"model": model} if isinstance(model, str) and model else {}),
+        **({content_key: messages} if _spend_log_field_has_content(messages) else {}),
+    }
 
 
 def _hydrate_spend_log_metadata(rows: Sequence[Mapping[str, object]]) -> None:
@@ -3360,26 +3383,32 @@ async def _resolve_request_response_payload(
             exc_info=True,
         )
         return pg_payload
-    if payload is None:
+    if not isinstance(payload, Mapping):
         return pg_payload
 
-    cold_audit: Final = classifier_audit_fields(payload)
+    normalized_payload: Final[dict[str, object]] = {  # mutable-ok: validates the untyped cold-storage boundary
+        key: value for key, value in payload.items() if isinstance(key, str)
+    }
+    cold_audit: Final = classifier_audit_fields(normalized_payload)
+    raw_request: Final = _normalize_spend_log_field(normalized_payload.get("proxy_server_request"))
+    archived_request: Final = raw_request if isinstance(raw_request, (str, dict)) else None
     resolved_request: Final = (
         {
-            **(classifier_input_snapshot(payload.get("proxy_server_request")) or stored_request or EMPTY_MAPPING),
+            **(classifier_input_snapshot(archived_request) or stored_request or EMPTY_MAPPING),
             **cold_audit,
         }
         if cold_audit
-        else payload.get("proxy_server_request")
+        else archived_request
     )
     if truncated_audit:
-        return RequestResponsePayload(messages, response, resolved_request if cold_audit else proxy_server_request)
+        return RequestResponsePayload(messages, response, resolved_request) if cold_audit else pg_payload
 
-    return RequestResponsePayload(
-        messages=payload.get("messages"),
-        response=payload.get("response"),
-        proxy_server_request=resolved_request,
-    )
+    cold_messages: Final = _normalize_spend_log_field(normalized_payload.get("messages"))
+    cold_response: Final = _normalize_spend_log_field(normalized_payload.get("response"))
+    if _spend_log_field_has_content(resolved_request):
+        return RequestResponsePayload(cold_messages, cold_response, resolved_request)
+    rebuilt_request: Final = _request_from_cold_storage(normalized_payload, cold_messages)
+    return RequestResponsePayload(None if rebuilt_request else cold_messages, cold_response, rebuilt_request or None)
 
 
 def _parse_spend_log_ui_date(value: str | None) -> datetime | None:
