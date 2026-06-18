@@ -8,7 +8,7 @@ import time
 import traceback
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any, Final, Literal, TypedDict, cast
+from typing import Annotated, Any, Final, Literal, TypedDict, cast
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -193,6 +193,17 @@ def get_callback_identifier(callback):
 
 
 router: Final = APIRouter()
+
+
+class VLLMQueueMetric(TypedDict):
+    running: int | None  # writable-ok: Pydantic warns when FastAPI generates schemas for ReadOnly fields
+    waiting: int | None  # writable-ok: Pydantic warns when FastAPI generates schemas for ReadOnly fields
+
+
+class VLLMQueueMetricsResponse(TypedDict):
+    queues: Mapping[str, VLLMQueueMetric]  # writable-ok: Pydantic warns on ReadOnly in FastAPI schemas
+
+
 services = (
     Literal[
         "slack_budget_alerts",
@@ -1320,6 +1331,37 @@ async def latest_health_checks_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": f"Failed to retrieve latest health checks: {e}"},
         )
+
+
+@router.get(
+    "/health/vllm-queue",
+    tags=["health"],  # mutable-ok: mutable FastAPI metadata
+    dependencies=[Depends(user_api_key_auth)],  # mutable-ok: mutable FastAPI metadata
+)
+async def vllm_queue_metrics_endpoint(
+    user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+) -> VLLMQueueMetricsResponse:
+    if not _is_proxy_admin(user_api_key_dict):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "Proxy admin access required"},  # mutable-ok: mutable FastAPI metadata
+        )
+
+    from litellm.proxy.proxy_server import llm_router
+
+    if llm_router is None:
+        return {"queues": {}}  # mutable-ok: mutable FastAPI metadata
+
+    metrics: Final = await llm_router.async_get_vllm_queue_metrics()
+    return {  # mutable-ok: mutable FastAPI metadata
+        "queues": {  # mutable-ok: mutable FastAPI metadata
+            model_id: {  # mutable-ok: mutable FastAPI metadata
+                "running": running,
+                "waiting": waiting,
+            }
+            for model_id, (running, waiting) in metrics.items()
+        }
+    }
 
 
 @router.get("/health/shared-status", tags=["health"], dependencies=[Depends(user_api_key_auth)])

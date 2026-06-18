@@ -33,6 +33,8 @@ export interface HealthCheckData {
   health_loading: boolean;
   health_error?: string;
   health_full_error?: string;
+  vllm_running?: number | null;
+  vllm_waiting?: number | null;
 }
 
 const HEALTH_STATUS_TONES: Record<string, StatusTone> = {
@@ -318,6 +320,27 @@ export const getHealthChecksTableColumns = ({
               onClick={() => onShowSuccess(displayName, successResponse)}
             />
           )}
+        </div>
+      );
+    },
+  },
+  {
+    id: "vllm_queue",
+    accessorFn: (row) => row.vllm_running,
+    meta: { title: "R / W", className: "text-center", headerClassName: "text-center" },
+    header: ({ column }) => <DataTableSortHeader column={column} title="R / W" variant="header-cycle" />,
+    size: 80,
+    enableSorting: true,
+    cell: ({ row }) => {
+      const running = row.original.vllm_running;
+      const waiting = row.original.vllm_waiting;
+      const hasQueue = typeof waiting === "number" && waiting > 0;
+      return (
+        <div
+          data-testid={`queue-${row.original.model_info.id}`}
+          className="whitespace-nowrap py-1 text-center text-sm tabular-nums"
+        >
+          {running ?? "-"} / <span className={cn(hasQueue && "font-medium text-amber-600")}>{waiting ?? "-"}</span>
         </div>
       );
     },

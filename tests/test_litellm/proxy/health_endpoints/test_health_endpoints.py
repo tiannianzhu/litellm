@@ -28,6 +28,7 @@ from litellm.proxy.health_endpoints._health_endpoints import (
 )
 from litellm.proxy.health_endpoints._health_endpoints import (
     test_model_connection as health_test_model_connection,
+    vllm_queue_metrics_endpoint,
 )
 
 # Import shared proxy test helpers from conftest
@@ -3217,3 +3218,30 @@ async def test_health_services_endpoint_pointfive_blocks_non_admin(monkeypatch, 
 
     assert str(raised.value.code) == "403"
     logger_class.assert_not_called()
+@pytest.mark.asyncio
+async def test_vllm_queue_metrics_endpoint_returns_deployment_counts():
+    mock_router = SimpleNamespace(
+        async_get_vllm_queue_metrics=AsyncMock(
+            return_value={
+                "deployment-1": (12, 3),
+                "deployment-2": (4, 0),
+            }
+        ),
+    )
+    user = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+
+    with patch(  # test-quality-ok: endpoint reads a proxy global; no injection seam
+        "litellm.proxy.proxy_server.llm_router", mock_router
+    ):
+        result = await vllm_queue_metrics_endpoint(user_api_key_dict=user)
+
+    mock_router.async_get_vllm_queue_metrics.assert_awaited_once_with()
+    assert result == {
+        "queues": {
+            "deployment-1": {
+                "running": 12,
+                "waiting": 3,
+            },
+            "deployment-2": {"running": 4, "waiting": 0},
+        }
+    }
