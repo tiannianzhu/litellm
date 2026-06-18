@@ -3704,6 +3704,23 @@ export const latestHealthChecksCall = async (accessToken: string) => {
   }
 };
 
+export interface VLLMQueueMetricsResponse {
+  queues: Record<
+    string,
+    {
+      running: number | null;
+      waiting: number | null;
+    }
+  >;
+}
+
+export const vllmQueueMetricsCall = async (
+  accessToken: string,
+  signal?: AbortSignal,
+): Promise<VLLMQueueMetricsResponse> => {
+  return apiClient.get<VLLMQueueMetricsResponse>(`/health/vllm-queue`, { accessToken, signal });
+};
+
 export const getProxyUISettings = async (accessToken: string) => {
   /**
    * Get all the models user has access to
