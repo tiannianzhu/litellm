@@ -1572,6 +1572,10 @@ class _HealthHost(Protocol):
 
     async def _core_get_remaining_model_group_usage(self, model_group: str) -> Mapping[str, int]: ...
 
+    async def async_get_vllm_queue_metrics(
+        self, use_cache: bool = True
+    ) -> Mapping[str, tuple[int | None, int | None]]: ...
+
     def _core_team_ptu_ceiling(self, team_id: str, model_group: str) -> "PTUTeamCeiling | None": ...
 
     def _core_split_request_priority(
@@ -1604,6 +1608,9 @@ class RouterHealth:
     def cooldowns(self) -> "CooldownCache":
         """The cooldown store (was ``cooldown_cache``)."""
         return self._router._core_cooldown_cache
+
+    async def vllm_queue_metrics(self, use_cache: bool = True) -> Mapping[str, tuple[int | None, int | None]]:
+        return await self._router.async_get_vllm_queue_metrics(use_cache=use_cache)
 
     @property
     def session_pins(self) -> "RouterSessionPinStore":

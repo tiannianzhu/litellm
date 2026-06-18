@@ -190,7 +190,7 @@ from litellm.router_rust.surface.health_routing import (
 from litellm.router_rust.surface.health_routing import all_blocked as deployments_all_blocked
 from litellm.router_rust.surface.health_routing import fully_blocked_model_names as blocked_model_names
 from litellm.router_rust.surface.health_routing import is_blocked as deployment_is_blocked
-from litellm.router_rust.surface.legacy_members import RustLegacyMembers
+from litellm.router_rust.surface.legacy_members import RustLegacyMembers, VLLMMetricsCacheEntry
 from litellm.router_rust.surface.members import RustRegistryMembers
 from litellm.router_rust.surface.model_list import typed_deployment
 from litellm.router_rust.surface.registry import (
@@ -1158,6 +1158,9 @@ class RustHealth(RouterHealth):
             return found
         raise RustCoreUnsupported(f"health().{name} is not served by the Rust router core", name=name, obj=self)
 
+    async def vllm_queue_metrics(self, use_cache: bool = True) -> Mapping[str, tuple[int | None, int | None]]:
+        return await self._core.async_get_vllm_queue_metrics(use_cache=use_cache)
+
     @property
     def store(self) -> "DualCache":
         return self._core._cache  # pyright: ignore[reportPrivateUsage]  # the health view reads its own core
@@ -1282,6 +1285,7 @@ _REBOUND_STATE: Final = MappingProxyType(
 
 _HEALTH_SERVED: Final = frozenset(
     {
+        "vllm_queue_metrics",
         "store",
         "cooldowns",
         "session_pins",
@@ -1492,6 +1496,7 @@ class RustCore(
         self._legacy: Final = legacy
         self._health_view: RustHealth | None = None
         self._cache: DualCache = host.routing_cache(config)
+        self._vllm_metrics_cache: dict[str, VLLMMetricsCacheEntry] = {}  # mutable-ok: mutated router state
         redis: Final = connect(self._cache.redis_cache)
         self._usage: RouterUsage = host.router_usage(redis)
         self._cooldowns: CooldownCache = CooldownCache(

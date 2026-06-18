@@ -19663,6 +19663,7 @@
         "modelName": "Model Name",
         "teamAlias": "Team Alias",
         "healthStatus": "Health Status",
+        "queue": "R / W",
         "errorDetails": "Error Details",
         "lastCheck": "Last Check",
         "lastSuccess": "Last Success",

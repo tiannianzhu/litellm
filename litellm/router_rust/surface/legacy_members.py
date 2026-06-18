@@ -14,13 +14,18 @@ attempts one host op, named by the endpoint's plan.
 import asyncio
 import contextlib
 import inspect
+import re
+import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from functools import partial
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypeAlias
+from urllib.parse import urlsplit, urlunsplit
 
+import httpx
+from pydantic import TypeAdapter, ValidationError
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 from litellm._internal_context import request_parent_otel_span, with_service_target
@@ -53,6 +58,29 @@ from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     find_deployment_metadata,
 )
 from litellm.utils import get_utc_datetime
+
+VLLM_QUEUE_METRICS_CACHE_TTL_SECONDS: Final = 5.0
+VLLM_QUEUE_METRICS_TIMEOUT_SECONDS: Final = 1.0
+VLLMDeploymentMetrics: TypeAlias = tuple[int | None, int | None]
+VLLMMetricsCacheEntry: TypeAlias = tuple[float, VLLMDeploymentMetrics]
+_STRING_OBJECT_DICT_ADAPTER: Final = TypeAdapter(dict[str, object])
+
+
+def _validated_string_object_dict(value: object) -> Mapping[str, object] | None:
+    try:
+        return _STRING_OBJECT_DICT_ADAPTER.validate_python(value)
+    except ValidationError:
+        return None
+
+
+VLLM_QUEUE_METRIC_PATTERN: Final = re.compile(
+    r"^vllm:num_requests_(running|waiting)(?:\{[^}]*\})?\s+([0-9.+\-eE]+)$",
+    re.MULTILINE,
+)
+VLLM_OMNI_QUEUE_METRIC_PATTERN: Final = re.compile(
+    r"^vllm_omni:num_requests_(running|waiting)(?:\{[^}]*\})?\s+([0-9.+\-eE]+)$",
+    re.MULTILINE,
+)
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
@@ -242,6 +270,7 @@ class RustLegacyMembers(RustRegistryMembers, RustOptionalChecks):
 
     # RustCore sets these in its constructor.
     _cache: "DualCache"
+    _vllm_metrics_cache: dict[str, VLLMMetricsCacheEntry]
     _usage: RouterUsage
     _cooldown_given: object
     _custom_strategy: "CustomRoutingStrategyBase | None"
@@ -264,6 +293,101 @@ class RustLegacyMembers(RustRegistryMembers, RustOptionalChecks):
         """The OpenAI models ``model_name`` serves (``_served_openai_models``). The Python core keeps
         an ``lru_cache`` over it, emptied with every model list change."""
         return _served_openai_models(self._registry_state._core_deployments_named(model_name) or ())  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
+
+    def _get_vllm_metrics_url(self, deployment: Mapping[str, object]) -> str | None:
+        litellm_params: Final = _validated_string_object_dict(deployment.get("litellm_params"))
+        if litellm_params is None:
+            return None
+        model: Final = litellm_params.get("model")
+        provider: Final = litellm_params.get("custom_llm_provider")
+        if provider != "hosted_vllm" and not (isinstance(model, str) and model.startswith("hosted_vllm/")):
+            return None
+        api_base: Final = litellm_params.get("api_base")
+        if not isinstance(api_base, str):
+            return None
+        parsed_url: Final = urlsplit(api_base)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            return None
+        return urlunsplit((parsed_url.scheme, parsed_url.netloc, "/metrics", "", ""))
+
+    def _parse_vllm_deployment_metrics(self, metrics_text: str) -> VLLMDeploymentMetrics:
+        omni_queue_metrics: Final = tuple(
+            (match.group(1), float(match.group(2))) for match in VLLM_OMNI_QUEUE_METRIC_PATTERN.finditer(metrics_text)
+        )
+        queue_metrics: Final = omni_queue_metrics or tuple(
+            (match.group(1), float(match.group(2))) for match in VLLM_QUEUE_METRIC_PATTERN.finditer(metrics_text)
+        )
+        running_values: Final = tuple(value for state, value in queue_metrics if state == "running")
+        waiting_values: Final = tuple(value for state, value in queue_metrics if state == "waiting")
+        running: Final = int(sum(running_values)) if running_values else None
+        waiting: Final = int(sum(waiting_values)) if waiting_values else None
+        return running, waiting
+
+    def _get_cached_vllm_metrics(self, metrics_url: str) -> VLLMDeploymentMetrics | None:
+        cached_value: Final = self._vllm_metrics_cache.get(metrics_url)
+        if cached_value is None:
+            return None
+        cached_at, metrics = cached_value
+        if time.time() - cached_at > VLLM_QUEUE_METRICS_CACHE_TTL_SECONDS:
+            return None
+        return metrics
+
+    async def _async_get_vllm_queue_metrics(
+        self,
+        client: httpx.AsyncClient,
+        metrics_url: str,
+        use_cache: bool = True,
+    ) -> VLLMDeploymentMetrics:
+        if use_cache:
+            cached_value: Final = self._get_cached_vllm_metrics(metrics_url)
+            if cached_value is not None:
+                return cached_value
+        try:
+            response: Final = await client.get(metrics_url)
+            response.raise_for_status()
+            metrics: Final = self._parse_vllm_deployment_metrics(response.text)
+        except (httpx.HTTPError, ValueError) as e:
+            verbose_router_logger.debug(
+                "Failed to read vLLM queue metrics from %s: %s",
+                metrics_url,
+                str(e),
+            )
+            empty_metrics: Final[VLLMDeploymentMetrics] = (None, None)
+            if use_cache:
+                self._vllm_metrics_cache[metrics_url] = (time.time(), empty_metrics)
+            return empty_metrics
+
+        self._vllm_metrics_cache[metrics_url] = (time.time(), metrics)
+        return metrics
+
+    async def async_get_vllm_queue_metrics(self, use_cache: bool = True) -> Mapping[str, VLLMDeploymentMetrics]:
+        deployments: Final[Sequence[object]] = (
+            self._registry_state._core_get_model_list(model_name=None) or ()  # pyright: ignore[reportPrivateUsage]  # the core reads its own host registry
+        )
+
+        def deployment_url(deployment: object) -> tuple[str, str] | None:
+            validated_deployment: Final = _validated_string_object_dict(deployment)
+            if validated_deployment is None:
+                return None
+            model_info: Final = _validated_string_object_dict(validated_deployment.get("model_info"))
+            model_id: Final = model_info.get("id") if model_info is not None else None
+            metrics_url: Final = self._get_vllm_metrics_url(validated_deployment)
+            return (str(model_id), metrics_url) if model_id is not None and metrics_url is not None else None
+
+        deployment_urls: Final = tuple(
+            item for deployment in deployments if (item := deployment_url(deployment)) is not None
+        )
+        unique_urls: Final = tuple(dict.fromkeys(url for _, url in deployment_urls))
+        async with httpx.AsyncClient(timeout=VLLM_QUEUE_METRICS_TIMEOUT_SECONDS, trust_env=False) as client:
+            metrics_by_url: Final[dict[str, VLLMDeploymentMetrics]] = dict(
+                zip(
+                    unique_urls,
+                    await asyncio.gather(
+                        *(self._async_get_vllm_queue_metrics(client, url, use_cache=use_cache) for url in unique_urls)
+                    ),
+                )
+            )
+        return {model_id: metrics_by_url.get(url) or (None, None) for model_id, url in deployment_urls}
 
     def auto_router_capability_violation(self, capability: GatedAutoRouterCapability) -> str | None:
         """Why one more router claiming ``capability`` cannot join this router, or None when it can
