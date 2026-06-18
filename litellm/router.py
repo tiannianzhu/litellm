@@ -25,6 +25,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, 
 from functools import lru_cache, partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, TypeAlias, TypeVar, Union, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import anyio
 import httpx
@@ -268,6 +269,28 @@ from litellm.utils import (
     set_live_deployment_replay,
 )
 
+VLLM_QUEUE_METRICS_CACHE_TTL_SECONDS: Final = 5.0
+VLLM_QUEUE_METRICS_TIMEOUT_SECONDS: Final = 1.0
+VLLMDeploymentMetrics: TypeAlias = tuple[int | None, int | None]
+VLLMMetricsCacheEntry: TypeAlias = tuple[float, VLLMDeploymentMetrics]
+_STRING_OBJECT_DICT_ADAPTER: Final = TypeAdapter(dict[str, object])
+
+
+def _validated_string_object_dict(value: object) -> dict[str, object] | None:
+    try:
+        return _STRING_OBJECT_DICT_ADAPTER.validate_python(value)
+    except ValidationError:
+        return None
+
+
+VLLM_QUEUE_METRIC_PATTERN: Final = re.compile(
+    r"^vllm:num_requests_(running|waiting)(?:\{[^}]*\})?\s+([0-9.+\-eE]+)$",
+    re.MULTILINE,
+)
+VLLM_OMNI_QUEUE_METRIC_PATTERN: Final = re.compile(
+    r"^vllm_omni:num_requests_(running|waiting)(?:\{[^}]*\})?\s+([0-9.+\-eE]+)$",
+    re.MULTILINE,
+)
 from .router_utils.pattern_match_deployments import PatternMatchRouter
 
 if TYPE_CHECKING:
@@ -882,6 +905,7 @@ class Router:
         self._routing_group_rows: tuple[DeploymentTypedDict, ...] | None = None
         self._init_routing_groups(None)
         self._provider_unresolved_deployments: tuple[Callable[[], Deployment | None], ...] = ()
+        self._vllm_metrics_cache: dict[str, VLLMMetricsCacheEntry] = {}  # mutable-ok: mutated router state
 
         self.deployment_affinity_ttl_seconds = deployment_affinity_ttl_seconds
         self.model_group_affinity_config = model_group_affinity_config
@@ -8304,14 +8328,14 @@ class Router:
             litellm_router_instance=self, parent_otel_span=parent_otel_span
         )
         unhealthy_set: Final = set(unhealthy_deployments)
-        healthy_deployments: list = [d for d in _all_deployments if d["model_info"]["id"] not in unhealthy_set]
+        healthy_deployments: list = [  # mutable-ok: blocked-deployment filtering consumes a mutable list
+            deployment for deployment in _all_deployments if self._deployment_model_id(deployment) not in unhealthy_set
+        ]
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
 
         return healthy_deployments, _all_deployments
 
-    async def _async_get_healthy_deployments(
-        self, model: str, parent_otel_span: Span | None
-    ) -> tuple[list[dict], list[dict]]:
+    async def _async_get_healthy_deployments(self, model: str, parent_otel_span: Span | None):
         """
         Returns Tuple of:
         - Tuple[List[Dict], List[Dict]]:
@@ -8333,8 +8357,10 @@ class Router:
         )
         # Convert to set for O(1) lookup instead of O(n)
         unhealthy_deployments_set: Final = set(unhealthy_deployments)
-        healthy_deployments: list = [
-            d for d in _all_deployments if d["model_info"]["id"] not in unhealthy_deployments_set
+        healthy_deployments: list = [  # mutable-ok: blocked-deployment filtering consumes a mutable list
+            deployment
+            for deployment in _all_deployments
+            if self._deployment_model_id(deployment) not in unhealthy_deployments_set
         ]
         healthy_deployments = self._filter_blocked_deployments(healthy_deployments)
         return healthy_deployments, _all_deployments
@@ -12330,6 +12356,128 @@ class Router:
 
         return filtered_deployments
 
+    def _get_vllm_metrics_url(self, deployment: Mapping[str, object]) -> str | None:
+        litellm_params: Final = _validated_string_object_dict(deployment.get("litellm_params"))
+        if litellm_params is None:
+            return None
+        model: Final = litellm_params.get("model")
+        provider: Final = litellm_params.get("custom_llm_provider")
+        if provider != "hosted_vllm" and not (isinstance(model, str) and model.startswith("hosted_vllm/")):
+            return None
+        api_base: Final = litellm_params.get("api_base")
+        if not isinstance(api_base, str):
+            return None
+        parsed_url: Final = urlsplit(api_base)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            return None
+        return urlunsplit((parsed_url.scheme, parsed_url.netloc, "/metrics", "", ""))
+
+    def _parse_vllm_deployment_metrics(self, metrics_text: str) -> VLLMDeploymentMetrics:
+        omni_queue_metrics: Final = tuple(
+            (match.group(1), float(match.group(2))) for match in VLLM_OMNI_QUEUE_METRIC_PATTERN.finditer(metrics_text)
+        )
+        queue_metrics: Final = omni_queue_metrics or tuple(
+            (match.group(1), float(match.group(2))) for match in VLLM_QUEUE_METRIC_PATTERN.finditer(metrics_text)
+        )
+        running_values: Final = tuple(value for state, value in queue_metrics if state == "running")
+        waiting_values: Final = tuple(value for state, value in queue_metrics if state == "waiting")
+        running: Final = int(sum(running_values)) if running_values else None
+        waiting: Final = int(sum(waiting_values)) if waiting_values else None
+        return running, waiting
+
+    def _get_cached_vllm_metrics(self, metrics_url: str) -> VLLMDeploymentMetrics | None:
+        cached_value: Final = self._vllm_metrics_cache.get(metrics_url)
+        if cached_value is None:
+            return None
+        cached_at, metrics = cached_value
+        if time.time() - cached_at > VLLM_QUEUE_METRICS_CACHE_TTL_SECONDS:
+            return None
+        return metrics
+
+    async def _async_get_vllm_queue_metrics(
+        self,
+        client: httpx.AsyncClient,
+        metrics_url: str,
+        use_cache: bool = True,
+    ) -> VLLMDeploymentMetrics:
+        if use_cache:
+            cached_value: Final = self._get_cached_vllm_metrics(metrics_url)
+            if cached_value is not None:
+                return cached_value
+        try:
+            response: Final = await client.get(metrics_url)
+            response.raise_for_status()
+        except httpx.HTTPError as e:
+            verbose_router_logger.debug(
+                "Failed to read vLLM queue metrics from %s: %s",
+                metrics_url,
+                str(e),
+            )
+            if not use_cache:
+                return None, None
+            empty_metrics = (None, None)  # rebind-ok: each error branch builds the same cache sentinel
+            self._vllm_metrics_cache[metrics_url] = (time.time(), empty_metrics)
+            return empty_metrics
+
+        try:
+            metrics: Final = self._parse_vllm_deployment_metrics(response.text)
+        except ValueError as e:
+            verbose_router_logger.debug(
+                "Failed to read vLLM queue metrics from %s: %s",
+                metrics_url,
+                str(e),
+            )
+            if not use_cache:
+                return None, None
+            empty_metrics = (None, None)  # rebind-ok: each error branch builds the same cache sentinel
+            self._vllm_metrics_cache[metrics_url] = (time.time(), empty_metrics)
+            return empty_metrics
+
+        self._vllm_metrics_cache[metrics_url] = (time.time(), metrics)
+        return metrics
+
+    async def async_get_vllm_queue_metrics(self, use_cache: bool = True) -> Mapping[str, VLLMDeploymentMetrics]:
+        deployments: Final[Sequence[object]] = self.get_model_list(model_name=None) or ()
+        deployment_urls: Final[list[tuple[str, str]]] = (  # mutable-ok: accumulated before the concurrent metrics fetch
+            []  # mutable-ok: accumulated before the concurrent metrics fetch
+        )
+        for deployment in deployments:
+            validated_deployment = (
+                _validated_string_object_dict(  # rebind-ok: each deployment is validated independently
+                    deployment
+                )
+            )
+            if validated_deployment is None:
+                continue
+            model_info = _validated_string_object_dict(  # rebind-ok: each deployment has independent metadata
+                validated_deployment.get("model_info")
+            )
+            model_id = (  # rebind-ok: each deployment contributes its own identifier
+                model_info.get("id") if model_info is not None else None
+            )
+            metrics_url = self._get_vllm_metrics_url(validated_deployment)
+            if model_id is not None and metrics_url is not None:
+                deployment_urls.append((str(model_id), metrics_url))
+
+        unique_urls: Final = tuple(dict.fromkeys(url for _, url in deployment_urls))
+        async with httpx.AsyncClient(timeout=VLLM_QUEUE_METRICS_TIMEOUT_SECONDS, trust_env=False) as client:
+            metrics_by_url: Final[dict[str, VLLMDeploymentMetrics]] = (
+                dict(  # mutable-ok: keyed lookup assembled from gathered metrics
+                    zip(
+                        unique_urls,
+                        await asyncio.gather(
+                            *(
+                                self._async_get_vllm_queue_metrics(client, url, use_cache=use_cache)
+                                for url in unique_urls
+                            )
+                        ),
+                    )
+                )
+            )
+        return {  # mutable-ok: router state
+            model_id: metrics_by_url.get(url) or (None, None) for model_id, url in deployment_urls
+        }
+
     async def async_get_healthy_deployments(
         self,
         model: str,
@@ -13585,6 +13733,13 @@ class Router:
         # Convert to set for O(1) lookup and use list comprehension for O(n) filtering
         cooldown_set: Final = set(cooldown_deployments)
         return [deployment for deployment in healthy_deployments if deployment["model_info"]["id"] not in cooldown_set]
+
+    @staticmethod
+    def _deployment_model_id(deployment: Mapping[str, object]) -> object:
+        model_info: Final = _validated_string_object_dict(deployment.get("model_info"))
+        if model_info is None or "id" not in model_info:
+            raise KeyError("model_info.id")
+        return model_info["id"]
 
     def _filter_blocked_deployments(self, healthy_deployments: list[dict]) -> list[dict]:
         """

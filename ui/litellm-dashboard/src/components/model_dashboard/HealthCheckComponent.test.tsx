@@ -1,6 +1,6 @@
 /* @vitest-environment jsdom */
 import type { PaginationState } from "@tanstack/react-table";
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,10 +9,12 @@ import HealthCheckComponent from "./HealthCheckComponent";
 
 const mockIndividualModelHealthCheckCall = vi.fn();
 const mockLatestHealthChecksCall = vi.fn();
+const mockVllmQueueMetricsCall = vi.fn();
 
 vi.mock("../networking", () => ({
   individualModelHealthCheckCall: (...args: unknown[]) => mockIndividualModelHealthCheckCall(...args),
   latestHealthChecksCall: (...args: unknown[]) => mockLatestHealthChecksCall(...args),
+  vllmQueueMetricsCall: (...args: unknown[]) => mockVllmQueueMetricsCall(...args),
 }));
 
 const getDisplayModelName = (model: { model_name?: string }) => model.model_name ?? "";
@@ -69,6 +71,7 @@ describe("HealthCheckComponent", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockLatestHealthChecksCall.mockResolvedValue({ latest_health_checks: {} });
+    mockVllmQueueMetricsCall.mockResolvedValue({ queues: {} });
     mockIndividualModelHealthCheckCall.mockResolvedValue({
       healthy_count: 1,
       unhealthy_count: 0,
@@ -84,6 +87,33 @@ describe("HealthCheckComponent", () => {
     expect(
       screen.getByText("Run health checks on individual models to verify they are working correctly"),
     ).toBeInTheDocument();
+  });
+
+  it("should display vLLM running and waiting counts in one queue column", async () => {
+    mockVllmQueueMetricsCall.mockResolvedValue({
+      queues: {
+        "deployment-1": {
+          running: 12,
+          waiting: 3,
+        },
+      },
+    });
+    const modelData = {
+      data: [
+        {
+          model_name: "test-model",
+          model_info: { id: "deployment-1" },
+          litellm_model_name: "hosted_vllm/test-model",
+        },
+      ],
+    };
+
+    await renderHealthCheck({ modelData, allModelsOnProxy: ["deployment-1"] });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("queue-deployment-1")).toHaveTextContent("12 / 3");
+    });
+    expect(mockVllmQueueMetricsCall).toHaveBeenCalledWith("token", expect.any(AbortSignal));
   });
 
   it("should call individualModelHealthCheckCall with model id when run health check is triggered", async () => {
