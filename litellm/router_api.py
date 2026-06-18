@@ -1063,6 +1063,9 @@ class RouterHealth:
         """The cooldown store (was ``cooldown_cache``)."""
         return self._router._core_cooldown_cache
 
+    async def vllm_queue_metrics(self, use_cache: bool = True) -> Mapping[str, tuple[int | None, int | None]]:
+        return await self._router.async_get_vllm_queue_metrics(use_cache=use_cache)
+
     @property
     def health_checks(self) -> "DeploymentHealthCache":
         """Background health check results (was ``health_state_cache``)."""
