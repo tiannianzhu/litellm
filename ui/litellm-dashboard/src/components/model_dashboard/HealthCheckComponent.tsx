@@ -13,7 +13,12 @@ import {
 import { errorPatterns } from "@/utils/errorPatterns";
 
 import { Team } from "../key_team_helpers/key_list";
-import { individualModelHealthCheckCall, latestHealthChecksCall } from "../networking";
+import {
+  individualModelHealthCheckCall,
+  latestHealthChecksCall,
+  type VLLMQueueMetricsResponse,
+  vllmQueueMetricsCall,
+} from "../networking";
 import { HealthChecksTable } from "./HealthChecksTable";
 import type { HealthCheckData, HealthStatus } from "./HealthChecksTableColumns";
 
@@ -176,6 +181,7 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
     fullError: string;
   } | null>(null);
   const [successModalVisible, setSuccessModalVisible] = useState(false);
+  const [vllmQueueMetrics, setVllmQueueMetrics] = useState<VLLMQueueMetricsResponse["queues"]>({});
   const [selectedSuccessDetails, setSelectedSuccessDetails] = useState<{
     modelName: string;
     response: unknown;
@@ -243,6 +249,27 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
 
     initializeHealthStatuses();
   }, [accessToken, modelData]);
+
+  useEffect(() => {
+    if (!accessToken) return;
+
+    const controller = new AbortController();
+    const refreshQueueMetrics = async () => {
+      try {
+        const response = await vllmQueueMetricsCall(accessToken, controller.signal);
+        if (!controller.signal.aborted) setVllmQueueMetrics(response.queues);
+      } catch {
+        return;
+      }
+    };
+
+    refreshQueueMetrics();
+    const interval = window.setInterval(refreshQueueMetrics, 5000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [accessToken]);
 
   const runIndividualHealthCheck = useCallback(
     async (modelId: string) => {
@@ -471,6 +498,7 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
     () =>
       (modelData?.data ?? []).map((model: any) => {
         const modelId = model.model_info?.id;
+        const queueMetrics = modelId ? vllmQueueMetrics[modelId] : undefined;
         const healthStatus = modelId ? modelHealthStatuses[modelId] : null;
         const status = healthStatus || {
           status: "none",
@@ -488,9 +516,11 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
           health_loading: status.loading,
           health_error: status.error,
           health_full_error: status.fullError,
+          vllm_running: queueMetrics?.running ?? null,
+          vllm_waiting: queueMetrics?.waiting ?? null,
         };
       }),
-    [modelData, modelHealthStatuses],
+    [modelData, modelHealthStatuses, vllmQueueMetrics],
   );
 
   const isPartialSelection = selectedModelIds.length > 0 && selectedModelIds.length < all_models_on_proxy.length;
