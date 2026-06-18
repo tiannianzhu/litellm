@@ -34,6 +34,7 @@ from litellm.proxy.health_endpoints._health_endpoints import (
 )
 from litellm.proxy.health_endpoints._health_endpoints import (
     test_model_connection as health_test_model_connection,
+    vllm_queue_metrics_endpoint,
 )
 from litellm.router import Router
 from litellm.types.router import RouterModelGroupAliasItem
@@ -6260,3 +6261,44 @@ async def test_unsaved_chatgpt_account_probe_requires_proxy_admin(
                 await call
             assert error.value.code == "403"
             assert len(upstream.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_vllm_queue_metrics_endpoint_returns_deployment_counts():
+    router: Final = litellm.Router(model_list=[
+        {
+            "model_name": "queue-fixture",
+            "litellm_params": {"model": "hosted_vllm/queue-fixture", "api_base": "http://host-a:8000/v1"},
+            "model_info": {"id": "deployment-1"},
+        },
+        {
+            "model_name": "queue-fixture",
+            "litellm_params": {"model": "hosted_vllm/queue-fixture", "api_base": "http://host-b:8000/v1"},
+            "model_info": {"id": "deployment-2"},
+        },
+    ])
+    user: Final = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+    with (
+        respx.mock(assert_all_called=True) as upstream,
+        patch(  # test-quality-ok: endpoint reads a proxy global; no injection seam
+            "litellm.proxy.proxy_server.llm_router", router
+        ),
+    ):
+        host_a: Final = upstream.get("http://host-a:8000/metrics").respond(
+            200, text="vllm:num_requests_running 12\nvllm:num_requests_waiting 3\n"
+        )
+        host_b: Final = upstream.get("http://host-b:8000/metrics").respond(
+            200, text="vllm:num_requests_running 4\nvllm:num_requests_waiting 0\n"
+        )
+        result: Final = await vllm_queue_metrics_endpoint(user_api_key_dict=user)
+        assert result == {
+            "queues": {
+                "deployment-1": {"running": 12, "waiting": 3},
+                "deployment-2": {"running": 4, "waiting": 0},
+            }
+        }
+        host_a.respond(200, text="vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n")
+        host_b.respond(200, text="vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n")
+        assert await router.health().vllm_queue_metrics(use_cache=False) == {
+            "deployment-1": (0, 0), "deployment-2": (0, 0),
+        }

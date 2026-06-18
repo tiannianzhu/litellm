@@ -1559,6 +1559,8 @@ class RouterHealth(Protocol):
         """The cooldown store (was ``cooldown_cache``)."""
         ...
 
+    async def vllm_queue_metrics(self, use_cache: bool = True) -> Mapping[str, tuple[int | None, int | None]]: ...
+
     @property
     def session_pins(self) -> "RouterSessionPinStore":
         """The session affinity pins deployment affinity and the complexity router claim and read."""
