@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import warnings
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -56,6 +57,107 @@ from litellm.router_utils.fallback_event_handlers import DISABLE_FALLBACKS_METAD
 from litellm.router_utils.router_callbacks.track_deployment_metrics import get_deployment_successes_for_current_minute
 from litellm.types.llms.openai import ChatCompletionRequest
 from litellm.types.router import Deployment, DeploymentTypedDict, LiteLLM_Params, ModelInfo, PreRoutingHookResponse, RetryPolicy
+
+
+def _hosted_vllm_deployment(deployment_id: str, api_base: str) -> dict:
+    return {
+        "model_name": "test-model",
+        "litellm_params": {
+            "model": "hosted_vllm/test-model",
+            "api_base": api_base,
+        },
+        "model_info": {"id": deployment_id},
+    }
+
+
+def test_parse_vllm_deployment_metrics_sums_labeled_queue_metrics():
+    router = litellm.Router(model_list=[])
+
+    running, waiting = router._parse_vllm_deployment_metrics(
+        "\n".join(
+            [
+                'vllm:num_requests_running{model_name="a"} 4.0',
+                'vllm:num_requests_running{model_name="b"} 6.0',
+                'vllm:num_requests_waiting{model_name="a"} 2.0',
+                'vllm:num_requests_waiting{model_name="b"} 3.0',
+            ]
+        )
+    )
+
+    assert running == 10
+    assert waiting == 5
+
+
+def test_parse_vllm_deployment_metrics_prefers_omni_queue_metrics():
+    router = litellm.Router(model_list=[])
+
+    assert router._parse_vllm_deployment_metrics(
+        "\n".join(
+            [
+                'vllm:num_requests_running{model_name="qwen3-tts",stage="0"} 1.0',
+                'vllm:num_requests_waiting{model_name="qwen3-tts",stage="1"} 1.0',
+                'vllm_omni:num_requests_running{model_name="Qwen3-TTS"} 0.0',
+                'vllm_omni:num_requests_waiting{model_name="Qwen3-TTS"} 0.0',
+            ]
+        )
+    ) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_get_vllm_queue_metrics_returns_counts_by_deployment_id():
+    deployment = _hosted_vllm_deployment("deployment-1", "http://host-a:8000/v1")
+    router = litellm.Router(model_list=[deployment])
+    router._vllm_metrics_cache = {
+        "http://host-a:8000/metrics": (time.time(), (12, 3)),
+    }
+
+    metrics = await router.async_get_vllm_queue_metrics()
+
+    assert metrics == {"deployment-1": (12, 3)}
+
+
+@pytest.mark.asyncio
+async def test_get_vllm_queue_metrics_can_skip_stale_cache():
+    deployment_a = _hosted_vllm_deployment("deployment-1", "http://host-a:8000/v1")
+    deployment_b = _hosted_vllm_deployment("deployment-2", "http://host-b:8000/v1")
+    router = litellm.Router(model_list=[deployment_a, deployment_b])
+    router._vllm_metrics_cache = {
+        "http://host-a:8000/metrics": (time.time(), (12, 3)),
+    }
+    client_init = MagicMock()
+
+    class FakeResponse:
+        text = "\n".join(
+            [
+                'vllm:num_requests_running{model_name="test-model"} 0.0',
+                'vllm:num_requests_waiting{model_name="test-model"} 0.0',
+            ]
+        )
+
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            client_init()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url):
+            return FakeResponse()
+
+    with patch("httpx.AsyncClient", FakeAsyncClient):
+        metrics = await router.async_get_vllm_queue_metrics(use_cache=False)
+
+    assert metrics == {
+        "deployment-1": (0, 0),
+        "deployment-2": (0, 0),
+    }
+    client_init.assert_called_once_with()
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
