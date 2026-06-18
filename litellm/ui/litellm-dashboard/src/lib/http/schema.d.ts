@@ -8323,6 +8323,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/health/vllm-queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Vllm Queue Metrics Endpoint */
+        get: operations["vllm_queue_metrics_endpoint_health_vllm_queue_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/images/edits": {
         parameters: {
             query?: never;
@@ -55867,6 +55884,20 @@ export interface components {
             /** User Id */
             user_id?: string | null;
         };
+        /** VLLMQueueMetric */
+        VLLMQueueMetric: {
+            /** Running */
+            running: number | null;
+            /** Waiting */
+            waiting: number | null;
+        };
+        /** VLLMQueueMetricsResponse */
+        VLLMQueueMetricsResponse: {
+            /** Queues */
+            queues: {
+                [key: string]: components["schemas"]["VLLMQueueMetric"];
+            };
+        };
         /** ValidationError */
         ValidationError: {
             /** Context */
@@ -69413,6 +69444,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    vllm_queue_metrics_endpoint_health_vllm_queue_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VLLMQueueMetricsResponse"];
                 };
             };
         };

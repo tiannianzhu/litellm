@@ -16,9 +16,17 @@ import i18n from "@/i18n/i18n";
 import { errorPatterns } from "@/utils/errorPatterns";
 
 import { Team } from "../key_team_helpers/key_list";
-import { individualModelHealthCheckCall, latestHealthChecksCall } from "../networking";
+import {
+  individualModelHealthCheckCall,
+  latestHealthChecksCall,
+  type VLLMQueueMetricsResponse,
+  vllmQueueMetricsCall,
+} from "../networking";
 import { HealthChecksTable } from "./HealthChecksTable";
 import type { HealthCheckData, HealthStatus } from "./HealthChecksTableColumns";
+
+const VLLM_QUEUE_POLL_INTERVAL_MS = 5_000;
+const VLLM_QUEUE_REQUEST_TIMEOUT_MS = 5_000;
 
 interface LatestHealthCheck {
   status?: string;
@@ -171,10 +179,18 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
     fullError: string;
   } | null>(null);
   const [successModalVisible, setSuccessModalVisible] = useState(false);
+  const [vllmQueue, setVllmQueue] = useState<{
+    accessToken: string | null;
+    queues: VLLMQueueMetricsResponse["queues"];
+  }>({ accessToken, queues: {} });
   const [selectedSuccessDetails, setSelectedSuccessDetails] = useState<{
     modelName: string;
     response: unknown;
   } | null>(null);
+
+  if (vllmQueue.accessToken !== accessToken) {
+    setVllmQueue({ accessToken, queues: {} });
+  }
 
   // Initialize health statuses on component mount (keyed by model id)
   useEffect(() => {
@@ -238,6 +254,40 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
 
     initializeHealthStatuses();
   }, [accessToken, modelData]);
+
+  useEffect(() => {
+    if (!accessToken) return;
+
+    let timer: number | undefined;
+    let activeRequest: AbortController | undefined;
+    let stopped = false;
+    const clearQueueMetrics = () => setVllmQueue({ accessToken, queues: {} });
+    const refreshQueueMetrics = async () => {
+      const request = new AbortController();
+      activeRequest = request;
+      timer = window.setTimeout(() => {
+        request.abort();
+        clearQueueMetrics();
+      }, VLLM_QUEUE_REQUEST_TIMEOUT_MS);
+
+      try {
+        const { queues } = await vllmQueueMetricsCall(accessToken, request.signal);
+        if (!request.signal.aborted) setVllmQueue({ accessToken, queues });
+      } catch {
+        if (!request.signal.aborted) clearQueueMetrics();
+      } finally {
+        window.clearTimeout(timer);
+        if (!stopped) timer = window.setTimeout(refreshQueueMetrics, VLLM_QUEUE_POLL_INTERVAL_MS);
+      }
+    };
+
+    void refreshQueueMetrics();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+      activeRequest?.abort();
+    };
+  }, [accessToken]);
 
   const runIndividualHealthCheck = useCallback(
     async (modelId: string) => {
@@ -468,6 +518,7 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
     () =>
       (modelData?.data ?? []).map((model: any) => {
         const modelId = model.model_info?.id;
+        const queueMetrics = modelId ? vllmQueue.queues[modelId] : undefined;
         const healthStatus = modelId ? modelHealthStatuses[modelId] : null;
         const status = healthStatus || {
           status: "none",
@@ -485,9 +536,11 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
           health_loading: status.loading,
           health_error: status.error,
           health_full_error: status.fullError,
+          vllm_running: queueMetrics?.running ?? null,
+          vllm_waiting: queueMetrics?.waiting ?? null,
         };
       }),
-    [modelData, modelHealthStatuses],
+    [modelData, modelHealthStatuses, vllmQueue.queues],
   );
 
   const isPartialSelection = selectedModelIds.length > 0 && selectedModelIds.length < all_models_on_proxy.length;
