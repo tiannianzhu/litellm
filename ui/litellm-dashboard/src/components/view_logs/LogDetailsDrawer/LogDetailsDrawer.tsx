@@ -121,7 +121,7 @@ export function LogDetailsDrawer({
 }: LogDetailsDrawerProps) {
   const isSessionMode = Boolean(sessionId);
   const [selectedSessionRequestId, setSelectedSessionRequestId] = useState<string | null>(null);
-  const [sessionSortMode, setSessionSortMode] = useState<SessionLogSortMode>("duration");
+  const [sessionSortMode, setSessionSortMode] = useState<SessionLogSortMode>("start_time");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [copiedLeftPanelId, setCopiedLeftPanelId] = useState(false);
 
@@ -192,26 +192,22 @@ export function LogDetailsDrawer({
 
   const currentLog = useMemo(() => {
     if (!isSessionMode) return logEntry;
-    if (!sessionLogs.length) return null;
+    if (!sessionLogs.length) return logEntry;
     const fallbackLog = mostRecentLog ?? sessionLogs[0];
+    if (logEntry?.request_id) {
+      return sessionLogs.find((row) => row.request_id === logEntry.request_id) ?? logEntry;
+    }
     if (selectedSessionRequestId) {
       return sessionLogs.find((row) => row.request_id === selectedSessionRequestId) || fallbackLog;
-    }
-    if (logEntry?.request_id) {
-      const clickedLog = sessionLogs.find((row) => row.request_id === logEntry.request_id);
-      return clickedLog || fallbackLog;
     }
     return fallbackLog;
   }, [isSessionMode, logEntry, selectedSessionRequestId, sessionLogs, mostRecentLog]);
 
   useEffect(() => {
     if (!isSessionMode || !sessionLogs.length) return;
+    if (logEntry?.request_id) return;
     if (!selectedSessionRequestId || !sessionLogs.some((row) => row.request_id === selectedSessionRequestId)) {
-      const fallbackRequestId =
-        logEntry?.request_id && sessionLogs.some((row) => row.request_id === logEntry.request_id)
-          ? logEntry.request_id
-          : (mostRecentLog ?? sessionLogs[0]).request_id;
-      setSelectedSessionRequestId(fallbackRequestId);
+      setSelectedSessionRequestId((mostRecentLog ?? sessionLogs[0]).request_id);
     }
   }, [isSessionMode, logEntry, selectedSessionRequestId, sessionLogs, mostRecentLog]);
 
@@ -221,7 +217,7 @@ export function LogDetailsDrawer({
       setIsSidebarCollapsed(false);
     } else {
       if (isSessionMode) setSelectedSessionRequestId(null);
-      setSessionSortMode("duration");
+      setSessionSortMode("start_time");
       setCopiedLeftPanelId(false);
     }
   }, [open, isSessionMode]);
@@ -391,11 +387,11 @@ export function LogDetailsDrawer({
                     onValueChange={(value) => setSessionSortMode(value as SessionLogSortMode)}
                   >
                     <TabsList className="w-full">
-                      <TabsTrigger value="duration" className="text-[11px]">
-                        Duration
-                      </TabsTrigger>
                       <TabsTrigger value="start_time" className="text-[11px]">
                         Start time
+                      </TabsTrigger>
+                      <TabsTrigger value="duration" className="text-[11px]">
+                        Duration
                       </TabsTrigger>
                     </TabsList>
                   </Tabs>
