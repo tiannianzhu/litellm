@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import { Check, ChevronDown, ChevronRight, CircleAlert, Copy, Info } from "lucide-react";
 import moment from "moment";
 import { Badge } from "@/components/ui/badge";
@@ -167,6 +167,14 @@ export function LogDetailContent({
                   <GuardrailLabel label={primaryGuardrailLabel} maskedCount={totalMaskedEntities} />
                 </DescriptionItem>
               )}
+              <div role="group" aria-label="End User" className="col-span-2 grid grid-cols-2 gap-x-4">
+                <DescriptionItem label="End User ID">
+                  <TruncatedValue value={logEntry.end_user} />
+                </DescriptionItem>
+                <DescriptionItem label="End User Alias">
+                  <TruncatedValue value={logEntry.end_user_alias} />
+                </DescriptionItem>
+              </div>
             </DescriptionList>
           </CardContent>
         </Card>
@@ -268,9 +276,12 @@ function DescriptionList({ children }: { children: React.ReactNode }) {
 }
 
 function DescriptionItem({ label, children }: { label: React.ReactNode; children: React.ReactNode }) {
+  const labelId = useId();
   return (
-    <div className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-0.5">
-      <span className="shrink-0 text-muted-foreground after:content-[':']">{label}</span>
+    <div role="group" aria-labelledby={labelId} className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-0.5">
+      <span id={labelId} className="shrink-0 text-muted-foreground after:content-[':']">
+        {label}
+      </span>
       <span className="min-w-0 break-words">{children}</span>
     </div>
   );

@@ -12,6 +12,8 @@ interface SimpleToolCallBlockProps {
 }
 
 export function SimpleToolCallBlock({ tool, compact = false }: SimpleToolCallBlockProps) {
+  const argumentEntries = Object.entries(tool.arguments);
+
   return (
     <div
       className={cn(
@@ -26,9 +28,11 @@ export function SimpleToolCallBlock({ tool, compact = false }: SimpleToolCallBlo
 
       <span className="mb-1.5 block text-[13px] font-semibold">{tool.name}</span>
 
-      {Object.keys(tool.arguments).length > 0 && (
+      {tool.id && <code className="mb-1.5 inline-block text-[10px] text-muted-foreground">{tool.id}</code>}
+
+      {argumentEntries.length > 0 && (
         <div>
-          {Object.entries(tool.arguments).map(([key, value]) => (
+          {argumentEntries.map(([key, value]) => (
             <div key={key} className="mb-0.5">
               <span className="text-xs text-muted-foreground">{key}: </span>
               <span className="text-xs">{JSON.stringify(value)}</span>
