@@ -49,6 +49,51 @@ export const getRequestLogsTableColumns = ({
     cell: ({ row }) => <DateCell value={row.original.startTime} />,
   },
   {
+    id: "end_user",
+    accessorKey: "end_user",
+    header: "End User",
+    size: 140,
+    enableSorting: false,
+    cell: ({ row }) => <TruncatedText value={row.original.end_user_alias || row.original.end_user} />,
+  },
+  {
+    id: "model",
+    accessorKey: "model",
+    header: ({ column }) => <DataTableSortHeader column={column} title="Model" variant="dropdown-tristate" />,
+    size: 200,
+    enableSorting: true,
+    cell: ({ row }) => {
+      const log = row.original;
+      const provider = log.custom_llm_provider;
+      const sessionModels = log.session_models ?? [];
+      const modelNames = sessionModels.length > 0 ? sessionModels : [log.model ?? ""];
+      const modelLabel = log.session_models_truncated ? `${modelNames.join(", ")}, ...` : modelNames.join(", ");
+      const isSingleModel = modelNames.length === 1;
+      return (
+        <div className="flex items-center space-x-2">
+          {provider && isSingleModel && (
+            <img
+              src={getLogoUrl(log, provider)}
+              alt=""
+              className="w-4 h-4"
+              onError={(event) => {
+                event.currentTarget.style.display = "none";
+              }}
+            />
+          )}
+          <CellTooltip
+            content={modelLabel}
+            trigger={
+              <span className={isSingleModel ? "max-w-[15ch] truncate block" : "min-w-0 truncate block"}>
+                {modelLabel}
+              </span>
+            }
+          />
+        </div>
+      );
+    },
+  },
+  {
     id: "type",
     header: "Type",
     size: 90,
@@ -218,43 +263,6 @@ export const getRequestLogsTableColumns = ({
     cell: ({ row }) => <TruncatedText value={readMetaString(row.original.metadata, "user_api_key_alias")} />,
   },
   {
-    id: "model",
-    accessorKey: "model",
-    header: ({ column }) => <DataTableSortHeader column={column} title="Model" variant="dropdown-tristate" />,
-    size: 200,
-    enableSorting: true,
-    cell: ({ row }) => {
-      const log = row.original;
-      const provider = log.custom_llm_provider;
-      const sessionModels = log.session_models ?? [];
-      const modelNames = sessionModels.length > 0 ? sessionModels : [log.model ?? ""];
-      const modelLabel = log.session_models_truncated ? `${modelNames.join(", ")}, ...` : modelNames.join(", ");
-      const isSingleModel = modelNames.length === 1;
-      return (
-        <div className="flex items-center space-x-2">
-          {provider && isSingleModel && (
-            <img
-              src={getLogoUrl(log, provider)}
-              alt=""
-              className="w-4 h-4"
-              onError={(event) => {
-                event.currentTarget.style.display = "none";
-              }}
-            />
-          )}
-          <CellTooltip
-            content={modelLabel}
-            trigger={
-              <span className={isSingleModel ? "max-w-[15ch] truncate block" : "min-w-0 truncate block"}>
-                {modelLabel}
-              </span>
-            }
-          />
-        </div>
-      );
-    },
-  },
-  {
     id: "total_tokens",
     accessorKey: "total_tokens",
     header: ({ column }) => <DataTableSortHeader column={column} title="Tokens" variant="dropdown-tristate" />,
@@ -287,14 +295,6 @@ export const getRequestLogsTableColumns = ({
     size: 150,
     enableSorting: false,
     cell: ({ row }) => <TruncatedText value={row.original.user} />,
-  },
-  {
-    id: "end_user",
-    accessorKey: "end_user",
-    header: "End User",
-    size: 140,
-    enableSorting: false,
-    cell: ({ row }) => <TruncatedText value={row.original.end_user} />,
   },
   {
     id: "request_tags",

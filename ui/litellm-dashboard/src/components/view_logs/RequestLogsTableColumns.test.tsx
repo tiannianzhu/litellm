@@ -198,6 +198,35 @@ describe("row action cells", () => {
   });
 });
 
+describe("column priority", () => {
+  it("places end user and model immediately after time", () => {
+    renderRows([logEntry({})]);
+
+    const headers = screen.getAllByRole("columnheader").map((header) => header.textContent);
+    expect(headers.slice(0, 3)).toEqual(["Time", "End User", "Model"]);
+  });
+});
+
+describe("End User column", () => {
+  it("shows the database alias instead of the end-user id", () => {
+    renderRows([
+      logEntry({
+        end_user: "user-id-1",
+        end_user_alias: "Database Alias <alias@example.com>",
+      }),
+    ]);
+
+    expect(screen.getByText("Database Alias <alias@example.com>")).toBeInTheDocument();
+    expect(screen.queryByText("user-id-1")).not.toBeInTheDocument();
+  });
+
+  it("falls back to the end-user id when no display name is available", () => {
+    renderRows([logEntry({ end_user: "user-id-1", request_tags: {} })]);
+
+    expect(screen.getByText("user-id-1")).toBeInTheDocument();
+  });
+});
+
 describe("sortable headers", () => {
   it("exposes sort controls only for the backend-sortable fields", () => {
     renderRows([logEntry({})]);

@@ -56,6 +56,41 @@ describe("LogDetailContent", () => {
     expect(screen.getByText("completion")).toBeInTheDocument();
   });
 
+  it("should display copyable end-user details together at the bottom of Request Details", async () => {
+    const user = userEvent.setup();
+    render(
+      <LogDetailContent
+        logEntry={createLogEntry({
+          end_user: "user-id-1",
+          end_user_alias: "Test User <test@example.com>",
+          requester_ip_address: "192.0.2.1",
+        })}
+      />,
+    );
+
+    const endUserId = screen.getByText("user-id-1");
+    const endUserIdDetail = endUserId.closest("div");
+    if (!endUserIdDetail) throw new Error("End User ID request detail was not rendered");
+
+    await user.click(within(endUserIdDetail).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe("user-id-1");
+
+    const endUserAlias = screen.getByText("Test User <test@example.com>");
+    const endUserAliasDetail = endUserAlias.closest("div");
+    if (!endUserAliasDetail) throw new Error("End User Alias request detail was not rendered");
+
+    await user.click(within(endUserAliasDetail).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe("Test User <test@example.com>");
+
+    const ipAddressLabel = screen.getByText("IP Address");
+    const endUserIdLabel = screen.getByText("End User ID");
+    const endUserAliasLabel = screen.getByText("End User Alias");
+
+    expect(ipAddressLabel.compareDocumentPosition(endUserIdLabel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(endUserIdLabel.compareDocumentPosition(endUserAliasLabel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(endUserIdLabel.parentElement?.parentElement).toBe(endUserAliasLabel.parentElement?.parentElement);
+  });
+
   it("should display error alert when request has failed", () => {
     render(
       <LogDetailContent

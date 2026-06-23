@@ -145,6 +145,14 @@ export function LogDetailContent({ logEntry, isLoadingDetails = false, accessTok
                   <GuardrailLabel label={primaryGuardrailLabel} maskedCount={totalMaskedEntities} />
                 </DescriptionItem>
               )}
+              <div className="col-span-2 grid grid-cols-2 gap-x-4">
+                <DescriptionItem label="End User ID">
+                  <TruncatedValue value={logEntry.end_user} />
+                </DescriptionItem>
+                <DescriptionItem label="End User Alias">
+                  <TruncatedValue value={logEntry.end_user_alias} />
+                </DescriptionItem>
+              </div>
             </DescriptionList>
           </CardContent>
         </Card>

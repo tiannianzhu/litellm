@@ -19,7 +19,7 @@ export function TruncatedValue({ value, maxWidth = DEFAULT_MAX_WIDTH }: Truncate
       <Tooltip>
         <TooltipTrigger
           render={
-            <span className="inline-flex items-center gap-1 align-bottom">
+            <span className="inline-flex items-center gap-1 align-baseline">
               <span className="truncate text-xs" style={{ maxWidth, fontFamily: FONT_FAMILY_MONO }}>
                 {value}
               </span>

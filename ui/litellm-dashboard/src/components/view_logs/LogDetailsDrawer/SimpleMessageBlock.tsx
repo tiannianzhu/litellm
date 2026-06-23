@@ -4,23 +4,30 @@
  */
 
 import { cn } from "@/lib/cva.config";
-import { ToolCall } from "./prettyMessagesTypes";
+import { MessageContentBlock, ToolCall } from "./prettyMessagesTypes";
 import { SimpleToolCallBlock } from "./SimpleToolCallBlock";
+import { MessageContentBlocks } from "./MessageContentBlocks";
 
 interface SimpleMessageBlockProps {
   label: string;
   content?: string;
+  contentBlocks?: MessageContentBlock[];
   toolCalls?: ToolCall[];
   isCompact?: boolean;
 }
 
-export function SimpleMessageBlock({ label, content, toolCalls, isCompact = false }: SimpleMessageBlockProps) {
-  // Don't show "null" for empty content
-  const displayContent = content && content !== "null" && content.length > 0 ? content : null;
-  const hasToolCalls = toolCalls && toolCalls.length > 0;
+export function SimpleMessageBlock({
+  label,
+  content,
+  contentBlocks,
+  toolCalls,
+  isCompact = false,
+}: SimpleMessageBlockProps) {
+  const hasContentBlocks = !!contentBlocks?.length;
+  const displayContent = !hasContentBlocks && content && content !== "null" && content.length > 0 ? content : null;
+  const hasToolCalls = !!toolCalls?.length;
 
-  // If no content and no tool calls, don't render
-  if (!displayContent && !hasToolCalls) {
+  if (!displayContent && !hasContentBlocks && !hasToolCalls) {
     return null;
   }
 
@@ -39,7 +46,8 @@ export function SimpleMessageBlock({ label, content, toolCalls, isCompact = fals
         </div>
       )}
 
-      {/* Inline tool calls for assistant messages in history */}
+      {hasContentBlocks && <MessageContentBlocks blocks={contentBlocks} compact={isCompact} />}
+
       {hasToolCalls && (
         <div>
           {toolCalls.map((tc, index) => (

@@ -27,6 +27,7 @@ export type LogEntry = {
   endTime: string;
   user?: string;
   end_user?: string;
+  end_user_alias?: string;
   custom_llm_provider?: string;
   metadata?: Record<string, any>;
   cache_hit: string;

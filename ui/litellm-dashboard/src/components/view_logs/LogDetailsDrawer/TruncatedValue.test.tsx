@@ -8,6 +8,11 @@ describe("TruncatedValue", () => {
     expect(screen.getByText("chatcmpl-abc123")).toBeInTheDocument();
   });
 
+  it("should align the value with the surrounding text baseline", () => {
+    render(<TruncatedValue value="chatcmpl-abc123" />);
+    expect(screen.getByText("chatcmpl-abc123").parentElement).toHaveClass("align-baseline");
+  });
+
   it("should render a dash when value is undefined", () => {
     render(<TruncatedValue />);
     expect(screen.getByText("-")).toBeInTheDocument();

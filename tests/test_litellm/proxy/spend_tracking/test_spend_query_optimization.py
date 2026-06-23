@@ -233,7 +233,13 @@ async def test_spend_logs_ui_uses_bounded_count_not_full_scan(monkeypatch):
     )
 
     page_rows = [
-        {"request_id": "req-1", "metadata": "{}", "session_id": None},
+        {
+            "request_id": "req-1",
+            "metadata": "{}",
+            "session_id": None,
+            "end_user": "user-id-1",
+            "end_user_alias": "Test User <user@example.com>",
+        },
         {"request_id": "req-2", "metadata": "{}", "session_id": None},
     ]
     mock_prisma = _make_ui_spend_logs_mock(count_total=137, page_rows=page_rows)
@@ -279,10 +285,14 @@ async def test_spend_logs_ui_uses_bounded_count_not_full_scan(monkeypatch):
     assert "GROUP BY" not in count_sql and "DISTINCT ON" not in page_sql, (
         "without group_by_session the endpoint must keep raw per-call pagination"
     )
+    assert '"LiteLLM_EndUserTable"' not in count_sql
+    assert "end_user_info.alias AS end_user_alias" in page_sql
+    assert 'FROM "LiteLLM_EndUserTable"' in page_sql
 
     assert response["total"] == 137
     assert response["total_is_capped"] is False
     assert response["total_pages"] == (137 + 50 - 1) // 50
+    assert response["data"][0]["end_user_alias"] == "Test User <user@example.com>"
 
     for row in response["data"]:
         assert "total_count" not in row, "the window-function helper column must be stripped before serialising rows"
@@ -587,6 +597,8 @@ async def test_spend_logs_ui_group_by_session_paginates_sessions(monkeypatch):
     assert f"ORDER BY {group_key}, call_type IN ('call_mcp_tool', 'list_mcp_tools'), \"startTime\" DESC" in rep_sql, (
         "the session representative must prefer the newest non-MCP call"
     )
+    assert "end_user_info.alias AS end_user_alias" in rep_sql
+    assert 'FROM "LiteLLM_EndUserTable"' in rep_sql
     assert "COUNT(*) OVER ()" not in rep_sql
 
     assert [row["request_id"] for row in response["data"]] == ["req-1", "req-2"]

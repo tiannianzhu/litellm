@@ -2822,13 +2822,26 @@ async def ui_view_spend_logs(
         raw_total: Final = int(count_rows[0]["total_count"]) if count_rows else 0
         total_is_capped: Final = raw_total > SPEND_LOGS_PAGINATION_COUNT_CAP
         total_records: Final = SPEND_LOGS_PAGINATION_COUNT_CAP if total_is_capped else raw_total
+        end_user_alias_select: Final = ", end_user_info.alias AS end_user_alias" if not is_v2 else ""
+        end_user_alias_join: Final = (
+            """
+            LEFT JOIN (
+                SELECT user_id, alias
+                FROM "LiteLLM_EndUserTable"
+            ) AS end_user_info
+                ON end_user_info.user_id = "LiteLLM_SpendLogs".end_user
+            """
+            if not is_v2
+            else ""
+        )
 
         sql_query: Final = (
             f"""
                 SELECT * FROM (
                     SELECT DISTINCT ON ({_SESSION_GROUP_KEY_SQL})
-                        {_SPEND_LOG_LIST_COLUMNS}
+                        {_SPEND_LOG_LIST_COLUMNS}{end_user_alias_select}
                     FROM "LiteLLM_SpendLogs"
+                    {end_user_alias_join}
                     WHERE {joined_conditions}
                     ORDER BY {_SESSION_GROUP_KEY_SQL}, call_type IN {_MCP_CALL_TYPES_SQL}, "startTime" DESC
                 ) AS session_representatives
@@ -2838,8 +2851,9 @@ async def ui_view_spend_logs(
             if session_grouping
             else f"""
             SELECT
-                {_SPEND_LOG_LIST_COLUMNS}
+                {_SPEND_LOG_LIST_COLUMNS}{end_user_alias_select}
             FROM "LiteLLM_SpendLogs"
+            {end_user_alias_join}
             WHERE {joined_conditions}
             ORDER BY {_order_expr} {_sql_dir}{_nulls_clause}
             LIMIT ${p} OFFSET ${p + 1}
@@ -2898,8 +2912,13 @@ async def _fetch_session_representatives(
     rep_query: Final = f"""
         SELECT * FROM (
             SELECT DISTINCT ON ({_SESSION_GROUP_KEY_SQL})
-                {_SPEND_LOG_LIST_COLUMNS}
+                {_SPEND_LOG_LIST_COLUMNS}, end_user_info.alias AS end_user_alias
             FROM "LiteLLM_SpendLogs"
+            LEFT JOIN (
+                SELECT user_id, alias
+                FROM "LiteLLM_EndUserTable"
+            ) AS end_user_info
+                ON end_user_info.user_id = "LiteLLM_SpendLogs".end_user
             WHERE {where_clause}
               AND ({_SESSION_GROUP_KEY_SQL}) IN (
                   SELECT * FROM unnest(${next_param_index}::text[], ${next_param_index + 1}::text[])
@@ -4383,9 +4402,15 @@ async def ui_view_session_spend_logs(
                 "completionStartTime", model, model_id, model_group,
                 custom_llm_provider, api_base, "user", metadata,
                 cache_hit, cache_key, request_tags, team_id,
-                organization_id, end_user, requester_ip_address,
+                organization_id, end_user,
+                end_user_info.alias AS end_user_alias, requester_ip_address,
                 session_id, status, mcp_namespaced_tool_name, agent_id
             FROM "LiteLLM_SpendLogs"
+            LEFT JOIN (
+                SELECT user_id, alias
+                FROM "LiteLLM_EndUserTable"
+            ) AS end_user_info
+                ON end_user_info.user_id = "LiteLLM_SpendLogs".end_user
             WHERE session_id = $1{scope_sql}
             ORDER BY "startTime" DESC
             LIMIT $2 OFFSET $3

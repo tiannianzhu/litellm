@@ -1892,6 +1892,8 @@ async def test_ui_view_session_spend_logs_pagination(client, monkeypatch):
             "request_id": "req1",
             "session_id": "session-123",
             "startTime": "2024-01-01T00:00:00Z",
+            "end_user": "user-id-1",
+            "end_user_alias": "Test User <user@example.com>",
         },
         {
             "id": "log2",
@@ -1913,6 +1915,8 @@ async def test_ui_view_session_spend_logs_pagination(client, monkeypatch):
             assert skip == 1  # page=2, page_size=1
             assert 'ORDER BY "startTime" DESC' in sql_query
             assert '"user" = $4' not in sql_query
+            assert "end_user_info.alias AS end_user_alias" in sql_query
+            assert 'FROM "LiteLLM_EndUserTable"' in sql_query
             return [mock_spend_logs[0]]
 
     class MockPrismaClient:
@@ -1942,6 +1946,7 @@ async def test_ui_view_session_spend_logs_pagination(client, monkeypatch):
         assert data["total_pages"] == 2
         assert len(data["data"]) == 1
         assert data["data"][0]["request_id"] == "req1"
+        assert data["data"][0]["end_user_alias"] == "Test User <user@example.com>"
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
 
