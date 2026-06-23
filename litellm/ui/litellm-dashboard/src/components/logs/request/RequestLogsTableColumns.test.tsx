@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -273,6 +273,13 @@ describe("Type column", () => {
     expect(screen.getByText("MCP")).toBeInTheDocument();
   });
 
+  it("keeps the conversation count when a search call represents the conversation", () => {
+    renderRows([logEntry({ call_type: "asearch", session_id: "sess-search", session_total_count: 3 })]);
+
+    expect(screen.getByRole("cell", { name: "3" })).toBeInTheDocument();
+    expect(screen.queryByText("Search")).not.toBeInTheDocument();
+  });
+
   it("marks a batch cost row with the Batch badge instead of LLM", () => {
     renderRows([logEntry({ request_id: "batch_1_batch_cost", call_type: "aretrieve_batch" })]);
 
@@ -475,6 +482,41 @@ describe("row action cells", () => {
   });
 });
 
+describe("column priority", () => {
+  it("places end user and model immediately after time", () => {
+    renderRows([logEntry({})]);
+
+    const headers = screen.getAllByRole("columnheader").map((header) => header.textContent);
+    expect(headers.slice(0, 3)).toEqual(["Time", "End User", "Model"]);
+  });
+});
+
+describe("End User column", () => {
+  const endUserCell = () => {
+    const column = screen.getAllByRole("columnheader").indexOf(screen.getByRole("columnheader", { name: "End User" }));
+    return within(screen.getAllByRole("row")[1]).getAllByRole("cell")[column];
+  };
+
+  it("shows the database alias instead of the end-user id", () => {
+    renderRows([
+      logEntry({
+        end_user: "user-id-1",
+        end_user_alias: "Database Alias <alias@example.com>",
+      }),
+    ]);
+
+    const cell = endUserCell();
+    expect(cell).toHaveTextContent(/^Database Alias <alias@example\.com>$/);
+    expect(cell).not.toHaveTextContent("user-id-1");
+  });
+
+  it("falls back to the end-user id when no display name is available", () => {
+    renderRows([logEntry({ end_user: "user-id-1", request_tags: {} })]);
+
+    expect(endUserCell()).toHaveTextContent(/^user-id-1$/);
+  });
+});
+
 describe("sortable headers", () => {
   it("exposes sort controls only for the backend-sortable fields", () => {
     renderRows([logEntry({})]);
@@ -489,6 +531,24 @@ describe("sortable headers", () => {
 });
 
 describe("TTFT column", () => {
+  it("identifies search requests without an empty provider image or TTFT", () => {
+    const searchOverrides: Partial<LogEntry> = {
+      request_id: "req-search",
+      model: "fixture-search-provider/search",
+      custom_llm_provider: "fixture-search-provider",
+      call_type: "asearch",
+      startTime: "2026-07-07T09:50:13Z",
+      endTime: "2026-07-07T09:50:15Z",
+      completionStartTime: "2026-07-07T09:50:14Z",
+    };
+    const searchLog = logEntry(searchOverrides);
+    renderRows([searchLog]);
+
+    expect(screen.getByText("Search")).toBeInTheDocument();
+    expect(screen.queryByText("1.00")).not.toBeInTheDocument();
+    expect(screen.queryByAltText(/.*/)).not.toBeInTheDocument();
+  });
+
   it("renders '-' when the completion start equals the end time, since TTFT is meaningless there", () => {
     renderRows([
       logEntry({

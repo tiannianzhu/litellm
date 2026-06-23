@@ -124,6 +124,16 @@ _SPEND_LOG_LIST_COLUMNS: Final = """
                 COALESCE(request_duration_ms,
                     (EXTRACT(EPOCH FROM ("endTime" - "startTime")) * 1000)::INTEGER) AS request_duration_ms
 """
+_END_USER_ALIAS_SQL: Final = (
+    ", end_user_info.alias AS end_user_alias",
+    """
+    LEFT JOIN (
+        SELECT user_id, alias
+        FROM "LiteLLM_EndUserTable"
+    ) AS end_user_info
+        ON end_user_info.user_id = "LiteLLM_SpendLogs".end_user
+    """,
+)
 
 _INTERNAL_HEALTH_CHECK_API_KEYS: Final = (
     LITTELM_INTERNAL_HEALTH_SERVICE_ACCOUNT_NAME,
@@ -3086,6 +3096,7 @@ async def ui_view_spend_logs(
             sql_params.append(json.dumps(used_client_oauth_token))
             p += 1
 
+        include_end_user_alias: Final = is_admin_view and not is_v2
         if (
             group_by_session is True
             and not is_v2
@@ -3104,6 +3115,7 @@ async def ui_view_spend_logs(
                 sort_desc=order_direction != "asc",
                 session_cursor=session_cursor,
                 organization_ids=organization_ids,
+                include_end_user_alias=include_end_user_alias,
             )
 
         if status_filter is not None and group_by_session is True and not is_search_lookup:
@@ -3163,13 +3175,15 @@ async def ui_view_spend_logs(
         raw_total: Final = int(count_rows[0]["total_count"]) if count_rows else 0
         total_is_capped: Final = raw_total > SPEND_LOGS_PAGINATION_COUNT_CAP
         total_records: Final = SPEND_LOGS_PAGINATION_COUNT_CAP if total_is_capped else raw_total
+        end_user_alias_select, end_user_alias_join = _END_USER_ALIAS_SQL if include_end_user_alias else ("", "")
 
         sql_query: Final = (
             f"""
                 SELECT * FROM (
                     SELECT DISTINCT ON ({_SESSION_GROUP_KEY_SQL})
-                        {_SPEND_LOG_LIST_COLUMNS}
+                        {_SPEND_LOG_LIST_COLUMNS}{end_user_alias_select}
                     FROM "LiteLLM_SpendLogs"
+                    {end_user_alias_join}
                     WHERE {joined_conditions}
                     ORDER BY {_SESSION_GROUP_KEY_SQL}, {SESSION_REPRESENTATIVE_ORDER_SQL}
                 ) AS session_representatives
@@ -3179,8 +3193,9 @@ async def ui_view_spend_logs(
             if session_grouping
             else f"""
             SELECT
-                {_SPEND_LOG_LIST_COLUMNS}
+                {_SPEND_LOG_LIST_COLUMNS}{end_user_alias_select}
             FROM "LiteLLM_SpendLogs"
+            {end_user_alias_join}
             WHERE {joined_conditions}
             ORDER BY {exact_request_id_first}{_order_expr} {_sql_dir}{_nulls_clause}
             LIMIT ${p} OFFSET ${p + 1}
@@ -3227,14 +3242,17 @@ async def _fetch_session_representatives(
     sql_params: Sequence[object],
     next_param_index: int,
     session_keys: Sequence[tuple[str, str]],
+    include_end_user_alias: bool,
 ) -> list[dict[str, object]]:  # mutable-ok: _build_ui_spend_logs_response writes session counts onto each row
     """Fetch the final agent outcome, or newest non-MCP row, of each ``(session_key, api_key)`` session, in ``session_keys`` order."""
     # Lets Postgres use the session_id and request_id indexes.
+    end_user_alias_select, end_user_alias_join = _END_USER_ALIAS_SQL if include_end_user_alias else ("", "")
     rep_query: Final = f"""
         SELECT * FROM (
             SELECT DISTINCT ON ({_SESSION_GROUP_KEY_SQL})
-                {_SPEND_LOG_LIST_COLUMNS}
+                {_SPEND_LOG_LIST_COLUMNS}{end_user_alias_select}
             FROM "LiteLLM_SpendLogs"
+            {end_user_alias_join}
             WHERE {where_clause}
               AND (session_id = ANY(${next_param_index}::text[]) OR request_id = ANY(${next_param_index}::text[]))
               AND ({_SESSION_GROUP_KEY_SQL}) IN (
@@ -3266,6 +3284,7 @@ async def _ui_session_grouped_spend_logs(
     page_size: int,
     sort_desc: bool,
     session_cursor: str | None,
+    include_end_user_alias: bool,
     organization_ids: tuple[str, ...] | None = None,
 ) -> Mapping[str, object]:
     """One row per session, keyset-paginated by last activity. ``read_session_page`` picks and counts the sessions,
@@ -3290,6 +3309,7 @@ async def _ui_session_grouped_spend_logs(
             sql_params=sql_params,
             next_param_index=next_param_index,
             session_keys=session_keys,
+            include_end_user_alias=include_end_user_alias,
         )
         if session_keys
         else []
@@ -4722,9 +4742,10 @@ async def ui_view_session_spend_logs(
                 detail="Database not connected",
             )
 
+        is_admin_view: Final = is_admin_view_safe(user_api_key_dict=user_api_key_dict)
         read_scope: Final = (
             AllRows()
-            if is_admin_view_safe(user_api_key_dict=user_api_key_dict)
+            if is_admin_view
             else await _spend_log_read_scope(user_api_key_dict, log_team_lookup)
             if _can_user_view_spend_log(user_api_key_dict=user_api_key_dict)
             else OwnedRows(user_api_key_dict.user_id)
@@ -4738,6 +4759,7 @@ async def ui_view_session_spend_logs(
 
         # Get total count for pagination metadata
         total_records: Final = await _count_spend_logs(prisma_client, where_conditions)
+        end_user_alias_select, end_user_alias_join = _END_USER_ALIAS_SQL if is_admin_view else ("", "")
 
         # Query with raw SQL to exclude heavy columns (messages, response, proxy_server_request)
         sql_query: Final = f"""
@@ -4747,9 +4769,10 @@ async def ui_view_session_spend_logs(
                 "completionStartTime", model, model_id, model_group,
                 custom_llm_provider, api_base, "user", metadata,
                 cache_hit, cache_key, request_tags, team_id,
-                organization_id, end_user, requester_ip_address,
+                organization_id, end_user{end_user_alias_select}, requester_ip_address,
                 session_id, status, mcp_namespaced_tool_name, agent_id
             FROM "LiteLLM_SpendLogs"
+            {end_user_alias_join}
             WHERE session_id = $1{scope_sql}
             ORDER BY "startTime" DESC
             LIMIT $2 OFFSET $3

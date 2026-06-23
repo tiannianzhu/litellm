@@ -60,7 +60,8 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
   const { startTime, endTime, isCustomDate } = timeRange;
 
   const [selectedKeyIdInfoView, setSelectedKeyIdInfoView] = useState<string | null>(null);
-  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+  const [pickedLog, setPickedLog] = useState<{ accessToken: string; log: LogEntry } | null>(null);
+  const selectedLog = pickedLog?.accessToken === accessToken ? pickedLog.log : null;
 
   const {
     logId: urlLogId,
@@ -256,31 +257,31 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
 
   const handleRowClick = useCallback(
     (log: LogEntry) => {
-      setSelectedLog(log);
+      setPickedLog({ accessToken, log });
       if (log.session_id && (log.session_total_count || 1) > 1) {
         openSession(log.session_id, log.request_id);
       } else {
         openLog(log.request_id);
       }
     },
-    [openLog, openSession],
+    [accessToken, openLog, openSession],
   );
 
   const handleSessionClick = useCallback(
     (log: LogEntry) => {
       if (!log.session_id) return;
-      setSelectedLog(log);
+      setPickedLog({ accessToken, log });
       openSession(log.session_id, log.request_id);
     },
-    [openSession],
+    [accessToken, openSession],
   );
 
   const handleSelectLog = useCallback(
     (log: LogEntry) => {
-      setSelectedLog(log);
+      setPickedLog({ accessToken, log });
       selectLog(log.request_id, displaySessionId);
     },
-    [selectLog, displaySessionId],
+    [accessToken, selectLog, displaySessionId],
   );
 
   const handleKeyHashClick = useCallback(

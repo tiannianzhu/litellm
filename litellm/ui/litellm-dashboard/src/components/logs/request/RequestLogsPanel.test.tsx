@@ -55,7 +55,7 @@ vi.mock("../detail", () => ({
     onSelectLog,
   }: {
     open: boolean;
-    logEntry?: { request_id: string } | null;
+    logEntry?: LogEntry | null;
     sessionId?: string | null;
     onClose: () => void;
     allLogs?: { request_id: string }[];
@@ -65,6 +65,7 @@ vi.mock("../detail", () => ({
     return (
       <div data-testid="log-details-drawer" data-log-id={logEntry?.request_id ?? ""} data-session-id={sessionId ?? ""}>
         {open ? "open" : "closed"}
+        {logEntry?.end_user_alias ?? logEntry?.end_user}
         <button type="button" onClick={onClose}>
           close-drawer
         </button>
@@ -580,6 +581,31 @@ describe("RequestLogsPanel", () => {
         expect(drawer()).toHaveTextContent("open");
       });
       expect(drawer()).toHaveAttribute("data-log-id", "req-1");
+    });
+
+    it("reloads the selected URL row without the previous token's customer alias", async () => {
+      const adminLog = logEntry({ end_user: "customer-1", end_user_alias: "Customer label" });
+      const viewerLog = logEntry({ end_user: "customer-1" });
+      const viewerPage = Promise.withResolvers<Awaited<ReturnType<typeof uiSpendLogsCall>>>();
+      const adminPage = { data: [adminLog], total: 1, page: 1, page_size: 25, total_pages: 1 };
+      vi.mocked(uiSpendLogsCall).mockImplementation(async ({ accessToken }) =>
+        accessToken === defaultProps.accessToken ? adminPage : viewerPage.promise,
+      );
+      const tree = (accessToken: string) => (
+        <NuqsTestingAdapter onUrlUpdate={onUrlUpdate} hasMemory>
+          <QueryClientProvider client={testQueryClient}>
+            <RequestLogsPanel {...defaultProps} accessToken={accessToken} />
+          </QueryClientProvider>
+        </NuqsTestingAdapter>
+      );
+      const { rerender } = render(tree(defaultProps.accessToken));
+      await userEvent.click(await screen.findByText("Customer label"));
+      expect(await within(drawer()).findByText(/Customer label/)).toBeInTheDocument();
+
+      rerender(tree("viewer-token"));
+      expect(screen.queryAllByText(/Customer label/)).toHaveLength(0);
+      viewerPage.resolve({ ...adminPage, data: [viewerLog] });
+      expect(await within(drawer()).findByText(/customer-1/)).toBeInTheDocument();
     });
 
     it("opens the drawer on load when ?log_id= matches a log in the loaded page", async () => {

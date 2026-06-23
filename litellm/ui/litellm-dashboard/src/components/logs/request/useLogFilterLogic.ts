@@ -1,6 +1,6 @@
 import moment from "moment";
 import type { ParseKeys } from "i18next";
-import { keepPreviousData, useQuery, type UseQueryOptions } from "@tanstack/react-query";
+import { useQuery, type UseQueryOptions } from "@tanstack/react-query";
 import type { ColumnFiltersState, PaginationState, SortingState } from "@tanstack/react-table";
 import { uiSpendLogsCall } from "../../networking";
 import { Team } from "../../key_team_helpers/key_list";
@@ -146,6 +146,7 @@ export function useLogFilterLogic({
     queryKey: [
       "logs",
       "table",
+      accessToken,
       pagination.pageIndex,
       pageSize,
       startTime,
@@ -205,7 +206,7 @@ export function useLogFilterLogic({
     },
     enabled: !!accessToken && !!token && !!userRole && !!userID && activeTab === "request logs",
     refetchInterval: getLiveTailRefetchInterval(isLiveTail, pagination.pageIndex),
-    placeholderData: keepPreviousData,
+    placeholderData: (previous, query) => (query?.queryKey[2] === accessToken ? previous : undefined),
     refetchIntervalInBackground: false,
   };
 
