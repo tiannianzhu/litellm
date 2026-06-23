@@ -56,6 +56,38 @@ describe("LogDetailContent", () => {
     expect(screen.getByText("completion")).toBeInTheDocument();
   });
 
+  it("should display copyable end-user details together at the bottom of Request Details", async () => {
+    const user = userEvent.setup();
+    render(
+      <LogDetailContent
+        logEntry={createLogEntry({
+          end_user: "user-id-1",
+          end_user_alias: "Test User <test@example.com>",
+          requester_ip_address: "192.0.2.1",
+        })}
+      />,
+    );
+
+    const endUserDetails = screen.getByRole("group", { name: "End User" });
+    const endUserIdDetail = within(endUserDetails).getByRole("group", { name: "End User ID" });
+    expect(within(endUserIdDetail).getByText("user-id-1")).toBeInTheDocument();
+
+    await user.click(within(endUserIdDetail).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe("user-id-1");
+
+    const endUserAliasDetail = within(endUserDetails).getByRole("group", { name: "End User Alias" });
+    expect(within(endUserAliasDetail).getByText("Test User <test@example.com>")).toBeInTheDocument();
+
+    await user.click(within(endUserAliasDetail).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe("Test User <test@example.com>");
+
+    expect(screen.getAllByRole("group", { name: /^(IP Address|End User ID|End User Alias)$/ })).toEqual([
+      screen.getByRole("group", { name: "IP Address" }),
+      endUserIdDetail,
+      endUserAliasDetail,
+    ]);
+  });
+
   it("should display error alert when request has failed", () => {
     render(
       <LogDetailContent

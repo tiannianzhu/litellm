@@ -43,7 +43,12 @@ export function OutputCard({ message, completionTokens, outputCost }: OutputCard
       >
         <div className="px-4 py-3">
           {message ? (
-            <SimpleMessageBlock label="ASSISTANT" content={message.content} toolCalls={message.toolCalls} />
+            <SimpleMessageBlock
+              label="ASSISTANT"
+              content={message.content}
+              contentBlocks={message.contentBlocks}
+              toolCalls={message.toolCalls}
+            />
           ) : (
             <span className="text-[13px] text-muted-foreground italic">No response data available</span>
           )}

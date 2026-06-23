@@ -20,7 +20,7 @@ vi.mock("./LogDetailContent", () => ({
 }));
 
 vi.mock("./DrawerHeader", () => ({
-  DrawerHeader: () => null,
+  DrawerHeader: ({ log }: { log: LogEntry }) => <div data-testid="drawer-log-id">{log.request_id}</div>,
 }));
 
 vi.mock("@/app/(dashboard)/hooks/models/useModels", () => ({
@@ -91,36 +91,55 @@ const sidebarEventNames = () =>
   screen.queryAllByText(/^(llm-early|llm-late|tool-early|tool-late)$/).map((el) => el.textContent);
 
 describe("LogDetailsDrawer session sidebar sorting", () => {
-  it("defaults to duration order, longest call first across LLM and MCP calls", async () => {
+  it("defaults to chronological order across LLM and MCP calls", async () => {
     renderSessionDrawer();
     await waitFor(() => expect(sidebarEventNames()).toHaveLength(4));
-    expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]);
+    expect(screen.getAllByText(/^(Start time|Duration)$/).map((option) => option.textContent)).toEqual([
+      "Start time",
+      "Duration",
+    ]);
+    expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]);
   });
 
-  it("switches to chronological order across LLM and MCP calls when Start time is selected", async () => {
+  it("switches to longest-first order when Duration is selected", async () => {
     renderSessionDrawer();
     await waitFor(() => expect(sidebarEventNames()).toHaveLength(4));
-
-    fireEvent.click(screen.getByText("Start time"));
-
-    await waitFor(() => expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]));
 
     fireEvent.click(screen.getByText("Duration"));
 
     await waitFor(() => expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]));
   });
 
-  it("resets the sort mode back to duration when the drawer is closed and reopened", async () => {
+  it("resets the sort mode back to start time when the drawer is closed and reopened", async () => {
     const { rerender, drawer } = renderSessionDrawer();
     await waitFor(() => expect(sidebarEventNames()).toHaveLength(4));
 
-    fireEvent.click(screen.getByText("Start time"));
-    await waitFor(() => expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]));
+    fireEvent.click(screen.getByText("Duration"));
+    await waitFor(() => expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]));
 
     rerender(drawer(false));
     rerender(drawer(true));
 
-    await waitFor(() => expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]));
+    await waitFor(() => expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]));
+  });
+
+  it("shows the externally selected log after a different session child was selected", async () => {
+    vi.mocked(sessionSpendLogsCall).mockResolvedValue({ data: sessionLogs, total: 4, total_pages: 1 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const drawer = (selectedLog: LogEntry | null) => (
+      <QueryClientProvider client={queryClient}>
+        <LogDetailsDrawer open onClose={() => {}} logEntry={selectedLog} sessionId="session-1" accessToken="token" />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(drawer(null));
+
+    await screen.findByText("llm-late");
+    fireEvent.click(screen.getByText("llm-late"));
+    await waitFor(() => expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("llm-late"));
+
+    rerender(drawer(sessionLogs[1]));
+
+    await waitFor(() => expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("mcp-early"));
   });
 });
 
