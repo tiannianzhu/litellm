@@ -14478,6 +14478,9 @@
         "errorFallback": "An error occurred",
         "requestFailed": "Request Failed",
         "requestDetails": "Request Details",
+        "endUser": "End User",
+        "endUserId": "End User ID",
+        "endUserAlias": "End User Alias",
         "model": "Model",
         "provider": "Provider",
         "callType": "Call Type",
@@ -14917,6 +14920,11 @@
       "collapsibleMessage": {
         "charCount": "({{value}} chars)"
       },
+      "contentBlocks": {
+        "toolError": "TOOL ERROR",
+        "toolResult": "TOOL RESULT",
+        "redactedThinking": "REDACTED THINKING"
+      },
       "toolCall": {
         "badge": "function"
       },
@@ -15072,6 +15080,7 @@
         "tags": "Tags"
       },
       "badges": {
+        "search": "Search",
         "agent": "Agent",
         "batch": "Batch"
       }

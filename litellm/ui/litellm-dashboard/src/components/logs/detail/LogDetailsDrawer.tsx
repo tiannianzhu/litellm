@@ -130,13 +130,24 @@ export function LogDetailsDrawer({
 }: LogDetailsDrawerProps) {
   const { t } = useTranslation();
   const isSessionMode = Boolean(sessionId);
-  const [selectedSessionRequestId, setSelectedSessionRequestId] = useState<string | null>(null);
-  const [sessionSortMode, setSessionSortMode] = useState<SessionLogSortMode>("duration");
+  const [localSelection, setLocalSelection] = useState<{
+    log: LogEntry;
+    entryId: string | undefined;
+    sessionId: string | null | undefined;
+    accessToken: string | null | undefined;
+  } | null>(null);
+  const [sessionSortMode, setSessionSortMode] = useState<SessionLogSortMode>("start_time");
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [copiedLeftPanelId, setCopiedLeftPanelId] = useState(false);
+  const entryId = logEntry?.request_id;
+  if (localSelection) {
+    const sameEntry = localSelection.entryId === entryId && localSelection.sessionId === sessionId;
+    if (!sameEntry || localSelection.accessToken !== accessToken) setLocalSelection(null);
+  }
+  const selectedLog = onSelectLog ? logEntry : localSelection?.log ?? logEntry;
 
   const { data: sessionData } = useQuery({
-    queryKey: ["sessionLogs", sessionId],
+    queryKey: ["sessionLogs", sessionId, accessToken],
     queryFn: async () => {
       if (!sessionId || !accessToken) return { logs: [] as LogEntry[], total: 0 };
 
@@ -201,54 +212,40 @@ export function LogDetailsDrawer({
   );
 
   const currentLog = useMemo(() => {
-    if (!isSessionMode) return logEntry;
-    if (!sessionLogs.length) return null;
-    const fallbackLog = mostRecentLog ?? sessionLogs[0];
-    if (selectedSessionRequestId) {
-      return sessionLogs.find((row) => row.request_id === selectedSessionRequestId) || fallbackLog;
-    }
-    if (logEntry?.request_id) {
-      const clickedLog = sessionLogs.find((row) => row.request_id === logEntry.request_id);
-      return clickedLog || fallbackLog;
-    }
-    return fallbackLog;
-  }, [isSessionMode, logEntry, selectedSessionRequestId, sessionLogs, mostRecentLog]);
+    if (!isSessionMode) return selectedLog;
+    if (!selectedLog) return mostRecentLog;
+    return sessionLogs.find((row) => row.request_id === selectedLog.request_id) ?? selectedLog;
+  }, [isSessionMode, selectedLog, sessionLogs, mostRecentLog]);
 
-  useEffect(() => {
-    if (!isSessionMode || !sessionLogs.length) return;
-    if (!selectedSessionRequestId || !sessionLogs.some((row) => row.request_id === selectedSessionRequestId)) {
-      const fallbackRequestId =
-        logEntry?.request_id && sessionLogs.some((row) => row.request_id === logEntry.request_id)
-          ? logEntry.request_id
-          : (mostRecentLog ?? sessionLogs[0]).request_id;
-      setSelectedSessionRequestId(fallbackRequestId);
+  const selectDrawerLog = (log: LogEntry) => {
+    if (onSelectLog) {
+      onSelectLog(log);
+    } else {
+      const selection = { log, entryId, sessionId, accessToken };
+      setLocalSelection(selection);
     }
-  }, [isSessionMode, logEntry, selectedSessionRequestId, sessionLogs, mostRecentLog]);
+  };
 
   // Reset transient UI state when the drawer opens or closes.
   useEffect(() => {
     if (open) {
       setIsSidebarCollapsed(false);
     } else {
-      if (isSessionMode) setSelectedSessionRequestId(null);
-      setSessionSortMode("duration");
+      setLocalSelection(null);
+      setSessionSortMode("start_time");
       setCopiedLeftPanelId(false);
     }
-  }, [open, isSessionMode]);
+  }, [open]);
 
   // Keyboard navigation
-  const { selectNextLog, selectPreviousLog } = useKeyboardNavigation({
+  const keyboardNavigation = {
     isOpen: open,
     currentLog,
     allLogs: isSessionMode ? sessionLogs : allLogs,
     onClose,
-    onSelectLog: (selected) => {
-      if (isSessionMode) {
-        setSelectedSessionRequestId(selected.request_id);
-      }
-      onSelectLog?.(selected);
-    },
-  });
+    onSelectLog: selectDrawerLog,
+  };
+  const { selectNextLog, selectPreviousLog } = useKeyboardNavigation(keyboardNavigation);
 
   // Lazy-load log details (messages/response) only when drawer is open.
   // This fetches data for a single log on-demand instead of prefetching all 50.
@@ -318,8 +315,8 @@ export function LogDetailsDrawer({
         style={{ width: DRAWER_WIDTH }}
       >
         <SheetTitle className="sr-only">
-          {logEntry?.request_id
-            ? t("logs.detail.drawer.titleWithId", { id: logEntry.request_id })
+          {currentLog.request_id
+            ? t("logs.detail.drawer.titleWithId", { id: currentLog.request_id })
             : t("logs.detail.drawer.title")}
         </SheetTitle>
         <div style={{ height: "100%" }} className="flex relative">
@@ -402,11 +399,11 @@ export function LogDetailsDrawer({
                     onValueChange={(value) => setSessionSortMode(value as SessionLogSortMode)}
                   >
                     <TabsList className="w-full">
-                      <TabsTrigger value="duration" className="text-[11px]">
-                        {t("logs.detail.drawer.sortDuration")}
-                      </TabsTrigger>
                       <TabsTrigger value="start_time" className="text-[11px]">
                         {t("logs.detail.drawer.sortStartTime")}
+                      </TabsTrigger>
+                      <TabsTrigger value="duration" className="text-[11px]">
+                        {t("logs.detail.drawer.sortDuration")}
                       </TabsTrigger>
                     </TabsList>
                   </Tabs>
@@ -433,10 +430,7 @@ export function LogDetailsDrawer({
                             <TraceEventRow
                               row={row}
                               isSelected={row.request_id === currentLog.request_id}
-                              onClick={() => {
-                                setSelectedSessionRequestId(row.request_id);
-                                onSelectLog?.(row);
-                              }}
+                              onClick={() => selectDrawerLog(row)}
                             />
                           </div>
                         );
@@ -450,7 +444,7 @@ export function LogDetailsDrawer({
                         key={row.request_id}
                         row={row}
                         isSelected={row.request_id === currentLog.request_id}
-                        onClick={() => onSelectLog?.(row)}
+                        onClick={() => selectDrawerLog(row)}
                       />
                     ))}
                   </div>

@@ -2384,6 +2384,8 @@ async def test_ui_view_session_spend_logs_pagination(client, monkeypatch):
             "request_id": "req1",
             "session_id": "session-123",
             "startTime": "2024-01-01T00:00:00Z",
+            "end_user": "user-id-1",
+            "end_user_alias": "Test User <user@example.com>",
         },
         {
             "id": "log2",
@@ -2405,6 +2407,8 @@ async def test_ui_view_session_spend_logs_pagination(client, monkeypatch):
             assert skip == 1  # page=2, page_size=1
             assert 'ORDER BY "startTime" DESC' in sql_query
             assert '"user" = $4' not in sql_query
+            assert "end_user_info.alias AS end_user_alias" in sql_query
+            assert 'FROM "LiteLLM_EndUserTable"' in sql_query
             return [mock_spend_logs[0]]
 
     class MockPrismaClient:
@@ -2435,6 +2439,7 @@ async def test_ui_view_session_spend_logs_pagination(client, monkeypatch):
         assert data["total_pages"] == 2
         assert len(data["data"]) == 1
         assert data["data"][0]["request_id"] == "req1"
+        assert data["data"][0]["end_user_alias"] == "Test User <user@example.com>"
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
 
@@ -2499,12 +2504,15 @@ async def test_ui_view_session_spend_logs_includes_permitted_team_logs(client, m
             assert scoped_user == "user-1"
             assert tuple(team_ids) == ("team-9",)
             assert '("user" = $4 OR team_id = ANY($5::text[]))' in sql_query
+            assert '"LiteLLM_EndUserTable"' not in sql_query
+            assert "end_user_alias" not in sql_query
             return [
                 {
                     "id": "log2",
                     "request_id": "req2",
                     "session_id": "session-123",
                     "team_id": "team-9",
+                    "end_user": "customer-1",
                     "startTime": "2024-01-02T00:00:00Z",
                 }
             ]
@@ -2537,6 +2545,7 @@ async def test_ui_view_session_spend_logs_includes_permitted_team_logs(client, m
         data = response.json()
         assert data["total"] == 1
         assert [row["request_id"] for row in data["data"]] == ["req2"]
+        assert data["data"][0]["end_user"] == "customer-1"
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
 

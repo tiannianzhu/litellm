@@ -18,6 +18,8 @@ import { customerLogIdentity } from "../customerIdentity";
 import { AGENT_CALL_TYPES, MCP_CALL_TYPES } from "../constants";
 import { AgentBadge, AgentIcon, BatchBadge, LlmBadge, McpBadge, SparkleIcon, WrenchIcon } from "./TypeBadges";
 
+const SEARCH_CALL_TYPES = ["search", "asearch"];
+
 export interface RequestLogsTableColumnsDeps {
   onKeyHashClick: (keyHash: string) => void;
   onSessionClick: (log: LogEntry) => void;
@@ -92,6 +94,68 @@ export const getRequestLogsTableColumns = (
     cell: ({ row }) => <DateCell value={row.original.startTime} />,
   },
   {
+    id: "end_user",
+    accessorKey: "end_user",
+    header: t("logs.request.columns.endUser"),
+    size: 140,
+    enableSorting: false,
+    cell: ({ row }) => <TruncatedText value={row.original.end_user_alias || row.original.end_user} />,
+  },
+  {
+    id: "model",
+    accessorKey: "model",
+    header: ({ column }) => (
+      <DataTableSortHeader column={column} title={t("logs.request.columns.model")} variant="dropdown-tristate" />
+    ),
+    size: 200,
+    enableSorting: true,
+    cell: ({ row }) => {
+      const log = row.original;
+      const sessionModels = log.session_models ?? [];
+      const latestModel = log.model || sessionModels[0] || "";
+      const otherModels = sessionModels.filter((model) => model !== latestModel);
+      const models = [latestModel, ...otherModels].filter((model) => model !== "");
+      const logoUrl = log.custom_llm_provider ? getLogoUrl(log, log.custom_llm_provider) : "";
+      if (models.length === 0) return <span className="text-muted-foreground">-</span>;
+      return (
+        <div className="flex min-w-0 items-center">
+          <CellTooltip
+            content={
+              <div className="flex max-w-[280px] flex-col gap-0.5">
+                {models.map((model) => (
+                  <span key={model}>{model}</span>
+                ))}
+                {log.session_models_truncated === true && (
+                  <span className="text-muted-foreground">{t("logs.request.columns.moreModelsNotShown")}</span>
+                )}
+              </div>
+            }
+            trigger={
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                {logoUrl ? (
+                  <img
+                    src={logoUrl}
+                    alt=""
+                    className="w-4 h-4 shrink-0"
+                    onError={(event) => {
+                      event.currentTarget.style.display = "none";
+                    }}
+                  />
+                ) : null}
+                <span className="max-w-[22ch] truncate">{latestModel}</span>
+                {otherModels.length > 0 && (
+                  <Badge variant="outline" className="text-muted-foreground">
+                    +{otherModels.length}
+                  </Badge>
+                )}
+              </span>
+            }
+          />
+        </div>
+      );
+    },
+  },
+  {
     id: "type",
     header: t("logs.request.columns.type"),
     size: 90,
@@ -110,6 +174,13 @@ export const getRequestLogsTableColumns = (
         return <BatchBadge />;
       }
       if (sessionCount <= 1) {
+        if (SEARCH_CALL_TYPES.includes(log.call_type)) {
+          return (
+            <span className="inline-flex items-center px-2 py-0.5 bg-cyan-50 text-cyan-700 border border-cyan-200 rounded-full text-[11px] font-medium whitespace-nowrap">
+              {t("logs.request.badges.search")}
+            </span>
+          );
+        }
         if (isMcp) return <McpBadge />;
         if (isAgent) return <AgentBadge />;
         return <LlmBadge />;
@@ -285,6 +356,7 @@ export const getRequestLogsTableColumns = (
     meta: { numeric: true },
     cell: ({ row }) => {
       const log = row.original;
+      if (SEARCH_CALL_TYPES.includes(log.call_type)) return <span>-</span>;
       const completionStartTime = log.completionStartTime;
       if (!completionStartTime) return <span>-</span>;
       if (completionStartTime === log.endTime) return <span>-</span>;
@@ -342,59 +414,6 @@ export const getRequestLogsTableColumns = (
     cell: ({ row }) => <TruncatedText value={readMetaString(row.original.metadata, "user_api_key_alias")} />,
   },
   {
-    id: "model",
-    accessorKey: "model",
-    header: ({ column }) => (
-      <DataTableSortHeader column={column} title={t("logs.request.columns.model")} variant="dropdown-tristate" />
-    ),
-    size: 200,
-    enableSorting: true,
-    cell: ({ row }) => {
-      const log = row.original;
-      const sessionModels = log.session_models ?? [];
-      const latestModel = log.model || sessionModels[0] || "";
-      const otherModels = sessionModels.filter((model) => model !== latestModel);
-      const models = [latestModel, ...otherModels].filter((model) => model !== "");
-      if (models.length === 0) return <span className="text-muted-foreground">-</span>;
-      return (
-        <div className="flex min-w-0 items-center">
-          <CellTooltip
-            content={
-              <div className="flex max-w-[280px] flex-col gap-0.5">
-                {models.map((model) => (
-                  <span key={model}>{model}</span>
-                ))}
-                {log.session_models_truncated === true && (
-                  <span className="text-muted-foreground">{t("logs.request.columns.moreModelsNotShown")}</span>
-                )}
-              </div>
-            }
-            trigger={
-              <span className="inline-flex min-w-0 items-center gap-1.5">
-                {log.custom_llm_provider && (
-                  <img
-                    src={getLogoUrl(log, log.custom_llm_provider)}
-                    alt=""
-                    className="w-4 h-4 shrink-0"
-                    onError={(event) => {
-                      event.currentTarget.style.display = "none";
-                    }}
-                  />
-                )}
-                <span className="max-w-[22ch] truncate">{latestModel}</span>
-                {otherModels.length > 0 && (
-                  <Badge variant="outline" className="text-muted-foreground">
-                    +{otherModels.length}
-                  </Badge>
-                )}
-              </span>
-            }
-          />
-        </div>
-      );
-    },
-  },
-  {
     id: "total_tokens",
     accessorKey: "total_tokens",
     header: ({ column }) => (
@@ -439,14 +458,6 @@ export const getRequestLogsTableColumns = (
         }
       />
     ),
-  },
-  {
-    id: "end_user",
-    accessorKey: "end_user",
-    header: t("logs.request.columns.endUser"),
-    size: 140,
-    enableSorting: false,
-    cell: ({ row }) => <TruncatedText value={row.original.end_user} />,
   },
   {
     id: "request_tags",
