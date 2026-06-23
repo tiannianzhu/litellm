@@ -43,6 +43,13 @@ const matchesLogId = (log: LogEntry, logId: string) => log.request_id === logId 
 const findLogById = (logs: readonly LogEntry[], logId: string): LogEntry | null =>
   logs.find((log) => log.request_id === logId) ?? logs.find((log) => log.litellm_call_id === logId) ?? null;
 
+type PickedLog = { accessToken: string; log: LogEntry };
+
+const pickedLogForRequest = (picked: PickedLog | null, accessToken: string, logId: string | null): LogEntry | null => {
+  if (picked?.accessToken !== accessToken || logId === null) return null;
+  return matchesLogId(picked.log, logId) ? picked.log : null;
+};
+
 interface RequestLogsPanelProps {
   accessToken: string;
   token: string;
@@ -64,7 +71,7 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
   const { startTime, endTime, isCustomDate } = timeRange;
 
   const [selectedKeyIdInfoView, setSelectedKeyIdInfoView] = useState<string | null>(null);
-  const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+  const [pickedLog, setPickedLog] = useState<PickedLog | null>(null);
 
   const {
     logId: urlLogId,
@@ -74,6 +81,7 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
     selectLog,
     close: closeUrlLog,
   } = useLogDetailRouting();
+  const selectedLog = pickedLogForRequest(pickedLog, accessToken, urlLogId);
 
   const [isLiveTail, setIsLiveTail] = useState<boolean>(() => {
     const storedValue = sessionStorage.getItem("isLiveTail");
@@ -158,7 +166,7 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
       });
       return findLogById(response.data, urlLogId);
     },
-    enabled: urlLogId !== null && !(selectedLog !== null && matchesLogId(selectedLog, urlLogId)),
+    enabled: urlLogId !== null && selectedLog === null,
     staleTime: Infinity,
   };
 
@@ -166,8 +174,7 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
 
   const displayLog = useMemo<LogEntry | null>(() => {
     if (urlLogId === null) return null;
-    if (selectedLog !== null && matchesLogId(selectedLog, urlLogId)) return selectedLog;
-    return findLogById(filteredLogs.data, urlLogId) ?? urlLog ?? null;
+    return selectedLog ?? findLogById(filteredLogs.data, urlLogId) ?? urlLog ?? null;
   }, [urlLogId, selectedLog, filteredLogs.data, urlLog]);
 
   const displaySessionId = useMemo<string | null>(() => {
@@ -260,31 +267,31 @@ export default function RequestLogsPanel({ accessToken, token, userRole, userID,
 
   const handleRowClick = useCallback(
     (log: LogEntry) => {
-      setSelectedLog(log);
+      setPickedLog({ accessToken, log });
       if (log.session_id && (log.session_total_count || 1) > 1) {
         openSession(log.session_id, log.request_id);
       } else {
         openLog(log.request_id);
       }
     },
-    [openLog, openSession],
+    [accessToken, openLog, openSession],
   );
 
   const handleSessionClick = useCallback(
     (log: LogEntry) => {
       if (!log.session_id) return;
-      setSelectedLog(log);
+      setPickedLog({ accessToken, log });
       openSession(log.session_id, log.request_id);
     },
-    [openSession],
+    [accessToken, openSession],
   );
 
   const handleSelectLog = useCallback(
     (log: LogEntry) => {
-      setSelectedLog(log);
+      setPickedLog({ accessToken, log });
       selectLog(log.request_id, displaySessionId);
     },
-    [selectLog, displaySessionId],
+    [accessToken, selectLog, displaySessionId],
   );
 
   const handleKeyHashClick = useCallback(

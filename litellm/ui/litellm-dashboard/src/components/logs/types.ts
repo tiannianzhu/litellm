@@ -35,6 +35,7 @@ export type LogEntry = {
   endTime: string;
   user?: string;
   end_user?: string;
+  end_user_alias?: string;
   custom_llm_provider?: string;
   metadata?: Record<string, any> & {
     kubernetes_pod_routing?: KubernetesPodRouting | null;

@@ -223,7 +223,8 @@ def _make_ui_spend_logs_mock(count_total, page_rows):
 
 
 @pytest.mark.asyncio
-async def test_spend_logs_ui_uses_bounded_count_not_full_scan(monkeypatch):
+@pytest.mark.parametrize("can_view_alias", [True, False], ids=["admin", "internal-user"])
+async def test_spend_logs_ui_uses_bounded_count_not_full_scan(monkeypatch, can_view_alias: bool):
     """
     /spend/logs/ui must compute its pagination total with a bounded
     `SELECT COUNT(*) FROM (SELECT 1 ... LIMIT $cap+1)` so it never scans the
@@ -238,20 +239,28 @@ async def test_spend_logs_ui_uses_bounded_count_not_full_scan(monkeypatch):
     )
 
     page_rows = [
-        {"request_id": "req-1", "metadata": "{}", "session_id": None},
+        {
+            "request_id": "req-1",
+            "metadata": "{}",
+            "session_id": None,
+            "end_user": "user-id-1",
+            **({"end_user_alias": "Customer label"} if can_view_alias else {}),
+        },
         {"request_id": "req-2", "metadata": "{}", "session_id": None},
     ]
     mock_prisma = _make_ui_spend_logs_mock(count_total=137, page_rows=page_rows)
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
 
-    auth = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin")
+    role = LitellmUserRoles.PROXY_ADMIN if can_view_alias else LitellmUserRoles.INTERNAL_USER
+    auth = UserAPIKeyAuth(user_role=role, user_id="viewer")
     mock_request = MagicMock()
     mock_request.url.path = "/spend/logs/ui"
 
     response = await ui_view_spend_logs(
-        log_team_lookup=await get_log_team_lookup(),
+        log_team_lookup=AsyncMock(return_value=()),
         request=mock_request,
         api_key=None,
+        team_id=None,
         user_id=None,
         request_id=None,
         search=None,
@@ -281,10 +290,15 @@ async def test_spend_logs_ui_uses_bounded_count_not_full_scan(monkeypatch):
     assert "GROUP BY" not in count_sql and "DISTINCT ON" not in page_sql, (
         "without group_by_session the endpoint must keep raw per-call pagination"
     )
+    assert '"LiteLLM_EndUserTable"' not in count_sql
+    assert ("end_user_info.alias AS end_user_alias" in page_sql) is can_view_alias
+    assert ('FROM "LiteLLM_EndUserTable"' in page_sql) is can_view_alias
 
     assert response["total"] == 137
     assert response["total_is_capped"] is False
     assert response["total_pages"] == (137 + 50 - 1) // 50
+    assert response["data"][0]["end_user"] == "user-id-1"
+    assert response["data"][0].get("end_user_alias") == ("Customer label" if can_view_alias else None)
 
     for row in response["data"]:
         assert "total_count" not in row, "the window-function helper column must be stripped before serialising rows"
@@ -512,7 +526,8 @@ async def test_global_spend_report_team_group_forwards_team_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_spend_logs_ui_group_by_session_paginates_sessions(monkeypatch):
+@pytest.mark.parametrize("can_view_alias", [True, False], ids=["admin-viewer", "internal-user"])
+async def test_spend_logs_ui_group_by_session_paginates_sessions(monkeypatch, can_view_alias: bool):
     """With group_by_session=true, /spend/logs/ui pages and counts sessions, not calls, one representative row per
     session, so the footer's total matches the rows shown (issue #38060)."""
     from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
@@ -540,14 +555,16 @@ async def test_spend_logs_ui_group_by_session_paginates_sessions(monkeypatch):
     statement_timeout_reads(mock_prisma, AsyncMock(side_effect=mock_query_raw))
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
 
-    auth = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin")
+    role = LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY if can_view_alias else LitellmUserRoles.INTERNAL_USER
+    auth = UserAPIKeyAuth(user_role=role, user_id="viewer")
     mock_request = MagicMock()
     mock_request.url.path = "/spend/logs/ui"
 
     response = await ui_view_spend_logs(
-        log_team_lookup=await get_log_team_lookup(),
+        log_team_lookup=AsyncMock(return_value=()),
         request=mock_request,
         api_key=None,
+        team_id=None,
         user_id=None,
         request_id=None,
         search=None,
@@ -576,6 +593,8 @@ async def test_spend_logs_ui_group_by_session_paginates_sessions(monkeypatch):
         "CASE WHEN call_type = 'asend_message' THEN \"endTime\" END DESC NULLS LAST, "
         "call_type IN ('call_mcp_tool', 'list_mcp_tools'), \"startTime\" DESC"
     ) in rep_sql, "the session representative must prefer the final agent outcome, then the newest non-MCP call"
+    assert ("end_user_info.alias AS end_user_alias" in rep_sql) is can_view_alias
+    assert ('FROM "LiteLLM_EndUserTable"' in rep_sql) is can_view_alias
     assert "COUNT(*) OVER ()" not in rep_sql
 
     assert [row["request_id"] for row in response["data"]] == ["req-1", "req-2"]

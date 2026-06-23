@@ -32,7 +32,7 @@ vi.mock("./LogDetailContent", () => ({
 }));
 
 vi.mock("./DrawerHeader", () => ({
-  DrawerHeader: () => null,
+  DrawerHeader: ({ log }: { log: LogEntry }) => <div data-testid="drawer-log-id">{log.request_id}</div>,
 }));
 
 vi.mock("@/app/(dashboard)/hooks/models/useModels", () => ({
@@ -103,36 +103,125 @@ const sidebarEventNames = () =>
   screen.queryAllByText(/^(llm-early|llm-late|tool-early|tool-late)$/).map((el) => el.textContent);
 
 describe("LogDetailsDrawer session sidebar sorting", () => {
-  it("defaults to duration order, longest call first across LLM and MCP calls", async () => {
+  it("defaults to chronological order across LLM and MCP calls", async () => {
     renderSessionDrawer();
     await waitFor(() => expect(sidebarEventNames()).toHaveLength(4));
-    expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]);
+    expect(screen.getAllByText(/^(Start time|Duration)$/).map((option) => option.textContent)).toEqual([
+      "Start time",
+      "Duration",
+    ]);
+    expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]);
   });
 
-  it("switches to chronological order across LLM and MCP calls when Start time is selected", async () => {
+  it("switches to longest-first order when Duration is selected", async () => {
     renderSessionDrawer();
     await waitFor(() => expect(sidebarEventNames()).toHaveLength(4));
-
-    fireEvent.click(screen.getByText("Start time"));
-
-    await waitFor(() => expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]));
 
     fireEvent.click(screen.getByText("Duration"));
 
     await waitFor(() => expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]));
   });
 
-  it("resets the sort mode back to duration when the drawer is closed and reopened", async () => {
+  it("resets the sort mode back to start time when the drawer is closed and reopened", async () => {
     const { rerender, drawer } = renderSessionDrawer();
     await waitFor(() => expect(sidebarEventNames()).toHaveLength(4));
 
-    fireEvent.click(screen.getByText("Start time"));
-    await waitFor(() => expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]));
+    fireEvent.click(screen.getByText("Duration"));
+    await waitFor(() => expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]));
 
     rerender(drawer(false));
     rerender(drawer(true));
 
-    await waitFor(() => expect(sidebarEventNames()).toEqual(["tool-early", "llm-late", "llm-early", "tool-late"]));
+    await waitFor(() => expect(sidebarEventNames()).toEqual(["llm-early", "tool-early", "llm-late", "tool-late"]));
+  });
+
+  it("shows the externally selected log after a different session child was selected", async () => {
+    vi.mocked(sessionSpendLogsCall).mockResolvedValue({ data: sessionLogs, total: 4, total_pages: 1 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const drawer = (selectedLog: LogEntry | null) => (
+      <QueryClientProvider client={queryClient}>
+        <LogDetailsDrawer open onClose={() => {}} logEntry={selectedLog} sessionId="session-1" accessToken="token" />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(drawer(null));
+
+    await screen.findByText("llm-late");
+    fireEvent.click(screen.getByText("llm-late"));
+    await waitFor(() => expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("llm-late"));
+
+    rerender(drawer(sessionLogs[1]));
+
+    await waitFor(() => expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("mcp-early"));
+  });
+
+  it("keeps a controlled selection outside the loaded page until the parent selects a different log", async () => {
+    vi.mocked(sessionSpendLogsCall).mockResolvedValue({ data: sessionLogs, total: 4, total_pages: 1 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const onSelectLog = vi.fn();
+    const drawer = (logEntry: LogEntry | null) => (
+      <QueryClientProvider client={queryClient}>
+        <LogDetailsDrawer
+          open
+          onClose={() => {}}
+          logEntry={logEntry}
+          sessionId="session-1"
+          accessToken="token"
+          onSelectLog={onSelectLog}
+        />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(drawer(null));
+    await userEvent.click(await screen.findByText("llm-early"));
+    expect(onSelectLog).toHaveBeenCalledWith(expect.objectContaining({ request_id: "llm-early" }));
+    expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("mcp-late");
+
+    rerender(drawer(makeLog({ request_id: "outside-page" })));
+    expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("outside-page");
+
+    rerender(drawer(sessionLogs[0]));
+    expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("llm-early");
+  });
+
+  it("lets a standalone drawer select a child after opening an unloaded request", async () => {
+    vi.mocked(sessionSpendLogsCall).mockResolvedValue({ data: sessionLogs, total: 4, total_pages: 1 });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <LogDetailsDrawer
+          open
+          onClose={() => {}}
+          logEntry={makeLog({ request_id: "outside-page" })}
+          sessionId="session-1"
+          accessToken="token"
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("outside-page");
+
+    await userEvent.click(await screen.findByText("llm-early"));
+    expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("llm-early");
+    expect(screen.getByRole("dialog")).toHaveAccessibleName("Request llm-early details");
+  });
+
+  it("discards cached session rows and local selection when the access token changes", async () => {
+    const viewerRows = Promise.withResolvers<Awaited<ReturnType<typeof sessionSpendLogsCall>>>();
+    vi.mocked(sessionSpendLogsCall)
+      .mockResolvedValueOnce({ data: sessionLogs, total: 4, total_pages: 1 })
+      .mockReturnValueOnce(viewerRows.promise);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const drawer = (accessToken: string) => (
+      <QueryClientProvider client={queryClient}>
+        <LogDetailsDrawer open onClose={() => {}} logEntry={null} sessionId="session-1" accessToken={accessToken} />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(drawer("admin-token"));
+    await userEvent.click(await screen.findByText("llm-early"));
+    expect(screen.getByTestId("drawer-log-id")).toHaveTextContent("llm-early");
+
+    rerender(drawer("viewer-token"));
+    expect(screen.queryByTestId("drawer-log-id")).not.toBeInTheDocument();
+    viewerRows.resolve({ data: [sessionLogs[2]], total: 1, total_pages: 1 });
+    expect(await screen.findByTestId("drawer-log-id")).toHaveTextContent("llm-late");
   });
 });
 
