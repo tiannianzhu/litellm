@@ -1,5 +1,6 @@
 import React from "react";
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, it, expect } from "vitest";
 import { PrettyMessagesView } from "./PrettyMessagesView";
 
@@ -26,6 +27,39 @@ describe("PrettyMessagesView", () => {
     render(<PrettyMessagesView request={request} response={response} />);
     expect(screen.getByText("Write me a poem")).toBeInTheDocument();
     expect(screen.getByText("A quiet moment.")).toBeInTheDocument();
+  });
+
+  it("renders Responses API input and output messages", () => {
+    const request = {
+      input: [
+        {
+          type: "message",
+          role: "developer",
+          content: [{ type: "input_text", text: "Follow the project instructions." }],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: "Inspect the repository." }],
+        },
+      ],
+    };
+    const response = {
+      object: "response",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "The repository is ready." }],
+        },
+      ],
+    };
+
+    render(<PrettyMessagesView request={request} response={response} />);
+
+    expect(screen.getByText("Follow the project instructions.")).toBeInTheDocument();
+    expect(screen.getByText("Inspect the repository.")).toBeInTheDocument();
+    expect(screen.getByText("The repository is ready.")).toBeInTheDocument();
   });
 
   it("should render the realtime pretty view for realtime API responses", () => {
@@ -198,5 +232,149 @@ describe("PrettyMessagesView", () => {
     render(<PrettyMessagesView request={request} response={response} />);
     expect(screen.getByText("Test")).toBeInTheDocument();
     expect(screen.getByText("Reply")).toBeInTheDocument();
+  });
+
+  it("renders search API results", () => {
+    const request = [{ role: "user", content: "Search for LiteLLM" }];
+    const response = {
+      object: "search",
+      results: [
+        {
+          title: "LiteLLM documentation",
+          url: "https://docs.litellm.ai/",
+          snippet: "Use LiteLLM to call multiple model providers.",
+        },
+      ],
+    };
+
+    render(<PrettyMessagesView request={request} response={response} />);
+
+    expect(screen.getByText("LiteLLM documentation", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("https://docs.litellm.ai/", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("Use LiteLLM to call multiple model providers.", { exact: false })).toBeInTheDocument();
+    expect(screen.queryByText("No response data available")).not.toBeInTheDocument();
+  });
+
+  it("renders Anthropic content blocks by type", async () => {
+    const user = userEvent.setup();
+    const request = {
+      system: [{ type: "text", text: "Follow the system policy." }],
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_123",
+              name: "search_code",
+              input: { query: "build_launch_command" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_123",
+              content: "Found the implementation.",
+            },
+            { type: "text", text: "Continue the review." },
+          ],
+        },
+      ],
+    };
+    const response = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "Check the implementation details." },
+        { type: "text", text: "The implementation is correct." },
+      ],
+    };
+
+    render(<PrettyMessagesView request={request} response={response} />);
+
+    expect(screen.getByText("SYSTEM")).toBeInTheDocument();
+    expect(screen.getByText("Follow the system policy.")).toBeInTheDocument();
+    expect(screen.getByText("TOOL RESULT")).toBeInTheDocument();
+    expect(screen.getByText("Found the implementation.")).toBeInTheDocument();
+    expect(screen.getByText("Continue the review.")).toBeInTheDocument();
+    expect(screen.getByText("USER")).toBeInTheDocument();
+    expect(screen.getByText("THINKING")).toBeInTheDocument();
+    expect(screen.getByText("The implementation is correct.")).toBeInTheDocument();
+    expect(screen.queryByText(/"tool_use_id"/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("HISTORY (1 message)"));
+    expect(screen.getByText("search_code")).toBeInTheDocument();
+    expect(screen.getAllByText("toolu_123").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("renders OpenAI tool calls and tool results without text content", async () => {
+    const user = userEvent.setup();
+    const request = {
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_123",
+              function: { name: "get_weather", arguments: '{"city":"Paris"}' },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_123", content: "Sunny" },
+        { role: "user", content: "Summarize the result." },
+      ],
+    };
+    const response = {
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_456",
+                function: { name: "save_weather", arguments: '{"city":"Paris"}' },
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    render(<PrettyMessagesView request={request} response={response} />);
+
+    expect(screen.getByText("Summarize the result.")).toBeInTheDocument();
+    expect(screen.getByText("save_weather")).toBeInTheDocument();
+    await user.click(screen.getByText("HISTORY (2 messages)"));
+    expect(screen.getByText("get_weather")).toBeInTheDocument();
+    expect(screen.getByText("TOOL RESULT")).toBeInTheDocument();
+    expect(screen.getByText("Sunny")).toBeInTheDocument();
+  });
+
+  it("collapses long tool results by default", async () => {
+    const user = userEvent.setup();
+    const longResult = "x".repeat(1201);
+    const request = {
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_large", content: longResult }],
+        },
+      ],
+    };
+
+    render(<PrettyMessagesView request={request} response={{}} />);
+
+    expect(screen.getByText("TOOL")).toBeInTheDocument();
+    expect(screen.queryByText("USER")).not.toBeInTheDocument();
+    expect(screen.getByText("TOOL RESULT")).toBeInTheDocument();
+    expect(screen.getByText("toolu_large")).toBeInTheDocument();
+    expect(screen.queryByText(longResult)).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("TOOL RESULT"));
+    expect(screen.getByText(longResult)).toBeInTheDocument();
   });
 });
