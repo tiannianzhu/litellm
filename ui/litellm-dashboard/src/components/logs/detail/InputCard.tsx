@@ -24,8 +24,11 @@ export function InputCard({ messages, promptTokens, inputCost }: InputCardProps)
     return null;
   }
 
-  // Separate system, history, and last message
-  const systemMessage = messages.find((m) => m.role === "system");
+  const systemContent = messages
+    .filter((message) => message.role === "system")
+    .map((message) => message.content)
+    .filter(Boolean)
+    .join("\n\n");
   const nonSystemMessages = messages.filter((m) => m.role !== "system");
   const lastMessage = nonSystemMessages.length > 0 ? nonSystemMessages[nonSystemMessages.length - 1] : null;
   const historyMessages = nonSystemMessages.slice(0, -1);
@@ -65,13 +68,8 @@ export function InputCard({ messages, promptTokens, inputCost }: InputCardProps)
         }}
       >
         <div style={{ padding: "12px 16px" }}>
-          {/* System Message - Collapsible with arrow */}
-          {systemMessage && (
-            <CollapsibleMessage
-              label="SYSTEM"
-              content={systemMessage.content}
-              defaultExpanded={!!(systemMessage.content && systemMessage.content.length < 200)}
-            />
+          {systemContent && (
+            <CollapsibleMessage label="SYSTEM" content={systemContent} defaultExpanded={systemContent.length < 200} />
           )}
 
           {/* History - Tree style, collapsed by default */}
@@ -82,6 +80,7 @@ export function InputCard({ messages, promptTokens, inputCost }: InputCardProps)
             <SimpleMessageBlock
               label={lastMessage.role.toUpperCase()}
               content={lastMessage.content}
+              contentBlocks={lastMessage.contentBlocks}
               toolCalls={lastMessage.toolCalls}
             />
           )}
