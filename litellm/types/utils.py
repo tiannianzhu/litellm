@@ -4607,6 +4607,7 @@ class SearchProviders(str, Enum):
     NIMBLE = "nimble"
     BING_GROUNDING = "bing_grounding"
     DEEPSEEK = "deepseek"
+    BOCHA = "bocha"
 
 
 # Create a set of all search provider values for quick lookup

@@ -10,19 +10,100 @@ import asyncio
 import os
 import time
 from datetime import datetime
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 import litellm
 from litellm import Router
 from litellm.caching import DualCache
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
 from litellm.proxy.spend_tracking.spend_management_endpoints import view_spend_logs
 from litellm.proxy.utils import ProxyLogging, hash_token, update_spend
 from litellm.llms.base_llm.search.transformation import SearchResponse, SearchResult
 from tests._master_key import MASTER_KEY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "registered_price", [None, 0.007, 0.0],
+)
+async def test_bocha_search_registers_price_and_logs_once_after_catalog_reload(
+    monkeypatch: pytest.MonkeyPatch, registered_price: float | None
+) -> None:
+    from litellm import utils as litellm_utils
+    from litellm.litellm_core_utils.get_model_cost_map import adopt_model_cost_map
+    from litellm.llms.bocha.search.transformation import BochaSearchConfig
+    from litellm.llms.custom_httpx import llm_http_handler
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    class SearchRecorder(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: asyncio.Queue[float] = asyncio.Queue()
+
+        async def async_log_success_event(
+            self,
+            kwargs: dict[str, object],
+            response_obj: object,
+            start_time: datetime,
+            end_time: datetime,
+        ) -> None:
+            if kwargs.get("call_type") != "asearch":
+                return
+            cost: Final = kwargs.get("response_cost")
+            assert isinstance(cost, (float, int))
+            self.records.put_nowait(float(cost))
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert "input_cost_per_query" not in request.content.decode()
+        return httpx.Response(200, json={"code": 200, "data": {"webPages": {"value": []}}}, request=request)
+
+    tool_params: Final[dict[str, str | float]] = {
+        "search_provider": "bocha",
+        "api_key": "test-key",
+    }
+    router: Final = Router(model_list=[], search_tools=[{"search_tool_name": "test-search", "litellm_params": tool_params}])
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    recorder: Final = SearchRecorder()
+    monkeypatch.setattr(llm_http_handler, "get_async_httpx_client", lambda **_: handler)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    monkeypatch.setattr(
+        litellm,
+        "model_cost",
+        {
+            **litellm.model_cost,
+            "bocha/search": {"litellm_provider": "bocha", "mode": "search"},
+        },
+    )
+
+    monkeypatch.setattr(litellm_utils, "_runtime_registered_model_cost", {})
+    if registered_price is not None:
+        litellm.register_model({"bocha/search": {"input_cost_per_query": registered_price}})
+    BochaSearchConfig()
+    expected_price: Final = litellm.model_cost["bocha/search"]["input_cost_per_query"]
+    if registered_price is None:
+        assert expected_price > 0
+    else:
+        assert expected_price == registered_price
+    adopt_model_cost_map({key: value for key, value in litellm.model_cost.items() if key != "bocha/search"})
+    assert litellm.model_cost["bocha/search"]["input_cost_per_query"] == expected_price
+
+    try:
+        await router.asearch(search_tool_name="test-search", query="query")
+        logged_cost: Final = await asyncio.wait_for(recorder.records.get(), timeout=5)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        assert logged_cost == pytest.approx(expected_price)
+        assert recorder.records.empty()
+    finally:
+        await handler.client.aclose()
 
 
 @pytest.fixture
