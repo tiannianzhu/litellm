@@ -239,6 +239,7 @@ jobs:
               tests/unit/llms/baseten
               tests/unit/llms/bigmodel
               tests/unit/llms/black_forest_labs
+              tests/unit/llms/bocha
               tests/unit/llms/brave
               tests/unit/llms/bytez
               tests/unit/llms/cerebras
