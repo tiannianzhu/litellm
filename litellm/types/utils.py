@@ -4023,6 +4023,7 @@ class SearchProviders(str, Enum):
     AGENTCORE = "agentcore"
     NIMBLE = "nimble"
     BING_GROUNDING = "bing_grounding"
+    BOCHA = "bocha"
 
 
 # Create a set of all search provider values for quick lookup

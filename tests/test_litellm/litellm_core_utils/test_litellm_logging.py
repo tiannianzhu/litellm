@@ -3654,6 +3654,21 @@ async def test_async_failure_handler_runs_callbacks_and_restores_correlation_con
         session_id_var.set("")
 
 
+def test_function_setup_asearch_uses_query_as_input():
+    query = "World Cup qualifiers latest news"
+
+    logging_obj, _ = litellm.utils.function_setup(
+        original_function="asearch",
+        rules_obj=litellm.utils.Rules(),
+        start_time=time.time(),
+        query=query,
+        search_provider="bocha",
+        litellm_call_id="search-call-id",
+    )
+
+    assert logging_obj.model_call_details["messages"] == [{"role": "user", "content": query}]
+
+
 def test_merge_hidden_params_from_response_into_metadata_populates_metadata():
     """Streaming completion path should mirror non-stream: metadata.hidden_params from response."""
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj

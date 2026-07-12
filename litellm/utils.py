@@ -1073,6 +1073,8 @@ def function_setup(
             messages = args[0] if len(args) > 0 else kwargs["prompt"]
         elif call_type == CallTypes.rerank.value or call_type == CallTypes.arerank.value:
             messages = kwargs.get("query")
+        elif call_type in (CallTypes.search.value, CallTypes.asearch.value):
+            messages = kwargs.get("query", "default-message-value")
         elif call_type == CallTypes.atranscription.value or call_type == CallTypes.transcription.value:
             _file_obj: Final[FileTypes] = args[1] if len(args) > 1 else kwargs["file"]
             # Lazy import audio_utils.utils only when needed for transcription calls
@@ -9332,6 +9334,7 @@ class ProviderConfigManager:
         )
         from litellm.llms.azure.search.transformation import BingGroundingSearchConfig
         from litellm.llms.bedrock.search.transformation import AgentCoreSearchConfig
+        from litellm.llms.bocha.search.transformation import BochaSearchConfig
         from litellm.llms.brave.search.transformation import BraveSearchConfig
         from litellm.llms.dataforseo.search.transformation import DataForSEOSearchConfig
         from litellm.llms.duckduckgo.search.transformation import DuckDuckGoSearchConfig
@@ -9373,6 +9376,7 @@ class ProviderConfigManager:
             SearchProviders.AGENTCORE: AgentCoreSearchConfig,
             SearchProviders.NIMBLE: NimbleSearchConfig,
             SearchProviders.BING_GROUNDING: BingGroundingSearchConfig,
+            SearchProviders.BOCHA: BochaSearchConfig,
         }
         config_class: Final = PROVIDER_TO_CONFIG_MAP.get(provider, None)
         if config_class is None:

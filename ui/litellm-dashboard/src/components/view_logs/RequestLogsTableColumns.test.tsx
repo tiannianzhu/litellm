@@ -241,6 +241,24 @@ describe("sortable headers", () => {
 });
 
 describe("TTFT column", () => {
+  it("identifies search requests without an empty provider image or TTFT", () => {
+    const searchOverrides: Partial<LogEntry> = {
+      request_id: "req-search",
+      model: "bocha/search",
+      custom_llm_provider: "bocha",
+      call_type: "asearch",
+      startTime: "2026-07-07T09:50:13Z",
+      endTime: "2026-07-07T09:50:15Z",
+      completionStartTime: "2026-07-07T09:50:14Z",
+    };
+    const searchLog = logEntry(searchOverrides);
+    renderRows([searchLog]);
+
+    expect(screen.getByText("Search")).toBeInTheDocument();
+    expect(screen.queryByText("1.00")).not.toBeInTheDocument();
+    expect(document.querySelector("img")).toBeNull();
+  });
+
   it("renders '-' when the completion start equals the end time, since TTFT is meaningless there", () => {
     renderRows([
       logEntry({
