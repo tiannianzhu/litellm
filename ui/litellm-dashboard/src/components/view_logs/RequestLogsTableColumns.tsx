@@ -12,6 +12,8 @@ import type { LogEntry } from "./columns";
 import { AGENT_CALL_TYPES, MCP_CALL_TYPES } from "./constants";
 import { AgentBadge, AgentIcon, BatchBadge, LlmBadge, McpBadge, SparkleIcon, WrenchIcon } from "./TypeBadges";
 
+const SEARCH_CALL_TYPES = ["search", "asearch"];
+
 export interface RequestLogsTableColumnsDeps {
   onKeyHashClick: (keyHash: string) => void;
   onSessionClick: (log: LogEntry) => void;
@@ -70,18 +72,19 @@ export const getRequestLogsTableColumns = ({
       const modelNames = sessionModels.length > 0 ? sessionModels : [log.model ?? ""];
       const modelLabel = log.session_models_truncated ? `${modelNames.join(", ")}, ...` : modelNames.join(", ");
       const isSingleModel = modelNames.length === 1;
+      const logoUrl = provider && isSingleModel ? getLogoUrl(log, provider) : "";
       return (
         <div className="flex items-center space-x-2">
-          {provider && isSingleModel && (
+          {logoUrl ? (
             <img
-              src={getLogoUrl(log, provider)}
+              src={logoUrl}
               alt=""
               className="w-4 h-4"
               onError={(event) => {
                 event.currentTarget.style.display = "none";
               }}
             />
-          )}
+          ) : null}
           <CellTooltip
             content={modelLabel}
             trigger={
@@ -102,6 +105,14 @@ export const getRequestLogsTableColumns = ({
     meta: { skeleton: "badge" },
     cell: ({ row }) => {
       const log = row.original;
+      if (SEARCH_CALL_TYPES.includes(log.call_type)) {
+        return (
+          <span className="inline-flex items-center px-2 py-0.5 bg-cyan-50 text-cyan-700 border border-cyan-200 rounded-full text-[11px] font-medium whitespace-nowrap">
+            Search
+          </span>
+        );
+      }
+
       const sessionCount = log.session_total_count || 1;
       const isMcp = MCP_CALL_TYPES.includes(log.call_type);
       const isAgent = AGENT_CALL_TYPES.includes(log.call_type);
@@ -253,6 +264,7 @@ export const getRequestLogsTableColumns = ({
     meta: { numeric: true },
     cell: ({ row }) => {
       const log = row.original;
+      if (SEARCH_CALL_TYPES.includes(log.call_type)) return <span>-</span>;
       const completionStartTime = log.completionStartTime;
       if (!completionStartTime) return <span>-</span>;
       if (completionStartTime === log.endTime) return <span>-</span>;
