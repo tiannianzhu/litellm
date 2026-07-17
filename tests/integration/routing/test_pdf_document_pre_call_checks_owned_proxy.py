@@ -4,6 +4,8 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from email.parser import BytesParser
+from email.policy import HTTP
 from pathlib import Path
 from typing import Final
 
@@ -17,15 +19,18 @@ from integration._support.pdf_document import (
     LETTER,
     chat_body,
     chat_file,
+    data_url,
     messages_body,
+    pdf_bytes,
     pdf_data_url,
     pdf_document,
     responses_body,
     responses_input_file,
 )
-from integration._support.process import OwnedProxy, graceful_stop_seconds, owned_proxy_process
+from integration._support.process import OwnedProxy, OwnedState, graceful_stop_seconds, owned_proxy_process
 from integration._support.wire import Reply, Request, Wire, wire_server
 from integration.providers._cache_control_marks_support import anthropic_peer, marker_of, owned_config
+from integration.routing._prompt_cache_pin_support import openai_peer
 from pydantic import JsonValue, TypeAdapter
 from redis import Redis
 
@@ -45,6 +50,17 @@ _PIN_KEYS: Final = "*:prompt_caching"
 _PROVIDER_KEY: Final = "synthetic-provider-key"
 _SURFACES: Final = ("messages", "messages-stream", "chat-file", "responses-input-file")
 _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
+_MINERU_TEXT: Final = "Quarterly revenue increased."
+_IMAGE: Final = {
+    "type": "image_url",
+    "image_url": {
+        "url": (
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+            "AAAADUlEQVQIHWP4z8DwHwAFgAI/ScLttAAAAABJRU5ErkJggg=="
+        ),
+        "detail": "low",
+    },
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +94,22 @@ def _peer(request: Request) -> Reply:
     if request.target == COUNT_TOKENS_TARGET:
         return COUNT_REFUSED
     return anthropic_peer(request)
+
+
+def _mineru_peer(request: Request) -> Reply:
+    if request.method == "POST" and request.target.partition("?")[0] == "/v1/tasks":
+        return Reply(status=202, body=b'{"task_id":"fixture-task"}')
+    if request.method == "GET" and request.target == "/v1/tasks/fixture-task":
+        return Reply(body=b'{"status":"completed"}')
+    if request.method == "GET" and request.target == "/v1/tasks/fixture-task/result":
+        return Reply(
+            body=(
+                b'{"status":"completed","files":[{"status":"completed","content":{"markdown":"'
+                + _MINERU_TEXT.encode()
+                + b'"}}]}'
+            )
+        )
+    return Reply(status=404)
 
 
 def _held(release: threading.Event) -> Callable[[Request], Reply]:
@@ -156,6 +188,79 @@ def test_context_window_check_passes_a_one_page_pdf_and_forwards_its_bytes(rig: 
     assert isinstance(forwarded, list) and len(forwarded) == 1, forwarded
     blocks: Final = object_value(forwarded[0])["content"]
     assert isinstance(blocks, list) and pdf_document((LETTER,)) in blocks, blocks
+
+
+@pytest.mark.timeout(2 * graceful_stop_seconds() + 180)
+def test_chat_pdf_is_extracted_before_the_model_receives_the_message(gateway: Gateway, tmp_path: Path) -> None:
+    model: Final = "chat-pdf"
+    before: Final = {"type": "text", "text": "Before the file."}
+    after: Final = {"type": "text", "text": "After the image."}
+    messages: Final = [
+        {"role": "system", "content": "Use all parts."},
+        {
+            "role": "user",
+            "content": [
+                before,
+                chat_file(data_url("Application/PDF", pdf_bytes((LETTER,))), "fixture.pdf"),
+                _IMAGE,
+                after,
+            ],
+        },
+        {"role": "assistant", "content": "Understood."},
+        {"role": "user", "content": "Summarize the document."},
+    ]
+    with wire_server(_mineru_peer) as mineru, wire_server(openai_peer) as model_peer:
+        config: Final = owned_config(
+            tmp_path,
+            [
+                {
+                    "model_name": model,
+                    "litellm_params": {
+                        "model": "hosted_vllm/fixture-model",
+                        "api_base": f"{model_peer.url}/v1",
+                        "api_key": _PROVIDER_KEY,
+                    },
+                }
+            ],
+            litellm_settings={
+                "cache": False,
+                "callbacks": ["litellm.deploy.compose.callbacks.mineru_document_interceptor.proxy_handler_instance"],
+                "mineru_document_interception": {"base_url": mineru.url, "poll_interval_seconds": 0.01},
+            },
+            router_settings={"redis_host": "os.environ/REDIS_HOST", "redis_port": "os.environ/REDIS_PORT"},
+        )
+        with owned_proxy_process(gateway, tmp_path, {}, config=config, workers=2, state=OwnedState.PRIVATE) as owned:
+            response: Final = owned.gateway.request(
+                "POST", "/v1/chat/completions", {"model": model, "messages": messages, "max_tokens": 64}
+            )
+            assert response.status_code == 200, response.text
+            submissions: Final = tuple(request for request in mineru.drain() if request.method == "POST")
+            assert len(submissions) == 1, submissions
+            multipart: Final = BytesParser(policy=HTTP).parsebytes(
+                f"Content-Type: {submissions[0].headers['content-type']}\r\n\r\n".encode() + submissions[0].body
+            )
+            assert multipart.is_multipart()
+            parts: Final = tuple(multipart.iter_parts())
+            assert len(parts) == 1, parts
+            assert parts[0].get_content_type() == "application/pdf"
+            assert parts[0].get_payload(decode=True) == pdf_bytes((LETTER,))
+            received: Final = model_peer.drain()
+            assert len(received) == 1, received
+            forwarded: Final = _JSON_OBJECT.validate_json(received[0].body)
+    assert forwarded["messages"] == [
+        {"role": "system", "content": "Use all parts."},
+        {
+            "role": "user",
+            "content": [
+                before,
+                {"type": "text", "text": f'<document title="fixture.pdf">\n{_MINERU_TEXT}\n</document>'},
+                _IMAGE,
+                after,
+            ],
+        },
+        {"role": "assistant", "content": "Understood."},
+        {"role": "user", "content": "Summarize the document."},
+    ]
 
 
 def test_model_itpm_check_rejects_a_pdf_whose_pages_exceed_the_limit(rig: _Rig) -> None:
