@@ -45,6 +45,18 @@ _ARTIFACT_FIELD_PATTERN: Final = r'^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\
 _ARTIFACT_DATA_ID_PATTERN: Final = r"^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$"
 
 
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        ({"file_data": "data:Application/PDF;base64,cGRm"}, True),
+        ({"format": "Application/PDF; charset=binary"}, True),
+        ({"file_data": "data:application/pdfx;base64,cGRm", "filename": "paper.pdf"}, False),
+    ],
+)
+def test_pdf_file_detection_normalizes_the_complete_media_type(metadata: Mapping[str, str], expected: bool) -> None:
+    assert common_utils.is_pdf_file_part({"type": "file", "file": metadata}) is expected
+
+
 def test_handle_any_messages_to_chat_completion_str_messages_conversion_list():
     # Test with list of messages
     messages = [
@@ -1327,7 +1339,9 @@ def test_old_path_patch_with_create_leaves_the_moved_helper_in_place() -> None:
 
 def test_overriding_a_moved_helper_through_the_old_path_warns_and_deleting_it_restores_the_released_one() -> None:
     moved_name: Final = "_attempt_json_repair"
-    with pytest.warns(DeprecationWarning, match=r"common_utils\._attempt_json_repair moved to .*\.tool_call_json_repair"):
+    with pytest.warns(
+        DeprecationWarning, match=r"common_utils\._attempt_json_repair moved to .*\.tool_call_json_repair"
+    ):
         setattr(common_utils, moved_name, mock.Mock(return_value={"overridden": True}))
     assert parse_tool_call_arguments('{"a": 1') == {"overridden": True}
     delattr(common_utils, moved_name)

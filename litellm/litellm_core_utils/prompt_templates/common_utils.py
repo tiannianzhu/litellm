@@ -43,6 +43,7 @@ from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
 from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
     update_responses_tools_with_model_file_ids as update_responses_tools_with_model_file_ids,  # noqa: PLC0414  # public compatibility re-export
 )
+from litellm.litellm_core_utils.prompt_templates.image_handling import is_pdf_media_type
 from litellm.litellm_core_utils.prompt_templates.json_schema_utils import (
     drop_lookaround_regex_patterns as drop_lookaround_regex_patterns,  # noqa: PLC0414  # public compatibility re-export
 )
@@ -616,9 +617,10 @@ def anthropic_inline_document(document: Mapping[str, object]) -> InlineDocument 
 def is_pdf_file_part(part: object) -> bool:
     match part:
         case {"type": "file", "file": {"file_data": str() as file_data}} if file_data.startswith("data:"):
-            return file_data.startswith("data:application/pdf")
+            header: Final = file_data.partition(",")[0]
+            return is_pdf_media_type(header.removeprefix("data:"))
         case {"type": "file", "file": {"format": str() as file_format}}:
-            return file_format == "application/pdf"
+            return is_pdf_media_type(file_format)
         case {"type": "file", "file": {"filename": str() as filename}}:
             return filename.lower().endswith(".pdf")
         case _:
