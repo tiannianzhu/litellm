@@ -11,7 +11,7 @@ If given, generate a unique model_id for the deployment.
 Ensures cooldowns are applied correctly.
 """
 
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from typing import Final, cast  # noqa: TID251  # narrows the untyped request dict for mutation
 
 from litellm.exceptions import BadRequestError
@@ -84,7 +84,7 @@ def _admin_config_fields_to_clear_on_base_override() -> list[str]:
 _ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE: Final = _admin_config_fields_to_clear_on_base_override()
 
 
-def is_clientside_credential(request_kwargs: dict) -> bool:
+def is_clientside_credential(request_kwargs: Mapping[str, object]) -> bool:
     """
     Check if the credential is a clientside credential.
     """
