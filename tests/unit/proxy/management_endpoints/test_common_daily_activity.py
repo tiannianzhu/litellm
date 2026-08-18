@@ -137,6 +137,7 @@ async def test_get_daily_activity_requires_a_database():
 async def test_get_daily_activity_maps_repository_failures_to_http_errors():
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2026-06-16", "total_count": 1}])
     mock_table = MagicMock()
     mock_table.count = AsyncMock(return_value=0)
     mock_table.find_many = AsyncMock(side_effect=RuntimeError("daily rows unavailable"))
@@ -207,6 +208,7 @@ async def test_get_daily_activity_empty_entity_id_list():
     # Mock PrismaClient
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": None, "total_count": 0}])
 
     # Mock the table methods
     mock_table = MagicMock()
@@ -233,14 +235,7 @@ async def test_get_daily_activity_empty_entity_id_list():
         page_size=10,
     )
 
-    # Verify the where conditions were set correctly
-    mock_table.find_many.assert_called_once()
-    call_args = mock_table.find_many.call_args[1]
-    where_conditions = call_args["where"]
-
-    # Check that team_id is set to empty list
-    assert "team_id" in where_conditions
-    assert where_conditions["team_id"] == {"in": []}
+    mock_table.find_many.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -259,6 +254,7 @@ async def test_get_daily_activity_order_has_id_tiebreaker():
     """
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-02", "total_count": 1}])
     mock_table = MagicMock()
     mock_table.count = AsyncMock(return_value=0)
     mock_table.find_many = AsyncMock(return_value=[])
@@ -854,7 +850,7 @@ async def test_get_daily_activity_recovers_a_session_key_alias_from_spend_logs_a
         return_value=[SimpleNamespace(user_id="session-user", user_email="session@example.com")]
     )
 
-    mock_prisma.db.query_raw = AsyncMock(return_value=[])
+    mock_prisma.db.query_raw = AsyncMock(side_effect=[[{"date": "2024-01-01", "total_count": 1}], [], []])
     spend_log_query_raw = _recovery_transaction(
         mock_prisma, [_spend_log_row(session_digest, "cli-session-alias", "session-user")]
     )
@@ -1007,6 +1003,7 @@ async def test_tag_daily_activity_metadata_totals_not_zero():
     """
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-01", "total_count": 1}])
 
     # Create mock tag spend records (request_id is NULL for aggregated rows)
     mock_record_1 = MagicMock()
@@ -1313,6 +1310,7 @@ async def test_get_daily_activity_applies_resolve_entity_metadata_to_breakdown()
     """
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-01", "total_count": 1}])
 
     records = [
         _daily_user_spend_record(user_id="user-with-email", api_key="key-1", spend=7.0),
@@ -1368,6 +1366,7 @@ async def test_model_groups_breakdown_keys_by_public_name_with_model_fallback():
     """
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-01", "total_count": 1}])
 
     records = [
         _daily_user_spend_record(user_id="u1", api_key="key-1", spend=7.0, model="gpt-5.2", model_group="gpt-5.2-eu"),
@@ -2083,6 +2082,7 @@ class TestPtuCostAttributionDisabled:
 
         mock_prisma = MagicMock()
         mock_prisma.db = MagicMock()
+        mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2026-07-01", "total_count": 1}])
         mock_table = MagicMock()
         mock_table.count = AsyncMock(return_value=2)
         mock_table.find_many = AsyncMock(
@@ -2121,6 +2121,7 @@ class TestPtuCostAttributionDisabled:
 
         mock_prisma = MagicMock()
         mock_prisma.db = MagicMock()
+        mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2026-07-01", "total_count": 1}])
         mock_table = MagicMock()
         mock_table.count = AsyncMock(return_value=2)
         mock_table.find_many = AsyncMock(

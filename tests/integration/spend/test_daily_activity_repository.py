@@ -663,7 +663,7 @@ async def test_team_exclusion_keeps_null_and_empty_entity_rows() -> None:
         assert {row.api_key for row in page.rows} == {"key-excluded-null", "key-excluded-empty", "key-excluded-normal"}
 
         daily: Final = await repository.daily_rows(scope, page=1, page_size=10)
-        assert daily.total_count == 3
+        assert daily.total_count == len(frozenset(row.date for row in daily.rows))
         assert {row.api_key for row in daily.rows} == {"key-excluded-null", "key-excluded-empty", "key-excluded-normal"}
 
 
@@ -700,3 +700,33 @@ async def test_user_page_ranks_users_and_folds_null_ids() -> None:
         assert empty_page.total_users == 5
         assert tuple(row.user_id for row in scoped_page.rows) == ("user-alpha",)
         assert scoped_page.total_users == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("table", "entity_field", "entity_id"),
+    (
+        (DailyActivityTable.USER, "user_id", "user-1"),
+        (DailyActivityTable.TEAM, "team_id", "team-1"),
+    ),
+)
+async def test_daily_rows_page_size_counts_complete_dates(
+    table: DailyActivityTable, entity_field: str, entity_id: str
+) -> None:
+    async with _daily_activity_database() as database:
+        repository: Final = _repository(database)
+        source: Final = (
+            database.litellm_dailyuserspend if table is DailyActivityTable.USER else database.litellm_dailyteamspend
+        )
+        expected: Final = await source.find_many(
+            where={entity_field: entity_id}, order=[{"date": "desc"}, {"id": "asc"}]
+        )
+        assert len(expected) > 1
+        scope: Final = _scope(table, entity_field, entity_id)
+
+        first: Final = await repository.daily_rows(scope, page=1, page_size=1)
+        empty: Final = await repository.daily_rows(scope, page=2, page_size=1)
+
+        assert tuple(row.id for row in first.rows) == tuple(row.id for row in expected)
+        assert empty.rows == ()
+        assert first.total_count == empty.total_count == len(frozenset(row.date for row in expected))
