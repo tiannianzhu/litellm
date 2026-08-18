@@ -62,7 +62,7 @@ const ScopedSavingsTab = ({ accessToken, scope, activity, entityType, scopeNote 
     accumulation === "cumulative"
       ? t("shared.scopedSavingsTab.runningTotal")
       : t("shared.scopedSavingsTab.savedInterval", { interval: intervalLabel.toLowerCase() }),
-    rangeLabel && t("shared.scopedSavingsTab.rangeUtc", { range: rangeLabel }),
+    rangeLabel && `${rangeLabel} (Beijing time)`,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -85,8 +85,11 @@ const ScopedSavingsTab = ({ accessToken, scope, activity, entityType, scopeNote 
   return (
     <div className="w-full space-y-6">
       <div className="flex flex-wrap items-center justify-end gap-4">
-        <span className="text-sm text-muted-foreground">{t("shared.scopedSavingsTab.bucketedByUtc")}</span>
-        <AdvancedDatePicker value={dateValue} onValueChange={onDateChange} />
+        <AdvancedDatePicker
+          value={dateValue}
+          onValueChange={onDateChange}
+          timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
+        />
       </div>
 
       {scopeNote && (

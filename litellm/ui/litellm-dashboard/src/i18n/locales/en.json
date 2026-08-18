@@ -3826,6 +3826,7 @@
     },
     "usage": {
       "perDay": "Per day",
+      "groupedByBusinessDay": "Spend is grouped by business day",
       "savings": {
         "runningTotal": "Running total saved",
         "savedPerInterval": "Saved {{interval}}",
@@ -3891,7 +3892,7 @@
       "retry": "Retry",
       "empty": "No matching prompt caching requests in this range",
       "columns": {
-        "request": "Request",
+        "request": "Request · Beijing time",
         "model": "Model",
         "injection": "LiteLLM injection",
         "cacheReads": "Cache reads",
@@ -8843,6 +8844,7 @@
       "label": "Keyboard shortcuts"
     },
     "advancedDatePicker": {
+      "beijingTimeZone": "Beijing time (Asia/Shanghai)",
       "selectTimeRange": "Select Time Range",
       "invalidDateFormat": "Invalid date format",
       "endBeforeStart": "End date cannot be before start date",
@@ -15386,7 +15388,7 @@
       "retryModels": "Retry model breakdown",
       "footnote": {
         "scoped": "Based on retained request logs within the exact selected time range.",
-        "allUsers": "All-user totals use UTC daily aggregates for the selected dates. Filtering by person uses the exact selected times. Cache values are reported counts.",
+        "allUsers": "All-user totals use daily aggregates for the selected dates. Filtering by person uses Beijing dates. Cache values are reported counts.",
         "spend": "Spend is the cost recorded by LiteLLM."
       }
     },

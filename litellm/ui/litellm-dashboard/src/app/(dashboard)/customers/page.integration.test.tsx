@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
-import { fireEvent, renderWithProviders, screen, testQueryClient, waitFor, within } from "../../../../tests/test-utils";
+import {
+  act,
+  fireEvent,
+  renderWithProviders,
+  screen,
+  testQueryClient,
+  waitFor,
+  within,
+} from "../../../../tests/test-utils";
 import CustomersPage from "./page";
 
 vi.unmock("@/app/(dashboard)/hooks/useAuthorized");
@@ -97,7 +105,12 @@ beforeEach(() => {
   creations.length = 0;
   organizations = [...original];
   failed = false;
-  const claims = { key: "sk-test", user_id: "admin", user_role: "proxy_admin", exp: NOW.getTime() / 1000 + 3600 };
+  const claims = {
+    key: "sk-test",
+    user_id: "admin",
+    user_role: "proxy_admin",
+    exp: new Date("2024-05-01T00:00:00Z").getTime() / 1000,
+  };
   document.cookie = `token=${btoa("{}")}.${btoa(JSON.stringify(claims))}.test; Path=/`;
   vi.stubGlobal(
     "fetch",
@@ -117,6 +130,62 @@ afterEach(() => {
 const customerLinks = () => within(screen.getByRole("table", { name: "Customer organizations" })).getAllByRole("link");
 
 describe("customer organization overview", () => {
+  it("refreshes the default UTC month when returning after month end", async () => {
+    vi.setSystemTime(new Date("2024-03-31T23:59:59Z"));
+    renderWithProviders(<CustomersPage />);
+    await screen.findByRole("link", { name: "Customer 29" });
+    expect(requests.at(-1)?.searchParams.get("start_date")).toBe("2024-03-01");
+    expect(requests.at(-1)?.searchParams.get("end_date")).toBe("2024-03-31");
+    act(() => {
+      vi.setSystemTime(new Date("2024-04-01T00:00:01Z"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("link", { name: "Customer 29" })).toHaveAttribute(
+        "href",
+        "/ui/customers/usage?org=customer-29&from=2024-04-01&to=2024-04-30",
+      ),
+    );
+    expect(requests.at(-1)?.searchParams.get("start_date")).toBe("2024-04-01");
+    expect(requests.at(-1)?.searchParams.get("end_date")).toBe("2024-04-30");
+    expect(screen.getByText("Spend is bucketed by UTC day")).toBeInTheDocument();
+  });
+
+  it("keeps a custom range across month end and sends edited calendar days", async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<CustomersPage />, { searchParams: "?range=2024-02-01..2024-02-29" });
+    await screen.findByRole("link", { name: "Customer 29" });
+    act(() => {
+      vi.setSystemTime(new Date("2024-04-01T00:00:01Z"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(requests.some((request) => request.searchParams.get("start_date") === "2024-04-01")).toBe(true),
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Overall customer usage" })).getByText("$20.00"),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "Customer 29" })).toHaveAttribute(
+      "href",
+      "/ui/customers/usage?org=customer-29&from=2024-02-01&to=2024-02-29",
+    );
+    await user.click(screen.getByRole("button", { name: /1 Feb 2024/ }));
+    fireEvent.change(screen.getByLabelText("Start date"), { target: { value: "2024-01-03" } });
+    fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2024-01-10" } });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect(screen.getByRole("link", { name: "Customer 29" })).toHaveAttribute(
+        "href",
+        "/ui/customers/usage?org=customer-29&from=2024-01-03&to=2024-01-10",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        requests.map((request) => [request.searchParams.get("start_date"), request.searchParams.get("end_date")]),
+      ).toContainEqual(["2024-01-03", "2024-01-10"]),
+    );
+  });
+
   it("keeps complete totals and shares while sorting, paginating, and searching", async () => {
     const user = userEvent.setup();
     renderWithProviders(<CustomersPage />);

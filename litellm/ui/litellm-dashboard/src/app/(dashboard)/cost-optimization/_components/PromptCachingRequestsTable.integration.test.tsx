@@ -81,7 +81,11 @@ describe("PromptCachingRequestsTable", () => {
     expect(within(write).getByText("1,000")).toBeInTheDocument();
     expect(within(write).getByText("$0.0375")).toBeInTheDocument();
     expect(within(write).getByText("-$0.0075")).toBeInTheDocument();
-    expect(within(write).getByText(new Date("2026-09-01T12:00:00Z").toLocaleString())).toBeInTheDocument();
+    expect(
+      within(write).getByText(
+        new Date("2026-09-01T12:00:00Z").toLocaleString(undefined, { timeZone: "Asia/Shanghai" }),
+      ),
+    ).toBeInTheDocument();
     expect(within(write).getByText("cache-test-model")).toHaveAttribute("title", "cache-test-model");
     expect(within(write).getByRole("link")).toHaveAttribute("href", "/ui/logs?log_id=injected%2Fwrite%3F%26");
 
@@ -92,8 +96,8 @@ describe("PromptCachingRequestsTable", () => {
     expect(within(table).getByRole("row", { name: /unknown-price/ })).toHaveTextContent("Unavailable");
     expect(within(table).getByRole("row", { name: /no-benefit/ })).toHaveTextContent("$0.00");
     expect(screen.getByText(/after cache-write premiums/)).toBeInTheDocument();
-    expect(lastQuery().get("start_date")).toBe("2026-09-01T00:00:00.000Z");
-    expect(lastQuery().get("end_date")).toBe("2026-09-02T23:59:59.999Z");
+    expect(lastQuery().get("start_date")).toBe("2026-08-31T16:00:00.000Z");
+    expect(lastQuery().get("end_date")).toBe("2026-09-02T15:59:59.999Z");
     expect(fetchMock.mock.calls[0][1]?.headers).toEqual(expect.objectContaining({ Authorization: "Bearer token-a" }));
   });
 
@@ -248,16 +252,22 @@ describe("PromptCachingRequestsTable", () => {
     expect(screen.getByText("Page 1")).toBeInTheDocument();
   });
 
-  it("includes the current UTC day for a range ending today, matching the activity totals", async () => {
+  it("uses the selected Beijing day even in a browser west of UTC", async () => {
     vi.stubEnv("TZ", "America/Los_Angeles");
     vi.setSystemTime(new Date("2026-09-20T03:00:00Z"));
-    fetchMock.mockResolvedValue(response([]));
-    const today = { from: new Date(2026, 8, 19), to: new Date() };
-    renderWithProviders(<PromptCachingRequestsTable accessToken="token-a" dateValue={today} />);
+    const startTime = "2026-09-18T16:01:00Z";
+    fetchMock.mockResolvedValue(response([request({ start_time: startTime })]));
+    const selected = new Date(2026, 8, 19);
+    renderWithProviders(
+      <PromptCachingRequestsTable accessToken="token-a" dateValue={{ from: selected, to: selected }} />,
+    );
 
-    await screen.findByText("No matching prompt caching requests in this range");
-    expect(lastQuery().get("start_date")).toBe("2026-09-19T00:00:00.000Z");
-    expect(lastQuery().get("end_date")).toBe("2026-09-20T23:59:59.999Z");
+    expect(await screen.findByRole("columnheader", { name: "Request · Beijing time" })).toBeInTheDocument();
+    expect(
+      screen.getByText(new Date(startTime).toLocaleString(undefined, { timeZone: "Asia/Shanghai" })),
+    ).toBeInTheDocument();
+    expect(lastQuery().get("start_date")).toBe("2026-09-18T16:00:00.000Z");
+    expect(lastQuery().get("end_date")).toBe("2026-09-19T15:59:59.999Z");
   });
 
   it.each(["date", "authentication"])(
@@ -295,7 +305,7 @@ describe("PromptCachingRequestsTable", () => {
       expect(lastQuery().has("cursor_request_id")).toBe(false);
       expect(lastQuery().has("cursor_start_time")).toBe(false);
       if (change === "date") {
-        expect(lastQuery().get("end_date")).toBe("2026-09-03T23:59:59.999Z");
+        expect(lastQuery().get("end_date")).toBe("2026-09-03T15:59:59.999Z");
       } else {
         expect(fetchMock.mock.calls.at(-1)?.[1]?.headers).toEqual(
           expect.objectContaining({ Authorization: "Bearer token-b" }),

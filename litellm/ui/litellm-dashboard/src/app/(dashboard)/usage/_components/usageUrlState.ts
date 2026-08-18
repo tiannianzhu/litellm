@@ -1,12 +1,14 @@
 import moment from "moment";
 import { parseAsNativeArrayOf, parseAsString, parseAsStringEnum, type inferParserType } from "nuqs";
+import { useMemo } from "react";
 
 import type { EntityType } from "@/components/EntityUsageExport/types";
-import { relativeTimeOptions } from "@/components/shared/date_range_presets";
 import type { DateRangePickerValue } from "@/components/shared/date_picker_types";
 import { uiHref } from "@/utils/uiHref";
 import { USAGE_OPTIONS, type UsageOption } from "./components/UsageViewSelect/UsageViewSelect";
 import { UsageClient } from "./components/overview/agentCatalog";
+import { presetRange, relativeTimeOptions } from "@/components/shared/date_range_presets";
+import { useUsageDay } from "./usageDates";
 
 export const DEFAULT_USAGE_VIEW: UsageOption = "global";
 export const USAGE_TABS = ["cost", "models", "keys", "users", "mcp", "endpoints", "errors"] as const;
@@ -124,21 +126,26 @@ const customRangeFromParams = (from: string, to: string): DateRangePickerValue |
 
 type DateParams = Pick<UsageUrlParams, "range" | "from" | "to">;
 
-export const dateRangeFromParams = (params: DateParams): DateRangePickerValue | undefined => {
+export const dateRangeFromParams = (params: DateParams, day?: string): DateRangePickerValue | undefined => {
   if (params.range !== null) {
-    return relativeTimeOptions.find((option) => option.shortLabel === params.range)?.getValue();
+    return relativeTimeOptions.find((option) => option.shortLabel === params.range)?.getValue(day);
   }
   if (params.from === null || params.to === null) return undefined;
   return customRangeFromParams(params.from, params.to);
 };
 
-export const defaultUsageDateRange = (setting: unknown): { value: DateRangePickerValue; preset: string | null } => {
+export const defaultUsageDateRange = (
+  setting: unknown,
+  day?: string,
+): { value: DateRangePickerValue; preset: string | null } => {
   const option = relativeTimeOptions.find((candidate) => candidate.settingValue === setting);
   if (!option || option.settingValue === "last_7_days") {
-    const now = new Date();
-    return { value: { from: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), to: now }, preset: null };
+    return {
+      value: presetRange("last_7_days", day),
+      preset: null,
+    };
   }
-  return { value: option.getValue(), preset: option.shortLabel };
+  return { value: option.getValue(day), preset: option.shortLabel };
 };
 
 export const dateRangePatch = (value: DateRangePickerValue, presetShortLabel: string | null): UsageUrlPatch => {
@@ -161,8 +168,29 @@ const clientDateParams = (params: ClientDateParams): DateParams => ({
   to: params.client_to,
 });
 
-export const clientDateRangeFromParams = (params: ClientDateParams): DateRangePickerValue | undefined =>
-  dateRangeFromParams(clientDateParams(params));
+export const clientDateRangeFromParams = (params: ClientDateParams, day?: string): DateRangePickerValue | undefined =>
+  dateRangeFromParams(clientDateParams(params), day);
+
+export function useUsageDateSelection(
+  { range, from, to, client_range, client_from, client_to }: DateParams & ClientDateParams,
+  defaultTimeRange?: string,
+) {
+  const day = useUsageDay();
+  const defaultRange = useMemo(() => defaultUsageDateRange(defaultTimeRange, day), [defaultTimeRange, day]);
+  const presetDay = range === null ? undefined : day;
+  const customOrPreset = useMemo(
+    () => dateRangeFromParams({ range, from, to }, presetDay),
+    [range, from, to, presetDay],
+  );
+  const dateValue = customOrPreset ?? defaultRange.value;
+  const presetShortLabel = range ?? (from === null && to === null ? defaultRange.preset : null);
+  const clientPresetDay = client_range === null ? undefined : day;
+  const clientCustomOrPreset = useMemo(
+    () => clientDateRangeFromParams({ client_range, client_from, client_to }, clientPresetDay),
+    [client_range, client_from, client_to, clientPresetDay],
+  );
+  return { dateValue, presetShortLabel, clientDateValue: clientCustomOrPreset ?? dateValue };
+}
 
 const asClientDatePatch = (patch: UsageUrlPatch): UsageUrlPatch => ({
   ...("range" in patch ? { client_range: patch.range } : {}),

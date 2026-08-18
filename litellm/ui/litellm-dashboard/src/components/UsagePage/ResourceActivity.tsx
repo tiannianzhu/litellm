@@ -7,7 +7,6 @@ import {
   useActivityDateRange,
   type ActivityDateRange,
 } from "@/app/(dashboard)/cost-optimization/_components/useDailyActivityRange";
-import { benchmarksWindow } from "@/app/(dashboard)/cost-optimization/_components/useAutoRouterBenchmarks";
 import { useAggregatedDailyActivity } from "@/app/(dashboard)/usage/_components/hooks/useAggregatedDailyActivity";
 import { getTopModels } from "@/app/(dashboard)/usage/_components/components/EntityUsage/entityUsageAggregations";
 import { ActivityMetrics, ModelSection, processActivityData } from "@/components/activity_metrics";
@@ -26,31 +25,43 @@ interface ResourceActivityProps {
   activity?: ActivityDateRange;
 }
 
+const getActivityScope = (
+  scope: ResourceActivityProps["scope"],
+  id: string,
+  userId: string | null,
+  userRole: string,
+) => {
+  const isTeam = scope === "team";
+  const isUser = scope === "user";
+  const proxyWideView = hasProxyWideSpendView(userRole);
+  return {
+    entity: isTeam ? "team" : "user",
+    entityId: isTeam || isUser ? id : spendScopeUserId(userRole, userId),
+    apiKey: scope === "key" ? reportingKeyId(id) : undefined,
+    canView: !isUser || proxyWideView || id === userId,
+    scopedToViewer: !isUser && !proxyWideView,
+  } as const;
+};
+
 export default function ResourceActivity({ scope, id, activity }: ResourceActivityProps) {
   const { t } = useTranslation();
   const { accessToken, userId, userRole } = useAuthorized();
   const localActivity = useActivityDateRange();
   const { dateValue, onDateChange } = activity ?? localActivity;
   const wildcard = scope === "model" && id.includes("*");
-  const entity = scope === "team" ? "team" : "user";
-  const entityId = scope === "team" || scope === "user" ? id : spendScopeUserId(userRole, userId);
-  const apiKey = scope === "key" ? reportingKeyId(id) : undefined;
-  const canView = scope !== "user" || hasProxyWideSpendView(userRole) || id === userId;
+  const { entity, entityId, apiKey, canView, scopedToViewer } = getActivityScope(scope, id, userId, userRole);
   const hasAccess = accessToken && id && canView;
-  const scopedToViewer = scope !== "user" && !hasProxyWideSpendView(userRole);
   const request: DailyActivityRequest | null =
     hasAccess && dateValue.from && dateValue.to
       ? {
           accessToken,
           startTime: dateValue.from,
-          endTime:
-            scope === "team" ? new Date(`${benchmarksWindow(dateValue, new Date()).end_date}T12:00:00`) : dateValue.to,
+          endTime: dateValue.to,
           entityIds: entityId ? [entityId] : null,
           apiKey,
           apiKeyLimit: 1,
           includeEntityBreakdown: scope === "model" ? false : undefined,
           model: scope === "model" && !wildcard ? id : undefined,
-          includeCurrentUtcDay: true,
         }
       : null;
   const { data, loading, failed, errorMessage, reload } = useAggregatedDailyActivity({
@@ -100,8 +111,11 @@ export default function ResourceActivity({ scope, id, activity }: ResourceActivi
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-end gap-4">
-        <span className="text-sm text-muted-foreground">{t("shared.scopedSavingsTab.bucketedByUtc")}</span>
-        <AdvancedDatePicker value={dateValue} onValueChange={onDateChange} />
+        <AdvancedDatePicker
+          value={dateValue}
+          onValueChange={onDateChange}
+          timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
+        />
       </div>
       {scopedToViewer && (
         <p className="text-sm text-muted-foreground">

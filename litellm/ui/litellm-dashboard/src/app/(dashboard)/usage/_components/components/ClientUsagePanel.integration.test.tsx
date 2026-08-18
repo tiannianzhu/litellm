@@ -66,9 +66,9 @@ const defaultProps: ComponentProps<typeof ClientUsagePanel> = {
   onUserChange: vi.fn(),
   onClose: vi.fn(),
   accessToken: "test-token",
-  startTime: new Date("2026-10-22T00:00:00Z"),
-  endTime: new Date("2026-10-22T23:59:59.999Z"),
-  dateValue: { from: new Date("2026-10-22T00:00:00Z"), to: new Date("2026-10-22T23:59:59.999Z") },
+  startTime: new Date(2026, 9, 22),
+  endTime: new Date(2026, 9, 22, 23, 59, 59, 999),
+  dateValue: { from: new Date(2026, 9, 22), to: new Date(2026, 9, 22, 23, 59, 59, 999) },
   presetShortLabel: null,
   onDateChange: vi.fn(),
   agent,
@@ -167,6 +167,43 @@ describe("ClientUsagePanel", () => {
     expect(screen.queryByRole("status", { name: "Loading client usage" })).not.toBeInTheDocument();
     expect(screen.queryByText(/Select a user to/)).not.toBeInTheDocument();
     expect(uiSpendLogsCall).not.toHaveBeenCalled();
+  });
+
+  it("queries and displays the selected Beijing calendar day for a person", async () => {
+    const startTime = new Date(2026, 9, 22);
+    const endTime = new Date(2026, 9, 22, 23, 59, 59, 999);
+    const logs = [
+      { ...personLog, request_id: "before", startTime: "2026-10-21T15:59:59.999Z" },
+      { ...personLog, request_id: "start", startTime: "2026-10-21T16:00:00.000Z" },
+      { ...personLog, request_id: "end", startTime: "2026-10-22T15:59:59.999Z" },
+      { ...personLog, request_id: "after", startTime: "2026-10-22T16:00:00.000Z" },
+    ];
+    const response = {
+      data: logs,
+      total: logs.length,
+      page: 1,
+      total_pages: 1,
+      total_is_capped: false,
+    };
+    vi.mocked(uiSpendLogsCall).mockResolvedValue(response);
+    renderWithProviders(
+      <ClientUsagePanel
+        {...defaultProps}
+        userId="person-1"
+        canChooseUser={false}
+        startTime={startTime}
+        endTime={endTime}
+        dateValue={{ from: startTime, to: endTime }}
+      />,
+    );
+
+    const panel = screen.getByRole("dialog", { name: "Claude Desktop" });
+    expect(panel).toHaveTextContent("Beijing time (Asia/Shanghai)");
+    await waitFor(() => expect(panel).toHaveTextContent(/Spend\s*\$6\.00/));
+    expect(panel).toHaveTextContent(/Requests\s*2/);
+    expect(uiSpendLogsCall).toHaveBeenCalledWith(
+      expect.objectContaining({ start_date: "2026-10-21 16:00:00.000", end_date: "2026-10-22 15:59:59.999" }),
+    );
   });
 
   it("should filter to a person inside the open panel and keep absent cache details unavailable", async () => {

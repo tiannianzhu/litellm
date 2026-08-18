@@ -17,7 +17,7 @@ import type { paths } from "@/lib/http/schema";
 import { formatNumberWithCommas } from "@/utils/dataUtils";
 import { uiHref } from "@/utils/uiHref";
 import { usd } from "./costOptimizationUtils";
-import { benchmarksWindow as activityWindow } from "./useAutoRouterBenchmarks";
+import { BEIJING_TIME_ZONE, beijingDayBounds } from "@/components/shared/date_range_presets";
 import type { DateRange } from "./useDailyActivityRange";
 
 const REQUESTS_PATH = "/cost_optimization/prompt_caching/requests";
@@ -33,13 +33,17 @@ interface PromptCachingRequestsTableProps {
   dateValue: DateRange;
 }
 
+function requestWindow({ from, to }: DateRange) {
+  if (!from || !to) return { startDate: "", endDate: "" };
+  const bounds = beijingDayBounds(from, to);
+  return { startDate: bounds.from.toISOString(), endDate: bounds.to.toISOString() };
+}
+
 export default function PromptCachingRequestsTable({ accessToken, dateValue }: PromptCachingRequestsTableProps) {
   const { t } = useTranslation();
   const [filter, setFilter] = useState<RequestFilter>("all");
   const [pageSize, setPageSize] = useState(10);
-  const window = activityWindow(dateValue, new Date());
-  const startDate = window.start_date ? `${window.start_date}T00:00:00.000Z` : "";
-  const endDate = window.end_date ? `${window.end_date}T23:59:59.999Z` : "";
+  const { startDate, endDate } = requestWindow(dateValue);
   const scope = JSON.stringify([accessToken, startDate, endDate, filter, pageSize]);
   const [pagination, setPagination] = useState<{ scope: string; cursors: readonly RequestCursor[] }>({
     scope,
@@ -155,7 +159,7 @@ export default function PromptCachingRequestsTable({ accessToken, dateValue }: P
                           {request.request_id}
                         </Link>
                         <time dateTime={request.start_time} className="mt-1 block text-xs text-muted-foreground">
-                          {new Date(request.start_time).toLocaleString()}
+                          {new Date(request.start_time).toLocaleString(undefined, { timeZone: BEIJING_TIME_ZONE })}
                         </time>
                       </TableCell>
                       <TableCell>

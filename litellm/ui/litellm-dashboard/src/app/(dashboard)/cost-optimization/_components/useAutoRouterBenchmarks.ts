@@ -1,26 +1,21 @@
+import { useState } from "react";
+
 import { formatDate } from "@/components/networking";
+import { presetRange, relativeTimeOptions } from "@/components/shared/date_range_presets";
 import { $api } from "@/lib/http/api";
 
-import type { DateRange } from "./useDailyActivityRange";
+import type { ActivityDateRange, DateRange } from "./useDailyActivityRange";
 
-/**
- * The endpoint cuts on UTC days but the picker hands back local dates, so west of UTC a
- * range ending today would hide sessions started after UTC midnight. Extend it to the
- * current UTC day (only the empty future is added), mirroring include_current_utc_day.
- */
-export const benchmarksWindow = (
-  range: DateRange,
-  now: Date,
-  toLocalDay: (d: Date) => string = formatDate,
-): { start_date: string; end_date: string } | Record<string, never> => {
-  if (!range.from || !range.to) return {};
-  const end_date = toLocalDay(range.to);
-  const utcToday = now.toISOString().slice(0, 10);
-  const endsToday = end_date >= toLocalDay(now);
-  return {
-    start_date: toLocalDay(range.from),
-    end_date: endsToday && utcToday > end_date ? utcToday : end_date,
-  };
+const utcToday = () => new Date().toISOString().slice(0, 10);
+
+export const autoRouterDateOptions = relativeTimeOptions.map((option) => ({
+  ...option,
+  getValue: () => option.getValue(utcToday()),
+}));
+
+export const useAutoRouterDateRange = (): ActivityDateRange => {
+  const [dateValue, setDateValue] = useState<DateRange>(() => presetRange("last_30_days", utcToday()));
+  return { dateValue, onDateChange: setDateValue };
 };
 
 export const useAutoRouterBenchmarks = (
@@ -32,6 +27,15 @@ export const useAutoRouterBenchmarks = (
   $api.useQuery(
     "get",
     "/auto_router/benchmarks",
-    { params: { query: { ...benchmarksWindow(range, new Date()), api_key: apiKey, user_id: userId } } },
+    {
+      params: {
+        query: {
+          start_date: range.from ? formatDate(range.from) : undefined,
+          end_date: range.to ? formatDate(range.to) : undefined,
+          api_key: apiKey,
+          user_id: userId,
+        },
+      },
+    },
     { enabled: Boolean(accessToken && range.from && range.to), retry: false },
   );

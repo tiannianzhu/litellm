@@ -38,7 +38,6 @@ export const useCacheLeakageKeys = (range: DailyActivityRange, enabled: boolean)
       endTime,
       entityIds: userId ? [userId] : null,
       apiKey,
-      includeCurrentUtcDay: true,
     };
     cacheLeakageKeysCall(request)
       .then((response) => {

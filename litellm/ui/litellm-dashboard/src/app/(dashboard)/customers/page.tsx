@@ -114,6 +114,7 @@ function CustomerOrganizations() {
             presetShortLabel={preset}
             presets={customerUsagePresets}
             maxRangeDays={CUSTOMER_USAGE_MAX_RANGE_DAYS}
+            timeZoneLabel={t("shared.scopedSavingsTab.bucketedByUtc")}
             label={t("customerPortal.range.label")}
             showTimeRange={false}
             compact

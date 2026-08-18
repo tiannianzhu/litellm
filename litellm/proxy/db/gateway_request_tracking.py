@@ -38,6 +38,7 @@ from litellm.constants import (
     REDIS_GATEWAY_REQUESTS_BUFFER_KEY,
     REDIS_GATEWAY_REQUESTS_BUFFER_KEY_V2,
 )
+from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
 from litellm.proxy.db.db_span import db_span
 from litellm.proxy.db.db_transaction_queue.pod_lock_manager import PodLockManager
 from litellm.proxy.middleware.billable_request_metrics_middleware import BillableCategory
@@ -79,7 +80,7 @@ class GatewayRequestAccumulator:
 
     def record(self, *, category: BillableCategory, route: str, status_code: int) -> None:
         key: Final = GatewayRequestKey(
-            date=self._clock().strftime("%Y-%m-%d"), category=category.value, route=route, status_code=status_code
+            date=get_daily_spend_date(self._clock()), category=category.value, route=route, status_code=status_code
         )
         self._counts[key] = self._counts.get(key, _EMPTY).plus(succeeded=200 <= status_code < 300)
 

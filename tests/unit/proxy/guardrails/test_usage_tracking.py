@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -104,6 +104,38 @@ async def test_usage_units_rolled_up_by_guardrail_team_key_and_date():
         ("bedrock-guard", "2026-08-17", "team-a", "hashed-key-1", "contentPolicyUnits"): 3,
         ("bedrock-guard", "2026-08-17", "", "hashed-key-2", "topicPolicyUnits"): 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_guardrail_rollups_share_the_spend_business_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    prisma: Final = _prisma()
+    prisma.get_request_status.return_value = "success"
+    payload: Final = {
+        **_payload("business-midnight", usage={"topicPolicyUnits": 1}),
+        "startTime": datetime(2026, 8, 17, 17, tzinfo=timezone.utc),
+        "user": "user-a",
+        "model": "fixture-model",
+        "model_group": "fixture-group",
+        "custom_llm_provider": "fixture-provider",
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "spend": 0.1,
+    }
+    writer: Final = DBSpendUpdateWriter()
+    await writer.add_spend_log_transaction_to_daily_user_transaction(payload, prisma)
+    await process_spend_logs_guardrail_usage(prisma, (payload,), pending=PendingRollups())
+
+    daily_rows: Final = await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    assert daily_rows is not None
+    (spend_row,) = daily_rows.values()
+    assert spend_row["date"] == "2026-08-18"
+    metrics: Final = prisma.db.litellm_dailyguardrailmetrics.upsert.call_args.kwargs["data"]["create"]
+    units: Final = prisma.db.litellm_dailyguardrailusageunits.upsert.call_args.kwargs["data"]["create"]
+    assert metrics["date"] == units["date"] == spend_row["date"]
 
 
 @pytest.mark.asyncio

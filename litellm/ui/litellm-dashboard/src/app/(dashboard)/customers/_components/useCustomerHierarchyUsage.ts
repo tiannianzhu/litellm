@@ -8,6 +8,7 @@ import {
   defaultUsageDateRange,
   usageUrlParsers,
 } from "@/app/(dashboard)/usage/_components/usageUrlState";
+import { useUsageDay } from "@/app/(dashboard)/usage/_components/usageDates";
 import {
   modelColorMap,
   overviewTotals,
@@ -54,8 +55,9 @@ const usageRequest = (
 export default function useCustomerHierarchyUsage() {
   const { accessToken } = useAuthorized();
   const [params, setParams] = useQueryStates(usageParsers);
-  const defaultRange = useMemo(() => defaultUsageDateRange("month_to_date"), []);
-  const dateValue = useMemo(() => dateRangeFromParams(params) ?? defaultRange.value, [params, defaultRange]);
+  const day = useUsageDay("UTC");
+  const defaultRange = useMemo(() => defaultUsageDateRange("month_to_date", day), [day]);
+  const dateValue = useMemo(() => dateRangeFromParams(params, day) ?? defaultRange.value, [params, day, defaultRange]);
   const preset = params.range ?? (params.from === null && params.to === null ? defaultRange.preset : null);
   const startDate = dateValue.from ? formatDate(dateValue.from) : undefined;
   const endDate = dateValue.to ? formatDate(dateValue.to) : undefined;

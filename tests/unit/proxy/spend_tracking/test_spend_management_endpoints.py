@@ -2595,6 +2595,45 @@ async def test_ui_view_spend_logs_date_range_filter(client, monkeypatch):
     assert data["data"][0]["id"] == "log2"
 
 
+def test_ui_view_spend_logs_counts_millisecond_bounds_before_pagination(client, monkeypatch):
+    log: Final = {
+        "api_key": "sk-test-key",
+        "user": "test_user",
+        "team_id": None,
+        "spend": 0.05,
+        "model": "test-model",
+    }
+    rows: Final = tuple(
+        {**log, "id": str(index), "request_id": str(index), "startTime": "2026-10-22T12:00:00.000Z"}
+        for index in range(998)
+    ) + (
+        {**log, "id": "start", "request_id": "start", "startTime": "2026-10-21T16:00:00.000Z"},
+        {**log, "id": "end", "request_id": "end", "startTime": "2026-10-22T15:59:59.999Z"},
+        {**log, "id": "before", "request_id": "before", "startTime": "2026-10-21T15:59:59.999Z"},
+        {**log, "id": "after", "request_id": "after", "startTime": "2026-10-22T16:00:00.000Z"},
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.prisma_client",
+        make_ui_spend_logs_mock_prisma(rows, lambda where: _filter_logs_by_date_range(rows, where)),
+    )
+    params: Final = {
+        "start_date": "2026-10-21 16:00:00.000",
+        "end_date": "2026-10-22 15:59:59.999",
+        "page_size": 1000,
+    }
+
+    response: Final = client.get("/spend/logs/ui", params=params, headers={"Authorization": "Bearer sk-test"})
+
+    assert response.status_code == 200, response.text
+    data: Final = response.json()
+    assert data["total"] == 1000
+    assert data["total_pages"] == 1
+    assert len(data["data"]) == 1000
+    assert {row["request_id"] for row in data["data"]} >= {"start", "end"}
+    public_response: Final = client.get("/spend/logs/v2", params=params, headers={"Authorization": "Bearer sk-test"})
+    assert public_response.status_code == 400
+
+
 @pytest.mark.asyncio
 async def test_ui_view_spend_logs_request_id_lookup_ignores_date_window(client, monkeypatch):
     """

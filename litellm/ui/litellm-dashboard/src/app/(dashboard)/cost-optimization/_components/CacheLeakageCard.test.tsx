@@ -114,20 +114,27 @@ describe("CacheLeakageCard", () => {
   });
 
   it("asks the server for the key ranking under the activity scope", async () => {
+    const startTime = new Date(2025, 0, 1);
+    const endTime = new Date(2025, 0, 31);
     renderWith([], {
       scope: {
         accessToken: "test-token",
-        startTime: new Date(2025, 0, 1),
-        endTime: new Date(2025, 0, 31),
+        startTime,
+        endTime,
         userId: "u1",
         apiKey: "hash-1",
       },
     });
 
+    const expectedRequest = {
+      accessToken: "test-token",
+      startTime,
+      endTime,
+      entityIds: ["u1"],
+      apiKey: "hash-1",
+    };
     await screen.findByText("No key usage in this range.");
-    expect(mockCacheLeakageKeysCall).toHaveBeenCalledWith(
-      expect.objectContaining({ entityIds: ["u1"], apiKey: "hash-1", includeCurrentUtcDay: true }),
-    );
+    expect(mockCacheLeakageKeysCall).toHaveBeenCalledWith(expectedRequest);
   });
 
   it("sorts by the clicked column, worst cache hit rate first", async () => {

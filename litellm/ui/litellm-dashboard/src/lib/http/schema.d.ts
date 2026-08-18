@@ -1482,11 +1482,11 @@ export interface paths {
          *
          *     Reads session rollups folded once per request at spend-write time, so this endpoint
          *     never scans LiteLLM_SpendLogs. A user filter selects only turns attributed to that
-         *     internal user when written; older key-only history remains outside user views. Money counts
-         *     only requests on the selected UTC days, and the all-router savings headline is the same daily
-         *     total the Overall view reads. Session shape and caching cover every session that overlaps the
-         *     window, whole. Overall hit rate is over telemetry-bearing turns; each bucket's hit rate is
-         *     over that bucket's turns.
+         *     internal user when written. Older key-only history remains outside user views. Money counts
+         *     only requests on the selected UTC days. The all-router savings headline uses the Overall
+         *     daily total when the proxy's business timezone is UTC. In other timezones, it uses the UTC
+         *     benchmark cohort. Session shape and caching cover whole sessions that overlap the window.
+         *     Overall hit rate is over telemetry-bearing turns. Each bucket's hit rate is over that bucket's turns.
          *
          *     The rollup supplies the measures, never the list. Which routers appear comes from the
          *     model registry, so one shows up as soon as it is configured and reads zero until it
@@ -57249,7 +57249,7 @@ export interface operations {
     get_auto_router_benchmarks_auto_router_benchmarks_get: {
         parameters: {
             query?: {
-                /** @description YYYY-MM-DD UTC, inclusive (defaults to 30 days before end_date) */
+                /** @description YYYY-MM-DD UTC, inclusive (defaults to 29 days before end_date) */
                 start_date?: string | null;
                 /** @description YYYY-MM-DD UTC, inclusive (defaults to today) */
                 end_date?: string | null;
@@ -65400,9 +65400,9 @@ export interface operations {
     get_global_activity_global_activity_cache_hits_get: {
         parameters: {
             query: {
-                /** @description Time from which to start viewing spend */
+                /** @description Inclusive UTC date or timestamp with a timezone */
                 start_date: string;
-                /** @description Time till which to view spend */
+                /** @description Inclusive UTC date or exclusive timestamp with a timezone */
                 end_date: string;
                 /** @description Only include spend from these key aliases */
                 key_aliases?: string[] | null;

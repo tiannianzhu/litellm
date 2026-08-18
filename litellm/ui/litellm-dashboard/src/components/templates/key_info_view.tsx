@@ -23,6 +23,7 @@ import { BadgeLink } from "@/components/shared/BadgeLink";
 import { KeyInfoHeader } from "./KeyInfoHeader";
 import KeySavingsTab from "./KeySavingsTab";
 import KeyAutoRouterUsageTab from "./KeyAutoRouterUsageTab";
+import { useAutoRouterDateRange } from "@/app/(dashboard)/cost-optimization/_components/useAutoRouterBenchmarks";
 import { useActivityDateRange } from "@/app/(dashboard)/cost-optimization/_components/useDailyActivityRange";
 import { useEffect, useMemo, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
@@ -120,6 +121,7 @@ export default function KeyInfoView({
   const { accessToken, userId: userID, userRole, premiumUser } = useAuthorized();
   const accessGroupNames = useModelAccessGroupNames();
   const activityDateRange = useActivityDateRange();
+  const autoRouterActivity = useAutoRouterDateRange();
   const [activeTab, setActiveTab] = useUrlTab(
     ["overview", "activity", "savings", "auto-router-usage", "settings"],
     "overview",
@@ -1001,7 +1003,7 @@ export default function KeyInfoView({
               <KeyAutoRouterUsageTab
                 accessToken={accessToken}
                 keyToken={currentKeyData.token}
-                activity={activityDateRange}
+                activity={autoRouterActivity}
               />
             </TabsContent>
           )}

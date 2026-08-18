@@ -17454,10 +17454,10 @@ async def test_get_team_spend_by_user_admin_groups_spend_logs_by_team_and_user(m
     assert any("statement_timeout = 30000" in statement for statement in transaction.statements)
     mock_db_client.db.tx.assert_not_called()
     sql, *params = transaction.query_raw.call_args.args
-    assert params == ["2026-09-01", "2026-09-04", "team-alpha", "team-beta", ["sk-alpha", "sk-beta", ""]]
+    assert params == ["2026-09-01", "2026-09-04", "team-alpha", "team-beta", ["sk-alpha", "sk-beta", ""], "UTC"]
     assert 'FROM "LiteLLM_SpendLogs" sl' in sql
-    assert 'sl."startTime" >= $1::timestamp' in sql
-    assert "sl.\"startTime\" < $2::timestamp + INTERVAL '1 day'" in sql
+    assert 'sl."startTime" >= ($1::timestamp AT TIME ZONE $6::text' in sql
+    assert "sl.\"startTime\" < (($2::timestamp + INTERVAL '1 day') AT TIME ZONE $6::text" in sql
     assert "sl.team_id IN ($3, $4)" in sql
     assert "sl.api_key = ANY($5::text[])" in sql
     lookup_sql, *lookup_params = transaction.query_raw.call_args_list[0].args
@@ -17494,7 +17494,7 @@ async def test_get_team_spend_by_user_team_admin_sees_every_member(mock_db_clien
     )
 
     sql, *params = transaction.query_raw.call_args.args
-    assert params == ["2026-09-01", "2026-09-04", "team-alpha", ["sk-alpha", ""]]
+    assert params == ["2026-09-01", "2026-09-04", "team-alpha", ["sk-alpha", ""], "UTC"]
     assert 'sl."user" = $' not in sql
     assert "sl.api_key = ANY($4::text[])" in sql
 
@@ -17519,7 +17519,7 @@ async def test_get_team_spend_by_user_plain_member_only_sees_own_row(mock_db_cli
     )
 
     sql, *params = transaction.query_raw.call_args.args
-    assert params == ["2026-09-01", "2026-09-04", "team-alpha", "bob", ["sk-bob", ""]]
+    assert params == ["2026-09-01", "2026-09-04", "team-alpha", "bob", ["sk-bob", ""], "UTC"]
     assert "sl.team_id IN ($3)" in sql
     assert 'AND sl."user" = $4' in sql
     assert "sl.api_key = ANY($5::text[])" in sql
@@ -17613,7 +17613,7 @@ async def test_get_team_spend_by_user_without_a_usable_key_list_keeps_the_plain_
     )
 
     sql, *params = transaction.query_raw.call_args.args
-    assert params == ["2026-09-01", "2026-09-04", "team-alpha"]
+    assert params == ["2026-09-01", "2026-09-04", "team-alpha", "UTC"]
     assert "sl.team_id IN ($3)" in sql
     assert "sl.api_key = ANY(" not in sql
 

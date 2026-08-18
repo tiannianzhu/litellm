@@ -135,7 +135,11 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
 from litellm.proxy.common_utils.callback_utils import encrypt_callback_vars
 from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.openai_error_payload import proxy_exception_for
-from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time, keeps_due_budget_reset
+from litellm.proxy.common_utils.timezone_utils import (
+    get_budget_reset_time,
+    get_budget_reset_timezone,
+    keeps_due_budget_reset,
+)
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     team_membership_auth_cache_key,
@@ -7488,6 +7492,7 @@ def _team_user_spend_sql(*, team_count: int, restrict_to_user: bool, narrow_to_a
     user_clause: Final = f' AND sl."user" = ${3 + team_count}' if restrict_to_user else ""
     api_key_placeholder: Final = 3 + team_count + (1 if restrict_to_user else 0)
     api_key_clause: Final = f" AND sl.api_key = ANY(${api_key_placeholder}::text[])" if narrow_to_api_keys else ""
+    timezone_param: Final = f"${api_key_placeholder + int(narrow_to_api_keys)}::text"
     return f"""
         SELECT
             sl.team_id,
@@ -7503,8 +7508,8 @@ def _team_user_spend_sql(*, team_count: int, restrict_to_user: bool, narrow_to_a
             COUNT(*) FILTER (WHERE sl.status = 'failure')::bigint AS failed_requests
         FROM "LiteLLM_SpendLogs" sl
         LEFT JOIN "LiteLLM_UserTable" u ON u.user_id = sl."user"
-        WHERE sl."startTime" >= $1::timestamp
-            AND sl."startTime" < $2::timestamp + INTERVAL '1 day'
+        WHERE sl."startTime" >= ($1::timestamp AT TIME ZONE {timezone_param} AT TIME ZONE 'UTC')
+            AND sl."startTime" < (($2::timestamp + INTERVAL '1 day') AT TIME ZONE {timezone_param} AT TIME ZONE 'UTC')
             AND sl.team_id IN ({team_placeholders}){user_clause}{api_key_clause}
         GROUP BY sl.team_id, sl."user", u.user_email, u.user_alias
         ORDER BY spend DESC, sl.team_id, sl."user"
@@ -7595,6 +7600,7 @@ async def get_team_spend_by_user(
                 *scoped_team_ids,
                 *user_param,
                 *api_key_param,
+                get_budget_reset_timezone(),
                 what="Spend per user",
             )
         )

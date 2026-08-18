@@ -1997,6 +1997,30 @@ describe("UsagePage", () => {
       }
     });
 
+    it("advances the open Today report at Beijing midnight without changing its URL", async () => {
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      vi.setSystemTime(new Date("2026-10-24T15:59:59Z"));
+      try {
+        renderAt("?range=today");
+        expect(mockUserDailyActivityAggregatedCall).toHaveBeenLastCalledWith(
+          expect.objectContaining({ startTime: new Date(2026, 9, 24) }),
+        );
+
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1000);
+        });
+
+        expect(mockUserDailyActivityAggregatedCall).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            startTime: new Date(2026, 9, 25),
+            endTime: new Date(2026, 9, 25, 23, 59, 59, 999),
+          }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it.each(["?range=today", "?from=2025-03-01&to=2025-03-05"])(
       "preserves explicit dates over configured defaults for %s",
       async (searchParams) => {

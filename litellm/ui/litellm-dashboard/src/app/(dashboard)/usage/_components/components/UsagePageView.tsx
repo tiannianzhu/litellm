@@ -79,15 +79,13 @@ import UserRecordLink from "./UserRecordLink";
 import {
   CLIENT_USAGE_VIEWS,
   cleanUsageUrl,
-  clientDateRangeFromParams,
   clientDateRangePatch,
   clientPanelPatch,
-  dateRangeFromParams,
-  defaultUsageDateRange,
   dateRangePatch,
   entitySelectionPatch,
   selectedEntitiesFromParams,
   DEFAULT_USAGE_VIEW,
+  useUsageDateSelection,
   usageTabFromParams,
   usageTabPatch,
   usageUrlParsers,
@@ -121,22 +119,8 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   const { accessToken, userRole, userId: userID, premiumUser, isViewOnly, isLoading: authLoading } = useAuthorized();
   const [gatewayActivityData, setGatewayActivityData] = useState<FetchedGatewayActivity | null>(null);
 
-  const defaultRange = useMemo(() => defaultUsageDateRange(defaultTimeRange), [defaultTimeRange]);
-
   const [urlParams, setUrlParams] = useQueryStates(usageUrlParsers);
-  const { range, from, to } = urlParams;
-  const dateValue = useMemo<DateRangePickerValue>(
-    () => dateRangeFromParams({ range, from, to }) ?? defaultRange.value,
-    [range, from, to, defaultRange],
-  );
-
-  const presetShortLabel = range ?? (from === null && to === null ? defaultRange.preset : null);
-
-  const { client_range, client_from, client_to } = urlParams;
-  const clientDateValue = useMemo<DateRangePickerValue>(
-    () => clientDateRangeFromParams({ client_range, client_from, client_to }) ?? dateValue,
-    [client_range, client_from, client_to, dateValue],
-  );
+  const { dateValue, presetShortLabel, clientDateValue } = useUsageDateSelection(urlParams, defaultTimeRange);
   const clientStartTime = clientDateValue.from ?? null;
   const clientEndTime = clientDateValue.to ?? null;
   const clientInheritsRange =
@@ -485,6 +469,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
               value={dateValue}
               onValueChange={handleDateChange}
               presetShortLabel={presetShortLabel}
+              timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
             />
             <Button
               variant="outline"
@@ -834,7 +819,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
           startTime={clientStartTime}
           endTime={clientEndTime}
           dateValue={clientDateValue}
-          presetShortLabel={client_range ?? (clientInheritsRange ? presetShortLabel : null)}
+          presetShortLabel={urlParams.client_range ?? (clientInheritsRange ? presetShortLabel : null)}
           onDateChange={(value, preset) => void setUrlParams(clientDateRangePatch(value, preset), { scroll: false })}
           agent={clientInheritsRange ? clientAgent : null}
           daily={clientInheritsRange ? tagDaily : []}

@@ -8,7 +8,7 @@ tests/unit/proxy/analytics_endpoints/test_analytics_endpoints.py.
 import json
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Final
 
 import pytest
@@ -27,6 +27,7 @@ from tests.integration._support.prisma_clients import connected_prisma
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
 DAY: Final = datetime(2001, 3, 7)
+NEXT_DAY: Final = DAY + timedelta(days=1)
 AT_NOON: Final = DAY.replace(hour=12)
 RUN: Final = uuid.uuid4()
 INFERENCE_KEY: Final = f"ca-inference-{RUN}"
@@ -60,6 +61,7 @@ async def _spend_log(
     error_code: str = "",
     user: str = "",
     team_id: str = "",
+    start_time: datetime = AT_NOON,
 ) -> None:
     metadata: Final = {"error_information": {"error_code": error_code, "error_class": "ProxyException"}}
     await db.execute_raw(
@@ -69,7 +71,7 @@ async def _spend_log(
         str(uuid.uuid4()),
         call_type,
         api_key,
-        AT_NOON,
+        start_time,
         model,
         status,
         json.dumps(metadata if status == "failure" else {}),
@@ -104,7 +106,9 @@ async def seeded(db):
 
 
 async def _groups(db, key_aliases: list[str], scope: tuple = GRANT_ALL) -> dict[str, dict]:
-    rows: Final = await db.query_raw(GROUPS_SQL, DAY, DAY, json.dumps(key_aliases), NO_FILTER, INFO_ROUTES_JSON, *scope)
+    rows: Final = await db.query_raw(
+        GROUPS_SQL, DAY, NEXT_DAY, json.dumps(key_aliases), NO_FILTER, INFO_ROUTES_JSON, *scope
+    )
     return {row["call_type"]: row for row in rows}
 
 
@@ -119,11 +123,30 @@ async def test_key_with_only_info_route_traffic_has_no_groups(db):
     assert await _groups(db, [INFO_ONLY_ALIAS]) == {}
 
 
+async def test_cache_activity_respects_the_exact_reporting_day_window(db):
+    start: Final = DAY + timedelta(days=4, hours=16)
+    end: Final = start + timedelta(days=1)
+    for timestamp in (start - timedelta(milliseconds=1), start, end - timedelta(milliseconds=1), end):
+        await _spend_log(db, INFERENCE_KEY, "acompletion", "success", start_time=timestamp)
+
+    rows: Final = await db.query_raw(
+        GROUPS_SQL,
+        start.replace(tzinfo=timezone.utc).isoformat(),
+        end.replace(tzinfo=timezone.utc).isoformat(),
+        json.dumps([INFERENCE_ALIAS]),
+        NO_FILTER,
+        INFO_ROUTES_JSON,
+        *GRANT_ALL,
+    )
+
+    assert [(row["call_type"], row["api_requests"]) for row in rows] == [("acompletion", 2)]
+
+
 async def test_error_breakdown_drops_info_routes(db):
     rows: Final = await db.query_raw(
         ERROR_BREAKDOWN_SQL,
         DAY,
-        DAY,
+        NEXT_DAY,
         json.dumps([INFERENCE_ALIAS, INFO_ONLY_ALIAS]),
         NO_FILTER,
         INFO_ROUTES_JSON,
@@ -136,8 +159,8 @@ async def test_error_breakdown_drops_info_routes(db):
 
 
 async def test_filter_options_only_offer_values_that_return_analytics(db):
-    key_alias_rows: Final = await db.query_raw(KEY_ALIAS_OPTIONS_SQL, DAY, DAY, INFO_ROUTES_JSON, *GRANT_ALL)
-    model_rows: Final = await db.query_raw(MODEL_OPTIONS_SQL, DAY, DAY, INFO_ROUTES_JSON, *GRANT_ALL)
+    key_alias_rows: Final = await db.query_raw(KEY_ALIAS_OPTIONS_SQL, DAY, NEXT_DAY, INFO_ROUTES_JSON, *GRANT_ALL)
+    model_rows: Final = await db.query_raw(MODEL_OPTIONS_SQL, DAY, NEXT_DAY, INFO_ROUTES_JSON, *GRANT_ALL)
     key_aliases: Final = {row["key_alias"] for row in key_alias_rows}
     models: Final = {row["model"] for row in model_rows}
     assert INFERENCE_ALIAS in key_aliases and INFO_ONLY_ALIAS not in key_aliases
@@ -165,7 +188,7 @@ async def test_scoped_error_breakdown_excludes_other_users_failures(db):
     rows: Final = await db.query_raw(
         ERROR_BREAKDOWN_SQL,
         DAY,
-        DAY,
+        NEXT_DAY,
         json.dumps([INFERENCE_ALIAS, INFO_ONLY_ALIAS]),
         NO_FILTER,
         INFO_ROUTES_JSON,
@@ -175,11 +198,11 @@ async def test_scoped_error_breakdown_excludes_other_users_failures(db):
 
 
 async def test_scoped_filter_options_hide_other_users_key_aliases(db):
-    unscoped_rows: Final = await db.query_raw(KEY_ALIAS_OPTIONS_SQL, DAY, DAY, INFO_ROUTES_JSON, *GRANT_ALL)
+    unscoped_rows: Final = await db.query_raw(KEY_ALIAS_OPTIONS_SQL, DAY, NEXT_DAY, INFO_ROUTES_JSON, *GRANT_ALL)
     assert OUTSIDER_ALIAS in {row["key_alias"] for row in unscoped_rows}, (
         "seed must make the outsider visible to admins"
     )
 
-    scoped_rows: Final = await db.query_raw(KEY_ALIAS_OPTIONS_SQL, DAY, DAY, INFO_ROUTES_JSON, *_owner_scope([]))
+    scoped_rows: Final = await db.query_raw(KEY_ALIAS_OPTIONS_SQL, DAY, NEXT_DAY, INFO_ROUTES_JSON, *_owner_scope([]))
     scoped_aliases: Final = {row["key_alias"] for row in scoped_rows}
     assert INFERENCE_ALIAS in scoped_aliases and OUTSIDER_ALIAS not in scoped_aliases

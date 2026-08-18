@@ -75,6 +75,60 @@ describe("AdvancedDatePicker", () => {
     expect(screen.getByText("Custom Label")).toBeInTheDocument();
   });
 
+  it("uses the supplied presets and displays their time zone", () => {
+    const customRange = { from: new Date(2026, 11, 26), to: new Date(2027, 0, 1, 23, 59, 59, 999) };
+    const options = [
+      { label: "Last 7 days", shortLabel: "7d", settingValue: "last_7_days", getValue: () => customRange },
+    ];
+    render(
+      <AdvancedDatePicker
+        value={defaultValue}
+        onValueChange={mockOnValueChange}
+        options={options}
+        timeZoneLabel="Beijing time (Asia/Shanghai)"
+      />,
+    );
+
+    expect(screen.getByText("Beijing time (Asia/Shanghai)")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Last 7 days/ }));
+    expect(screen.getByLabelText("Start date")).toHaveValue("2026-12-26");
+    expect(screen.getByLabelText("End date")).toHaveValue("2027-01-01");
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(mockOnValueChange).toHaveBeenNthCalledWith(1, customRange, "7d");
+  });
+
+  it("uses presets with the date-only range limit and applies an allowed range once", () => {
+    const range = { from: new Date(2025, 0, 10), to: new Date(2025, 0, 13, 23, 59, 59, 999) };
+    const presets = [
+      {
+        label: "shared.dateRangePresets.last7Days" as const,
+        shortLabel: "7d",
+        settingValue: "last_7_days",
+        getValue: () => range,
+      },
+    ];
+    render(
+      <AdvancedDatePicker
+        value={defaultValue}
+        onValueChange={mockOnValueChange}
+        presets={presets}
+        maxRangeDays={3}
+        showTimeRange={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Last 7 days/ }));
+    expect(screen.getByLabelText("Start date")).toHaveValue("2025-01-10");
+    fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2025-01-14" } });
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2025-01-13" } });
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(mockOnValueChange).toHaveBeenCalledTimes(1);
+    expect(mockOnValueChange).toHaveBeenCalledWith(range, null);
+  });
+
   it("should display formatted date range", () => {
     const { container } = render(<AdvancedDatePicker value={defaultValue} onValueChange={mockOnValueChange} />);
     expect(getTrigger(container)).toHaveTextContent(/\d{1,2} \w{3}, \d{2}:\d{2} - \d{1,2} \w{3}, \d{2}:\d{2}/);

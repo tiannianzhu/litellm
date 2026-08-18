@@ -1,75 +1,45 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/components/networking", () => ({ formatDate: vi.fn() }));
 vi.mock("@/lib/http/api", () => ({ $api: { useQuery: vi.fn() } }));
 
 import { $api } from "@/lib/http/api";
 
-import { benchmarksWindow, useAutoRouterBenchmarks } from "./useAutoRouterBenchmarks";
-
-const localDay =
-  (offsetHours: number) =>
-  (d: Date): string =>
-    new Date(d.getTime() + offsetHours * 3_600_000).toISOString().slice(0, 10);
-
-const pacific = localDay(-7);
-const tokyo = localDay(+9);
-
-describe("benchmarksWindow", () => {
-  it("passes a historical range through as the picked local calendar days", () => {
-    const now = new Date("2026-08-21T19:00:00Z");
-    const range = { from: new Date("2026-07-06T19:00:00Z"), to: new Date("2026-08-05T19:00:00Z") };
-    expect(benchmarksWindow(range, now, pacific)).toEqual({ start_date: "2026-07-06", end_date: "2026-08-05" });
-  });
-
-  it("keeps a range ending today unchanged while the local and UTC days still agree", () => {
-    const now = new Date("2026-08-21T19:00:00Z");
-    const range = { from: new Date("2026-07-22T19:00:00Z"), to: now };
-    expect(benchmarksWindow(range, now, pacific)).toEqual({ start_date: "2026-07-22", end_date: "2026-08-21" });
-  });
-
-  it("extends a range ending today to the current UTC day once UTC rolls past local midnight", () => {
-    const now = new Date("2026-08-22T03:00:00Z");
-    const range = { from: new Date("2026-07-22T19:00:00Z"), to: now };
-    expect(benchmarksWindow(range, now, pacific)).toEqual({ start_date: "2026-07-22", end_date: "2026-08-22" });
-  });
-
-  it("never shrinks a range for a caller east of UTC whose local day is already tomorrow", () => {
-    const now = new Date("2026-08-21T19:00:00Z");
-    const range = { from: new Date("2026-07-22T19:00:00Z"), to: now };
-    expect(benchmarksWindow(range, now, tokyo)).toEqual({ start_date: "2026-07-23", end_date: "2026-08-22" });
-  });
-
-  it("sends no dates while the picker is missing either end", () => {
-    const now = new Date("2026-08-21T19:00:00Z");
-    expect(benchmarksWindow({ from: now }, now, pacific)).toEqual({});
-    expect(benchmarksWindow({ to: now }, now, pacific)).toEqual({});
-  });
-});
+import { autoRouterDateOptions, useAutoRouterBenchmarks } from "./useAutoRouterBenchmarks";
 
 describe("useAutoRouterBenchmarks", () => {
-  const range = { from: new Date("2026-07-06T19:00:00Z"), to: new Date("2026-08-05T19:00:00Z") };
+  const range = { from: new Date(2026, 7, 15), to: new Date(2026, 7, 21, 23, 59, 59, 999) };
 
-  it("forwards the key hash as the endpoint's api_key filter", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("keeps custom UTC dates without extending the end to the current UTC day", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-22T03:00:00Z"));
+
     useAutoRouterBenchmarks("sk-test", range, "key-hash-1");
 
-    const [, path, init] = vi.mocked($api.useQuery).mock.calls.at(-1) as unknown as [
-      string,
-      string,
-      { params: { query: Record<string, string | undefined> } },
-    ];
-    expect(path).toBe("/auto_router/benchmarks");
-    expect(init.params.query.api_key).toBe("key-hash-1");
+    expect($api.useQuery).toHaveBeenLastCalledWith(
+      "get",
+      "/auto_router/benchmarks",
+      { params: { query: { start_date: "2026-08-15", end_date: "2026-08-21", api_key: "key-hash-1" } } },
+      { enabled: true, retry: false },
+    );
   });
 
-  it("leaves the read deployment-wide when no key is given", () => {
-    useAutoRouterBenchmarks("sk-test", range);
+  it.each([
+    ["last_7_days", "2026-08-16"],
+    ["last_30_days", "2026-07-24"],
+  ])("uses exactly %s through the current UTC date", (settingValue, startDate) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-08-22T16:15:00Z"));
+    const option = autoRouterDateOptions.find((item) => item.settingValue === settingValue);
 
-    const [, , init] = vi.mocked($api.useQuery).mock.calls.at(-1) as unknown as [
-      string,
-      string,
-      { params: { query: Record<string, string | undefined> } },
-    ];
-    expect(init.params.query.api_key).toBeUndefined();
+    useAutoRouterBenchmarks("sk-test", option?.getValue() ?? {});
+
+    expect($api.useQuery).toHaveBeenLastCalledWith(
+      "get",
+      "/auto_router/benchmarks",
+      { params: { query: { start_date: startDate, end_date: "2026-08-22" } } },
+      { enabled: true, retry: false },
+    );
   });
 });

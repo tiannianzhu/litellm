@@ -11,6 +11,7 @@ import {
   defaultUsageDateRange,
   usageUrlParsers,
 } from "@/app/(dashboard)/usage/_components/usageUrlState";
+import { useUsageDay } from "@/app/(dashboard)/usage/_components/usageDates";
 import { overviewTotals } from "@/app/(dashboard)/usage/_components/components/overview/overviewData";
 import UsageBreakdownChart from "@/app/(dashboard)/usage/_components/components/overview/UsageBreakdownChart";
 import UsageStatStrip from "@/app/(dashboard)/usage/_components/components/overview/UsageStatStrip";
@@ -33,8 +34,9 @@ export default function CustomerUsageOverview({ customerId }: { customerId: stri
   const { t } = useTranslation();
   const { accessToken } = useAuthorized();
   const [params, setParams] = useQueryStates(dateParsers);
-  const defaultRange = useMemo(() => defaultUsageDateRange("month_to_date"), []);
-  const dateValue = useMemo(() => dateRangeFromParams(params) ?? defaultRange.value, [params, defaultRange]);
+  const day = useUsageDay();
+  const defaultRange = useMemo(() => defaultUsageDateRange("month_to_date", day), [day]);
+  const dateValue = useMemo(() => dateRangeFromParams(params, day) ?? defaultRange.value, [params, day, defaultRange]);
   const preset = params.range ?? (params.from === null && params.to === null ? defaultRange.preset : null);
   const startTime = dateValue.from;
   const endTime = dateValue.to;
@@ -61,6 +63,7 @@ export default function CustomerUsageOverview({ customerId }: { customerId: stri
           value={dateValue}
           presetShortLabel={preset}
           showTimeRange={false}
+          timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
           onValueChange={(value, selectedPreset) => void setParams(dateRangePatch(value, selectedPreset))}
         />
       </div>

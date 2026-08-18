@@ -12,7 +12,7 @@ and the endpoint is restricted to proxy admin roles.
 """
 
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -21,6 +21,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.models.gateway_activity import GatewayRouteActivity, GatewayStatusCodeActivity
 from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
 from litellm.proxy.deps.repositories import GatewayActivityRepositoryDep
 from litellm.types.proxy.gateway_requests import (
     GatewayRequestActivityResponse,
@@ -35,9 +36,9 @@ _DEFAULT_LOOKBACK_DAYS: Final = 30
 
 
 def _default_range() -> tuple[str, str]:
-    end: Final = datetime.now(timezone.utc)
-    start: Final = end - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    end: Final = get_daily_spend_date(datetime.now(timezone.utc))
+    start: Final = date.fromisoformat(end) - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
+    return start.isoformat(), end
 
 
 def _fold_by_date(rows: Sequence[GatewayRouteActivity]) -> tuple[GatewayRequestDailyEntry, ...]:

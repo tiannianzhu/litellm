@@ -44,6 +44,21 @@ describe("useDailyActivityRange", () => {
     expect(mockUseAggregatedDailyActivity).not.toHaveBeenCalled();
   });
 
+  it("defaults to thirty Beijing calendar days including today", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-12-31T16:00:00Z"));
+      const { result } = renderHook(() => useActivityDateRange());
+
+      expect(result.current.dateValue).toEqual({
+        from: new Date(2026, 11, 3),
+        to: new Date(2027, 0, 1, 23, 59, 59, 999),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("fetches every user's activity for an admin through the aggregated endpoint", async () => {
     renderHook(() => useDailyActivityRange("test-token", "u1", "proxy_admin"));
 
@@ -53,9 +68,9 @@ describe("useDailyActivityRange", () => {
       expect.objectContaining({
         accessToken: "test-token",
         entityIds: null,
-        includeCurrentUtcDay: true,
       }),
     );
+    expect(vi.mocked(dailyActivityAggregatedCall).mock.calls.at(-1)?.[1].includeCurrentUtcDay).toBeUndefined();
   });
 
   it("scopes the query to the caller for a non-admin", async () => {

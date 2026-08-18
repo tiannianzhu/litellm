@@ -21,15 +21,17 @@ interface AdvancedDatePickerProps {
   compact?: boolean;
   presets?: readonly RelativeTimeOption[];
   maxRangeDays?: number;
+  options?: readonly RelativeTimeOption[];
+  timeZoneLabel?: string;
 }
 
 export function matchRelativeTimeOption(
   value: DateRangePickerValue,
-  presets: readonly RelativeTimeOption[] = relativeTimeOptions,
+  options: readonly RelativeTimeOption[] = relativeTimeOptions,
 ): RelativeTimeOption | undefined {
   const { from, to } = value;
   if (!from || !to) return undefined;
-  return presets.find((option) => {
+  return options.find((option) => {
     const optionRange = option.getValue();
     return moment(from).isSame(optionRange.from, "day") && moment(to).isSame(optionRange.to, "day");
   });
@@ -47,8 +49,10 @@ const AdvancedDatePicker: React.FC<AdvancedDatePickerProps> = ({
   showTimeRange = true,
   align = "right",
   compact = false,
-  presets = relativeTimeOptions,
+  presets,
+  options = presets ?? relativeTimeOptions,
   maxRangeDays,
+  timeZoneLabel,
 }) => {
   const { t } = useTranslation();
   const inputId = useId();
@@ -65,8 +69,8 @@ const AdvancedDatePicker: React.FC<AdvancedDatePickerProps> = ({
 
   const getMatchingOption = useCallback(
     (currentValue: DateRangePickerValue): string | null =>
-      matchRelativeTimeOption(currentValue, presets)?.shortLabel ?? null,
-    [presets],
+      matchRelativeTimeOption(currentValue, options)?.shortLabel ?? null,
+    [options],
   );
 
   // Update selected option when value changes
@@ -292,6 +296,7 @@ const AdvancedDatePicker: React.FC<AdvancedDatePickerProps> = ({
             </svg>
           </span>
         </button>
+        {timeZoneLabel && <p className="mt-1 text-xs text-muted-foreground">{timeZoneLabel}</p>}
 
         {/* Dropdown panel */}
         {isOpen && (
@@ -313,7 +318,7 @@ const AdvancedDatePicker: React.FC<AdvancedDatePickerProps> = ({
                   </span>
                 </div>
                 <div className={cn("overflow-y-auto", compact ? "grid h-auto grid-cols-2" : "h-[350px]")}>
-                  {presets.map((option) => {
+                  {options.map((option) => {
                     const isSelected = selectedOption === option.shortLabel;
                     return (
                       <button

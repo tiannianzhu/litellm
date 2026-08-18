@@ -247,7 +247,7 @@ describe("KeyInfoView", () => {
     expect(screen.getByTestId("key-auto-router-usage")).toHaveTextContent("test-token-123");
   });
 
-  it("preserves dates in both directions across unmounted analytics panels", async () => {
+  it("preserves separate savings and UTC auto-router dates across tab changes", async () => {
     vi.mocked(useAuthorized).mockReturnValue({ ...baseUseAuthorizedMock, userRole: "Admin" });
     renderWithProviders(<KeyInfoView keyData={MOCK_KEY_DATA} onClose={() => {}} keyId="test-key-id" teams={[]} />);
 
@@ -255,11 +255,12 @@ describe("KeyInfoView", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Savings" }));
     await userEvent.click(screen.getByRole("button", { name: "Select August 1" }));
     await userEvent.click(screen.getByRole("tab", { name: "Auto-router usage" }));
-    expect(screen.getByLabelText("Selected dates")).toHaveTextContent("2026-08-01T00:00:00.000Z");
     await userEvent.click(screen.getByRole("button", { name: "Select August 10" }));
     await userEvent.click(screen.getByRole("tab", { name: "Settings" }));
     expect(screen.queryByLabelText("Selected dates")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Savings" }));
+    expect(screen.getByLabelText("Selected dates")).toHaveTextContent("2026-08-01T00:00:00.000Z");
+    await userEvent.click(screen.getByRole("tab", { name: "Auto-router usage" }));
     expect(screen.getByLabelText("Selected dates")).toHaveTextContent("2026-08-10T00:00:00.000Z");
   });
 

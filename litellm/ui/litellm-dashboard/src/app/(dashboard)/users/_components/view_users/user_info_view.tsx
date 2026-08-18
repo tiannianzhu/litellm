@@ -48,6 +48,7 @@ import { extractMcpEntitlement } from "@/components/mcp_server_management/mcpEnt
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import ScopedSavingsTab from "@/components/shared/ScopedSavingsTab";
 import { AutoRouterUsageView } from "@/app/(dashboard)/cost-optimization/_components/AutoRouterBenchmarksTab";
+import { useAutoRouterDateRange } from "@/app/(dashboard)/cost-optimization/_components/useAutoRouterBenchmarks";
 import { useActivityDateRange } from "@/app/(dashboard)/cost-optimization/_components/useDailyActivityRange";
 import { BudgetPeriodTooltip } from "@/components/shared/BudgetPeriodTooltip";
 
@@ -75,6 +76,18 @@ interface TeamOption {
   team_alias: string;
 }
 
+const fetchTeamDetails = async (accessToken: string, teamIds: readonly string[]): Promise<TeamDisplayInfo[]> =>
+  Promise.all(
+    teamIds.map(async (teamId) => {
+      try {
+        const teamData = await teamInfoCall(accessToken, teamId);
+        return { team_id: teamId, team_alias: teamData?.team_info?.team_alias || null };
+      } catch {
+        return { team_id: teamId, team_alias: null };
+      }
+    }),
+  );
+
 export default function UserInfoView({
   userId,
   onClose,
@@ -90,6 +103,7 @@ export default function UserInfoView({
   const canViewAutoRouterUsage = hasProxyWideSpendView(userRole);
   const canViewUserUsage = canViewAutoRouterUsage || (Boolean(userId.trim()) && userId === signedInUserId);
   const activityDateRange = useActivityDateRange();
+  const autoRouterActivity = useAutoRouterDateRange();
   const [userData, setUserData] = useState<UserInfoV2Response | null>(null);
   const [teamDetails, setTeamDetails] = useState<TeamDisplayInfo[]>([]);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -135,19 +149,7 @@ export default function UserInfoView({
         // Fetch team details for display (team aliases)
         if (data.teams && data.teams.length > 0) {
           try {
-            const teamPromises = data.teams.map(async (teamId: string) => {
-              try {
-                const teamData = await teamInfoCall(accessToken, teamId);
-                return {
-                  team_id: teamId,
-                  team_alias: teamData?.team_info?.team_alias || null,
-                };
-              } catch {
-                return { team_id: teamId, team_alias: null };
-              }
-            });
-            const teams = await Promise.all(teamPromises);
-            setTeamDetails(teams);
+            setTeamDetails(await fetchTeamDetails(accessToken, data.teams));
           } catch {
             // Fall back to just team IDs
             setTeamDetails(data.teams.map((id: string) => ({ team_id: id, team_alias: null })));
@@ -211,15 +213,7 @@ export default function UserInfoView({
       const data = await userGetInfoV2(accessToken, userId);
       setUserData(data);
       if (data.teams && data.teams.length > 0) {
-        const teamPromises = data.teams.map(async (teamId: string) => {
-          try {
-            const teamData = await teamInfoCall(accessToken, teamId);
-            return { team_id: teamId, team_alias: teamData?.team_info?.team_alias || null };
-          } catch {
-            return { team_id: teamId, team_alias: null };
-          }
-        });
-        setTeamDetails(await Promise.all(teamPromises));
+        setTeamDetails(await fetchTeamDetails(accessToken, data.teams));
       } else {
         setTeamDetails([]);
       }
@@ -252,15 +246,7 @@ export default function UserInfoView({
       const data = await userGetInfoV2(accessToken, userId);
       setUserData(data);
       if (data.teams && data.teams.length > 0) {
-        const teamPromises = data.teams.map(async (teamId: string) => {
-          try {
-            const teamData = await teamInfoCall(accessToken, teamId);
-            return { team_id: teamId, team_alias: teamData?.team_info?.team_alias || null };
-          } catch {
-            return { team_id: teamId, team_alias: null };
-          }
-        });
-        setTeamDetails(await Promise.all(teamPromises));
+        setTeamDetails(await fetchTeamDetails(accessToken, data.teams));
       } else {
         setTeamDetails([]);
       }
@@ -776,7 +762,7 @@ export default function UserInfoView({
                   key={userId}
                   accessToken={accessToken}
                   userId={userId}
-                  activity={activityDateRange}
+                  activity={autoRouterActivity}
                 />
               ) : (
                 <p role="alert">{t("users.userInfo.autoRouter.unavailable")}</p>

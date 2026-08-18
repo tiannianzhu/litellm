@@ -1,5 +1,6 @@
 import { createParser, parseAsStringLiteral, useQueryStates } from "nuqs";
 import { useMemo } from "react";
+import { useUsageDay } from "@/app/(dashboard)/usage/_components/usageDates";
 import type { DateRangePickerValue } from "@/components/shared/date_picker_types";
 import type { RelativeTimeOption } from "@/components/shared/date_range_presets";
 
@@ -68,7 +69,8 @@ const parsers = { range: customerRangeParser, period: presetParser };
 
 export const useCustomerUsageRange = () => {
   const [params, setParams] = useQueryStates(parsers);
-  const initialRange = useMemo(() => customerPresetRange("month"), []);
+  const day = useUsageDay("UTC");
+  const initialRange = useMemo(() => customerPresetRange("month", new Date(`${day}T00:00:00Z`)), [day]);
   const dateValue = params.range ?? initialRange;
   const onDateChange = (value: DateRangePickerValue, preset: string | null) => {
     if (!value.from || !value.to || value.from > value.to) return;

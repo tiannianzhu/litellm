@@ -3,6 +3,7 @@ import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AdvancedDatePicker from "@/components/shared/advanced_date_picker";
 import type { DateRangePickerValue } from "@/components/shared/date_picker_types";
+import { utcRelativeTimeOptions } from "@/components/shared/date_range_presets";
 import { uiHref } from "@/utils/uiHref";
 import type { CustomerHierarchyUsage, CustomerUsageScope } from "./customerUsageApi";
 
@@ -88,6 +89,8 @@ export default function CustomerUsageHeader({
         <AdvancedDatePicker
           value={dateValue}
           presetShortLabel={preset}
+          options={utcRelativeTimeOptions}
+          timeZoneLabel={t("shared.scopedSavingsTab.bucketedByUtc")}
           showTimeRange={false}
           onValueChange={onDateRangeChange}
         />
