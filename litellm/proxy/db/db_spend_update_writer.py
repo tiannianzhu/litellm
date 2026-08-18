@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 from urllib.parse import quote, unquote
+from zoneinfo import ZoneInfo
 
 from pydantic import TypeAdapter
 from typing_extensions import LiteralString, ReadOnly, TypedDict
@@ -470,6 +471,26 @@ def debitable_model_access_groups(
     if served is None:
         return ordered
     return tuple(group for group in ordered if group in served)
+
+
+def _get_daily_spend_date(start_time: object) -> str | None:
+    if not isinstance(start_time, (datetime, str)):
+        return None
+
+    try:
+        parsed_datetime: Final = (
+            start_time
+            if isinstance(start_time, datetime)
+            else datetime.fromisoformat(f"{start_time[:-1]}+00:00" if start_time.endswith("Z") else start_time)
+        )
+    except ValueError:
+        return None
+
+    normalized_datetime: Final = (
+        parsed_datetime.replace(tzinfo=timezone.utc) if parsed_datetime.tzinfo is None else parsed_datetime
+    )
+    timezone_name: Final = getattr(litellm, "timezone", None) or "UTC"
+    return normalized_datetime.astimezone(ZoneInfo(timezone_name)).date().isoformat()
 
 
 class DBSpendUpdateWriter:
@@ -2747,15 +2768,14 @@ class DBSpendUpdateWriter:
     def _record_request_error(*, payload: SpendLogsPayload, prisma_client: PrismaClient | None) -> None:
         if prisma_client is None:
             return
-        start_time: Final = payload["startTime"]
-        date: Final = start_time.isoformat() if isinstance(start_time, datetime) else str(start_time or "")
-        if not date:
+        date: Final = _get_daily_spend_date(payload["startTime"])
+        if date is None:
             return
         metadata: Final[SpendLogsMetadata] = json.loads(payload["metadata"])
         request_error_accumulator.record(
             payload=payload,
             request_status=prisma_client.get_request_status(payload),  # pyright: ignore[reportUnknownMemberType]  # legacy payload union; this caller supplies a typed spend payload
-            date=date.split("T")[0],
+            date=date,
             is_internal_call=bool(metadata.get(INTERNAL_CALL_ORIGIN_METADATA_KEY)),  # pyright: ignore[reportUnknownMemberType]  # TypedDict.get overloads carry Any defaults
         )
 
@@ -2803,12 +2823,10 @@ class DBSpendUpdateWriter:
         verbose_proxy_logger.debug("Logged request status: %s", request_status)
         _metadata: Final[SpendLogsMetadata] = json.loads(payload["metadata"])
         usage_obj: Final = _metadata.get("usage_object", {}) or {}
-        if isinstance(payload["startTime"], datetime):
-            start_time: Final = payload["startTime"].isoformat()
-            date = start_time.split("T")[0]
-        elif isinstance(payload["startTime"], str):
-            date = payload["startTime"].split("T")[0]
-        else:
+        raw_start_time: Final = payload["startTime"]
+        start_time: Final = raw_start_time if isinstance(raw_start_time, (datetime, str)) else None
+        date: Final = _get_daily_spend_date(start_time)
+        if date is None:
             verbose_proxy_logger.debug(
                 "Invalid start time: %s, skipping from daily_user_spend_transactions", payload["startTime"]
             )

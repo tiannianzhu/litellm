@@ -20,13 +20,14 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm._service_logger import ServiceTypes
 from litellm.constants import SPEND_ROLLUP_LOCK_TIMEOUT_MS
-from litellm.proxy._types import DailyTagSpendTransaction, Litellm_EntityType, SpendUpdateQueueItem
+from litellm.proxy._types import DailyTagSpendTransaction, Litellm_EntityType, SpendLogsPayload, SpendUpdateQueueItem
 from litellm.proxy.db.db_spend_update_writer import (
     _TEAM_ADVISORY_LOCK_SQL,
     _TEAM_MEMBER_SPEND_SQL,
     DBSpendUpdateWriter,
-    _spend_tables_left_to_send,
     _SpendTableName,
+    _get_daily_spend_date,
+    _spend_tables_left_to_send,
 )
 from litellm.proxy.db.db_transaction_queue.daily_spend_update_queue import DailySpendUpdateQueue
 from litellm.proxy.db.db_transaction_queue.redis_update_buffer import RedisUpdateBuffer
@@ -36,6 +37,25 @@ from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import (
 )
 from litellm.proxy.db.rollup_lock_timeout import ROLLUP_LOCK_TIMEOUT_SQL
 from tests.unit.proxy.db.fake_prisma_engine import engine_call
+
+
+def test_get_daily_spend_date_uses_configured_business_timezone(monkeypatch):
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    monkeypatch.setenv("TZ", "UTC")
+
+    assert _get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-02"
+
+
+def test_get_daily_spend_date_defaults_to_utc(monkeypatch):
+    monkeypatch.delattr(litellm, "timezone", raising=False)
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+
+    assert _get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-01"
+
+
+def test_get_daily_spend_date_rejects_invalid_start_time():
+    assert _get_daily_spend_date("not-a-date") is None
+    assert _get_daily_spend_date(1) is None
 
 
 @pytest.mark.asyncio
@@ -5117,33 +5137,56 @@ async def test_daily_spend_rows_survive_a_lock_timeout_for_the_next_flush():
     assert list(daily_spend_transactions) == ["key"]
 
 
-def test_record_request_error_feeds_the_failure_rollup_with_the_logged_status() -> None:
+@pytest.mark.asyncio
+@pytest.mark.parametrize("business_timezone", ["UTC", "Asia/Shanghai"])
+@pytest.mark.parametrize("as_datetime", [False, True])
+async def test_record_request_error_feeds_the_failure_rollup_with_the_logged_status(
+    monkeypatch: pytest.MonkeyPatch, business_timezone: str, as_datetime: bool
+) -> None:
     from litellm.proxy.db import db_spend_update_writer as writer_module
-    from litellm.proxy.db.request_error_tracking import RequestErrorAccumulator
     from litellm.types.proxy.request_errors import RequestErrorKey
 
-    accumulator: Final = RequestErrorAccumulator()
+    monkeypatch.setattr(litellm, "timezone", business_timezone, raising=False)
+    accumulator: Final = writer_module.request_error_accumulator
+    pending: Final = accumulator.drain()
     prisma_client: Final = MagicMock()
     prisma_client.get_request_status.side_effect = lambda payload: json.loads(payload["metadata"])["status"]
-    failed_payload: Final[dict[str, object]] = {
-        "startTime": datetime(2026, 10, 8, 23, 59, tzinfo=timezone.utc),
-        "api_key": "hash-1",
-        "team_id": "team-a",
-        "user": "user-a",
-        "model_group": "gpt-4o",
-        "metadata": json.dumps({"status": "failure", "error_information": {"error_code": "503"}}),
-    }
-    ok_payload: Final[dict[str, object]] = {**failed_payload, "metadata": json.dumps({"status": "success"})}
-    with patch.object(writer_module, "request_error_accumulator", accumulator):
+    start_time: Final = datetime(2026, 5, 1, 17, tzinfo=timezone.utc)
+    failed_payload: Final = cast(
+        SpendLogsPayload,
+        {
+            "startTime": start_time if as_datetime else start_time.isoformat(),
+            "api_key": "hash-1",
+            "team_id": "team-a",
+            "user": "user-a",
+            "model": "fixture-model",
+            "model_group": "fixture-model",
+            "custom_llm_provider": "openai",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "spend": 0.0,
+            "metadata": json.dumps({"status": "failure", "error_information": {"error_code": "503"}}),
+        },
+    )
+    ok_payload: Final[SpendLogsPayload] = {**failed_payload, "metadata": json.dumps({"status": "success"})}
+    try:
+        transaction: Final = await DBSpendUpdateWriter()._common_add_spend_log_transaction_to_daily_transaction(
+            payload=failed_payload, prisma_client=prisma_client, type="user"
+        )
         DBSpendUpdateWriter._record_request_error(payload=failed_payload, prisma_client=prisma_client)
         DBSpendUpdateWriter._record_request_error(payload=ok_payload, prisma_client=prisma_client)
-    assert accumulator.drain() == {
-        RequestErrorKey(
-            date="2026-10-08",
-            api_key="hash-1",
-            team_id="team-a",
-            user_id="user-a",
-            model_group="gpt-4o",
-            status_code=503,
-        ): 1
-    }
+        assert transaction is not None
+        assert transaction["failed_requests"] == 1
+        assert accumulator.drain() == {
+            RequestErrorKey(
+                date=transaction["date"],
+                api_key="hash-1",
+                team_id="team-a",
+                user_id="user-a",
+                model_group="fixture-model",
+                status_code=503,
+            ): transaction["failed_requests"]
+        }
+    finally:
+        accumulator.drain()
+        accumulator.restore(pending)
