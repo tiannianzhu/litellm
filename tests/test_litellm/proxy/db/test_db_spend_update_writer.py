@@ -26,6 +26,7 @@ from litellm.proxy.db.db_spend_update_writer import (
     _TEAM_MEMBER_SPEND_SQL,
     DBSpendUpdateWriter,
     _SpendTableName,
+    _get_daily_spend_date,
     _spend_tables_left_to_send,
 )
 from litellm.proxy.db.db_transaction_queue.daily_spend_update_queue import DailySpendUpdateQueue
@@ -34,6 +35,25 @@ from litellm.proxy.db.db_transaction_queue.spend_update_queue import SpendUpdate
 from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import (
     build_window_spend_transaction,
 )
+
+
+def test_get_daily_spend_date_uses_configured_business_timezone(monkeypatch):
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    monkeypatch.setenv("TZ", "UTC")
+
+    assert _get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-02"
+
+
+def test_get_daily_spend_date_defaults_to_utc(monkeypatch):
+    monkeypatch.delattr(litellm, "timezone", raising=False)
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+
+    assert _get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-01"
+
+
+def test_get_daily_spend_date_rejects_invalid_start_time():
+    assert _get_daily_spend_date("not-a-date") is None
+    assert _get_daily_spend_date(1) is None
 
 
 @pytest.mark.asyncio
