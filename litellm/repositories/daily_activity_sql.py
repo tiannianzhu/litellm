@@ -106,6 +106,33 @@ def build_where_clause(scope: DailyActivityScope, *, start_index: int = 1) -> tu
     return " AND ".join(conditions), params
 
 
+def build_paginated_dates_sql(scope: DailyActivityScope, *, page: int, page_size: int) -> SqlQuery:
+    pg_table: Final = PRISMA_TO_PG_TABLE[scope.table]
+    where_clause, where_params = build_where_clause(scope)
+    limit_parameter: Final = len(where_params) + 1
+    offset_parameter: Final = limit_parameter + 1
+    sql: Final = f"""
+        WITH grouped_dates AS (
+            SELECT date
+            FROM "{pg_table}"
+            WHERE {where_clause}
+            GROUP BY date
+        ),
+        page_dates AS (
+            SELECT date
+            FROM grouped_dates
+            ORDER BY date DESC
+            LIMIT ${limit_parameter}
+            OFFSET ${offset_parameter}
+        )
+        SELECT page_dates.date, totals.total_count
+        FROM (SELECT COUNT(*)::bigint AS total_count FROM grouped_dates) AS totals
+        LEFT JOIN page_dates ON TRUE
+        ORDER BY page_dates.date DESC
+    """
+    return SqlQuery(sql, (*where_params, page_size, (page - 1) * page_size))
+
+
 def _ptu_flat_cost_select(table: DailyActivityTable, *, aggregate: bool = True) -> str:
     if table is DailyActivityTable.TEAM:
         return "SUM(ptu_flat_cost)::float AS ptu_flat_cost" if aggregate else "SUM(scoped.ptu_flat_cost)::float"
