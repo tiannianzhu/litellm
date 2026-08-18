@@ -8361,6 +8361,8 @@ _PUBLISHED_BATCH_RATES: Final = MappingProxyType(
         "output_cost_per_token": 8e-6,
         "input_cost_per_token_batches": 1.1e-6,
         "output_cost_per_token_batches": 4.1e-6,
+        "output_cost_per_image_token": 8e-5,
+        "output_cost_per_image_token_batches": 4.1e-5,
         "cache_read_input_token_cost_batches": 1.2e-7,
         "cache_creation_input_token_cost_batches": 1.3e-6,
         "input_cost_per_token_above_200k_tokens_batches": 2.1e-6,
@@ -8448,12 +8450,14 @@ def test_deployment_pricing_model_info_carries_the_published_output_batch_tier_w
     assert info["cache_creation_input_token_cost_batches"] is None
 
 
+@pytest.mark.parametrize("image_tokens", (0, 4))
 def test_batch_cost_calculator_bills_the_carried_output_tier_when_the_deployment_declares_its_own_input_rate(
     _published_batch_model: None,
+    image_tokens: int,
 ) -> None:
     from litellm.cost_calculator import batch_cost_calculator
     from litellm.litellm_core_utils.litellm_logging import deployment_pricing_model_info
-    from litellm.types.utils import Usage
+    from litellm.types.utils import CompletionTokensDetailsWrapper, Usage
 
     info: Final = deployment_pricing_model_info(
         _batch_deployment_id({"input_cost_per_token": 5e-6}), _PUBLISHED_BATCH_DEPLOYMENT
@@ -8461,7 +8465,12 @@ def test_batch_cost_calculator_bills_the_carried_output_tier_when_the_deployment
     assert info is not None
 
     prompt_cost, completion_cost = batch_cost_calculator(
-        usage=Usage(prompt_tokens=300_000, completion_tokens=10, total_tokens=300_010),
+        usage=Usage(
+            prompt_tokens=300_000,
+            completion_tokens=10,
+            total_tokens=300_010,
+            completion_tokens_details=CompletionTokensDetailsWrapper(image_tokens=image_tokens),
+        ),
         model=_PUBLISHED_BATCH_DEPLOYMENT,
         custom_llm_provider="openai",
         model_info=info,
@@ -8469,19 +8478,57 @@ def test_batch_cost_calculator_bills_the_carried_output_tier_when_the_deployment
 
     assert prompt_cost == pytest.approx(300_000 * 5e-6 / 2)
     assert completion_cost == pytest.approx(
-        10 * _PUBLISHED_BATCH_RATES["output_cost_per_token_above_272k_tokens_batches"]
+        (10 - image_tokens) * _PUBLISHED_BATCH_RATES["output_cost_per_token_above_272k_tokens_batches"]
+        + image_tokens * _PUBLISHED_BATCH_RATES["output_cost_per_image_token_batches"]
+    )
+
+
+@pytest.mark.parametrize("image_price_key", ("output_cost_per_image_token", "output_cost_per_image_token_batches"))
+def test_batch_cost_calculator_honors_image_only_deployment_pricing(
+    _published_batch_model: None,
+    image_price_key: str,
+) -> None:
+    from litellm.cost_calculator import batch_cost_calculator
+    from litellm.litellm_core_utils.litellm_logging import deployment_pricing_model_info
+    from litellm.types.utils import CompletionTokensDetailsWrapper, Usage
+
+    image_rate: Final = 1e-4
+    info: Final = deployment_pricing_model_info(
+        _batch_deployment_id({image_price_key: image_rate}), _PUBLISHED_BATCH_DEPLOYMENT
+    )
+    assert info is not None
+
+    prompt_cost, completion_cost = batch_cost_calculator(
+        usage=Usage(
+            prompt_tokens=100,
+            completion_tokens=10,
+            total_tokens=110,
+            completion_tokens_details=CompletionTokensDetailsWrapper(image_tokens=4),
+        ),
+        model=_PUBLISHED_BATCH_DEPLOYMENT,
+        custom_llm_provider="openai",
+        model_info=info,
+    )
+
+    expected_image_rate: Final = image_rate if image_price_key.endswith("_batches") else image_rate / 2
+    assert prompt_cost == pytest.approx(100 * _PUBLISHED_BATCH_RATES["input_cost_per_token_batches"])
+    assert completion_cost == pytest.approx(
+        6 * _PUBLISHED_BATCH_RATES["output_cost_per_token_batches"] + 4 * expected_image_rate
     )
 
 
 @pytest.mark.parametrize(
-    "tier_key",
-    ["input_cost_per_token_above_200k_tokens_batches", "input_cost_per_token_above_272k_tokens_batches"],
+    "threshold",
+    (100, 200, 272),
 )
 def test_deployment_pricing_model_info_honors_a_tier_only_batch_override_over_the_published_flat_rates(
-    _published_batch_model: None, tier_key: str
+    _published_batch_model: None, threshold: int
 ) -> None:
+    from litellm.cost_calculator import batch_cost_calculator
     from litellm.litellm_core_utils.litellm_logging import deployment_pricing_model_info
+    from litellm.types.utils import Usage
 
+    tier_key: Final = f"input_cost_per_token_above_{threshold}k_tokens_batches"
     info: Final = deployment_pricing_model_info(_batch_deployment_id({tier_key: 1e-3}), _PUBLISHED_BATCH_DEPLOYMENT)
     carried_keys: Final = tuple(
         key for key in (*_PUBLISHED_INPUT_BATCH_KEYS, *_PUBLISHED_OUTPUT_BATCH_KEYS) if key != tier_key
@@ -8490,21 +8537,33 @@ def test_deployment_pricing_model_info_honors_a_tier_only_batch_override_over_th
     assert info is not None
     assert info[tier_key] == 1e-3
     assert {key: info[key] for key in carried_keys} == {key: _PUBLISHED_BATCH_RATES[key] for key in carried_keys}
+    prompt_tokens: Final = threshold * 1000 + 1
+    prompt_cost, _ = batch_cost_calculator(
+        usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=1, total_tokens=prompt_tokens + 1),
+        model=_PUBLISHED_BATCH_DEPLOYMENT,
+        custom_llm_provider="openai",
+        model_info=info,
+    )
+    assert prompt_cost == pytest.approx(prompt_tokens * 1e-3)
 
 
+@pytest.mark.parametrize("threshold", (100, 200))
 @pytest.mark.parametrize(
-    "override_key",
+    "rate_key",
     (
-        "output_cost_per_token_above_200k_tokens_batches",
-        "cache_read_input_token_cost_above_200k_tokens_batches",
-        "cache_creation_input_token_cost_above_200k_tokens_batches",
+        "output_cost_per_token",
+        "cache_read_input_token_cost",
+        "cache_creation_input_token_cost",
     ),
 )
-def test_deployment_pricing_model_info_honors_a_200k_tier_batch_override(
-    _published_batch_model: None, override_key: str
+def test_deployment_pricing_model_info_honors_a_tier_batch_override(
+    _published_batch_model: None, rate_key: str, threshold: int
 ) -> None:
+    from litellm.cost_calculator import batch_cost_calculator
     from litellm.litellm_core_utils.litellm_logging import deployment_pricing_model_info
+    from litellm.types.utils import PromptTokensDetailsWrapper, Usage
 
+    override_key: Final = f"{rate_key}_above_{threshold}k_tokens_batches"
     info: Final = deployment_pricing_model_info(_batch_deployment_id({override_key: 1e-3}), _PUBLISHED_BATCH_DEPLOYMENT)
     carried_keys: Final = tuple(
         key for key in (*_PUBLISHED_INPUT_BATCH_KEYS, *_PUBLISHED_OUTPUT_BATCH_KEYS) if key != override_key
@@ -8513,6 +8572,37 @@ def test_deployment_pricing_model_info_honors_a_200k_tier_batch_override(
     assert info is not None
     assert info[override_key] == 1e-3
     assert {key: info[key] for key in carried_keys} == {key: _PUBLISHED_BATCH_RATES[key] for key in carried_keys}
+    prompt_tokens: Final = threshold * 1000 + 1
+    rates: Final = {
+        prefix: 1e-3
+        if prefix == rate_key
+        else _PUBLISHED_BATCH_RATES.get(
+            f"{prefix}_above_{threshold}k_tokens_batches", _PUBLISHED_BATCH_RATES[f"{prefix}_batches"]
+        )
+        for prefix in (
+            "input_cost_per_token",
+            "output_cost_per_token",
+            "cache_read_input_token_cost",
+            "cache_creation_input_token_cost",
+        )
+    }
+    prompt_cost, completion_cost = batch_cost_calculator(
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=10,
+            total_tokens=prompt_tokens + 10,
+            prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=12, cache_creation_tokens=7),
+        ),
+        model=_PUBLISHED_BATCH_DEPLOYMENT,
+        custom_llm_provider="openai",
+        model_info=info,
+    )
+    assert prompt_cost == pytest.approx(
+        (prompt_tokens - 19) * rates["input_cost_per_token"]
+        + 12 * rates["cache_read_input_token_cost"]
+        + 7 * rates["cache_creation_input_token_cost"]
+    )
+    assert completion_cost == pytest.approx(10 * rates["output_cost_per_token"])
 
 
 def test_get_status_fields_ranks_guardrail_flagged_between_success_and_intervened():
