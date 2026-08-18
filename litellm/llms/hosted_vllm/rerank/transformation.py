@@ -26,6 +26,7 @@ from litellm.types.rerank import (
     RerankResponseResult,
     RerankTokens,
 )
+from litellm.types.utils import ModelInfo
 
 
 class HostedVLLMRerankError(BaseLLMException):
@@ -48,6 +49,21 @@ def validated_truncation_params(non_default_params: Mapping[str, object] | None)
 class HostedVLLMRerankConfig(BaseRerankConfig):
     def __init__(self) -> None:
         pass
+
+    def calculate_rerank_cost(
+        self,
+        model: str,
+        custom_llm_provider: str | None = None,
+        billed_units: RerankBilledUnits | None = None,
+        model_info: ModelInfo | None = None,
+    ) -> tuple[float, float]:
+        if model_info is not None and model_info.get("input_cost_per_query") is not None:
+            return super().calculate_rerank_cost(model, custom_llm_provider, billed_units, model_info)
+        input_rate: Final = model_info.get("input_cost_per_token") if model_info is not None else None
+        total_tokens: Final = billed_units.get("total_tokens") if billed_units is not None else None
+        if input_rate is not None and total_tokens is not None:
+            return input_rate * total_tokens, 0.0
+        return super().calculate_rerank_cost(model, custom_llm_provider, billed_units, model_info)
 
     def get_complete_url(
         self,

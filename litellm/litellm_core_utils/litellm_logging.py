@@ -388,16 +388,22 @@ class RawRequestCaptured(Exception):
 _DEPLOYMENT_PRICING_KEYS: Final = (
     "input_cost_per_token",
     "output_cost_per_token",
+    "output_cost_per_image_token",
     "input_cost_per_token_batches",
     "output_cost_per_token_batches",
+    "output_cost_per_image_token_batches",
+    "input_cost_per_token_above_100k_tokens_batches",
     "input_cost_per_token_above_200k_tokens_batches",
     "input_cost_per_token_above_272k_tokens_batches",
+    "output_cost_per_token_above_100k_tokens_batches",
     "output_cost_per_token_above_200k_tokens_batches",
     "output_cost_per_token_above_272k_tokens_batches",
     "cache_read_input_token_cost_batches",
+    "cache_read_input_token_cost_above_100k_tokens_batches",
     "cache_read_input_token_cost_above_200k_tokens_batches",
     "cache_read_input_token_cost_above_272k_tokens_batches",
     "cache_creation_input_token_cost_batches",
+    "cache_creation_input_token_cost_above_100k_tokens_batches",
     "cache_creation_input_token_cost_above_200k_tokens_batches",
     "cache_creation_input_token_cost_above_272k_tokens_batches",
     "ocr_cost_per_page",
@@ -410,7 +416,7 @@ _INPUT_PRICING_KEY_PREFIXES: Final = (
     "cache_read_input_token_cost",
     "cache_creation_input_token_cost",
 )
-_OUTPUT_PRICING_KEY_PREFIXES: Final = ("output_cost_per_token",)
+_OUTPUT_PRICING_KEY_PREFIXES: Final = ("output_cost_per_token", "output_cost_per_image_token")
 _BATCH_PRICING_KEY_SUFFIX: Final = "_batches"
 
 
@@ -425,7 +431,14 @@ def _published_direction(
             key: value
             for key, value in published.items()
             if registered.get(key) is None
-            and (key == flat_key or (key.startswith(prefixes) and key.endswith(_BATCH_PRICING_KEY_SUFFIX)))
+            and (
+                key == flat_key
+                or (
+                    key.startswith(prefixes)
+                    and (key.endswith(_BATCH_PRICING_KEY_SUFFIX) or key == "output_cost_per_image_token")
+                )
+            )
+            and (key != "output_cost_per_image_token_batches" or registered.get("output_cost_per_image_token") is None)
         }
     )
 
