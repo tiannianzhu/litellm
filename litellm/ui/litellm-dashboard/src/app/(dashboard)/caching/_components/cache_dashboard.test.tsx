@@ -179,15 +179,21 @@ describe("CacheDashboard cache analytics charts", () => {
     expect(await screen.findByText("18.18%")).toBeInTheDocument();
   });
 
-  it("passes the date range and selected filters to the activity query", () => {
-    renderDashboard();
+  it("defaults to seven Beijing dates including today and queries their exact UTC bounds", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-04T16:30:00Z"));
+    try {
+      renderDashboard();
 
-    expect(useCacheActivity).toHaveBeenCalledWith({
-      startDate: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
-      endDate: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
-      keyAliases: [],
-      models: [],
-    });
+      expect(useCacheActivity).toHaveBeenCalledWith({
+        startDate: "2026-10-29T16:00:00.000Z",
+        endDate: "2026-11-05T16:00:00.000Z",
+        keyAliases: [],
+        models: [],
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("opens the error-code drilldown for a call_type when its failed segment is clicked, and closes it again", async () => {

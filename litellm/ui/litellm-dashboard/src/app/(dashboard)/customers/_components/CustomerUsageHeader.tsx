@@ -78,6 +78,7 @@ export default function CustomerUsageHeader({
           value={dateValue}
           presetShortLabel={preset}
           label={t("customerPortal.range.label")}
+          timeZoneLabel={t("shared.scopedSavingsTab.bucketedByUtc")}
           showTimeRange={false}
           presets={customerUsagePresets}
           maxRangeDays={CUSTOMER_USAGE_MAX_RANGE_DAYS}

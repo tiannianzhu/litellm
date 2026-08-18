@@ -54,7 +54,11 @@ const PromptCachingTab: React.FC<PromptCachingTabProps> = ({ accessToken, activi
       <PromptCachingPanel accessToken={accessToken} settings={settings} onChange={handleChange} />
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-muted-foreground">{t("costOptimization.promptCaching.dateRangeLabel")}</p>
-        <AdvancedDatePicker value={activity.dateValue} onValueChange={activity.onDateChange} />
+        <AdvancedDatePicker
+          value={activity.dateValue}
+          onValueChange={activity.onDateChange}
+          timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
+        />
       </div>
       <PromptCachingRequestsTable accessToken={accessToken} dateValue={activity.dateValue} />
       <CacheLeakageCard activity={activity} />

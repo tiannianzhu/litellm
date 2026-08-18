@@ -45,7 +45,11 @@ const response: DailyActivityAggregatedResponse = {
 };
 
 describe("ResourceActivity", () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
 
   it("keeps alert dates when Activity mounts after another date consumer", async () => {
     function Details() {
@@ -135,18 +139,45 @@ describe("ResourceActivity", () => {
     );
   });
 
-  it("includes today's UTC bucket for a team when the local date is still yesterday", async () => {
+  it.each(["team", "user"] as const)("requests the current Beijing date for %s activity", async (scope) => {
+    vi.stubEnv("TZ", "UTC");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-08T16:01:00Z"));
+    vi.mocked(networking.dailyActivityAggregatedCall).mockRestore();
+    const mockFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify(response), { status: 200, headers: { "Content-Type": "application/json" } }),
+      );
+    render(<ResourceActivity scope={scope} id="resource-1" />);
+
+    expect(await screen.findByText("$12.34")).toBeInTheDocument();
+    expect(screen.getByText("Beijing time (Asia/Shanghai)")).toBeInTheDocument();
+    const url = new URL(String(mockFetch.mock.calls[0][0]), "http://localhost");
+    expect(url.pathname.endsWith(`/${scope}/daily/activity/aggregated`)).toBe(true);
+    expect(url.searchParams.get("start_date")).toBe("2026-10-11");
+    expect(url.searchParams.get("end_date")).toBe("2026-11-09");
+    expect(url.searchParams.has("include_current_utc_day")).toBe(false);
+  });
+
+  it("keeps the selected team dates when the browser and Beijing are on different days", async () => {
+    vi.stubEnv("TZ", "America/Los_Angeles");
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-11-09T01:00:00Z"));
-    vi.spyOn(networking, "formatDate").mockImplementation((date) =>
-      new Date(date.getTime() - 8 * 60 * 60 * 1000).toISOString().slice(0, 10),
-    );
-    render(<ResourceActivity scope="team" id="team-1" />);
+    vi.mocked(networking.dailyActivityAggregatedCall).mockRestore();
+    const mockFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify(response), { status: 200, headers: { "Content-Type": "application/json" } }),
+      );
+    render(<ResourceActivity scope="team" id="team-1" />, {
+      searchParams: "activity_from=2026-11-07&activity_to=2026-11-08",
+    });
+
     expect(await screen.findByText("$12.34")).toBeInTheDocument();
-    const request = vi.mocked(networking.dailyActivityAggregatedCall).mock.calls[0][1];
-    expect(request.endTime.getFullYear()).toBe(2026);
-    expect(request.endTime.getMonth()).toBe(10);
-    expect(request.endTime.getDate()).toBe(9);
+    const url = new URL(String(mockFetch.mock.calls[0][0]), "http://localhost");
+    expect(url.searchParams.get("start_date")).toBe("2026-11-07");
+    expect(url.searchParams.get("end_date")).toBe("2026-11-08");
   });
 
   beforeEach(() => {

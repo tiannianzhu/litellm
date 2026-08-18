@@ -149,13 +149,14 @@ const filterFor = (resource: string | undefined) =>
     team: "customer_team_ids",
     member: "customer_member_ids",
   })[activityDimension(resource)];
-const activityUrl = (resource: string, id: string, endDate = "2026-11-03") => {
+const activityUrl = (resource: string, id: string, endDate = "2026-11-03", startDate?: string) => {
   const filter = filterFor(resource);
   return requestedUrls().findLast(
     (url) =>
       url.pathname === `/management/v1/${resource}/daily/activity` &&
       url.searchParams.get(filter) === id &&
-      url.searchParams.get("end_date") === endDate,
+      url.searchParams.get("end_date") === endDate &&
+      (startDate === undefined || url.searchParams.get("start_date") === startDate),
   );
 };
 const activityIds = (url: URL, resource: string | undefined, aggregated: boolean) => {
@@ -360,16 +361,7 @@ describe("CustomerHierarchyUsagePage", () => {
     vi.setSystemTime(new Date(now));
     renderWithProviders(<CustomerHierarchyUsagePage />, { searchParams: `?org=org-1${query}` });
     await screen.findByRole("heading", { name: "Customer organization" });
-    expect(
-      requestedUrls()
-        .find((url) => url.pathname.endsWith("/daily/activity"))
-        ?.searchParams.get("start_date"),
-    ).toBe(startDate);
-    expect(
-      requestedUrls()
-        .find((url) => url.pathname.endsWith("/daily/activity"))
-        ?.searchParams.get("end_date"),
-    ).toBe(endDate);
+    await waitFor(() => expect(activityUrl("customer_organizations", "org-1", endDate, startDate)).toBeDefined());
   });
 
   it("should keep the selected dates in customer navigation and the return to all customers", async () => {
@@ -380,6 +372,105 @@ describe("CustomerHierarchyUsagePage", () => {
       const url = new URL(link.getAttribute("href")!, "http://localhost");
       expect(url.searchParams.get("from")).toBe("2026-11-01");
       expect(url.searchParams.get("to")).toBe("2026-11-03");
+    }
+  });
+
+  it("requests the previous full month from the customer usage date picker", async () => {
+    vi.setSystemTime(new Date("2026-11-15T12:00:00Z"));
+    renderWithProviders(<CustomerHierarchyUsagePage />, { searchParams: "?org=org-1" });
+    await screen.findByRole("heading", { name: "Customer organization" });
+    fireEvent.click(screen.getByRole("button", { name: /15 Nov 2026/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Previous month/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect(activityUrl("customer_organizations", "org-1", "2026-10-31", "2026-10-01")).toBeDefined(),
+    );
+  });
+
+  it("keeps customer usage on UTC days as midnight passes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-30T20:00:00Z"));
+    try {
+      renderWithProviders(<CustomerHierarchyUsagePage />, { searchParams: "?org=org-1" });
+
+      await waitFor(() =>
+        expect(
+          activityUrl("customer_organizations", "org-1", "2026-11-30", "2026-11-01")?.searchParams.get("end_date"),
+        ).toBe("2026-11-30"),
+      );
+      expect(
+        activityUrl("customer_organizations", "org-1", "2026-11-30", "2026-11-01")?.searchParams.get("start_date"),
+      ).toBe("2026-11-01");
+      expect(screen.getByText("Spend is bucketed by UTC day")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /30 Nov 2026/ }));
+      fireEvent.click(screen.getByRole("button", { name: /^Today/ }));
+      expect(screen.getByLabelText("Start date")).toHaveValue("2026-11-30");
+      fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+      await waitFor(() =>
+        expect(
+          activityUrl("customer_organizations", "org-1", "2026-11-30", "2026-11-30")?.searchParams.get("start_date"),
+        ).toBe("2026-11-30"),
+      );
+
+      act(() => {
+        vi.setSystemTime(new Date("2026-12-01T00:00:01Z"));
+        window.dispatchEvent(new Event("focus"));
+      });
+      await waitFor(() =>
+        expect(
+          activityUrl("customer_organizations", "org-1", "2026-12-01", "2026-12-01")?.searchParams.get("end_date"),
+        ).toBe("2026-12-01"),
+      );
+      expect(
+        activityUrl("customer_organizations", "org-1", "2026-12-01", "2026-12-01")?.searchParams.get("start_date"),
+      ).toBe("2026-12-01");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps explicitly selected dates across a UTC day change", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-30T23:59:59Z"));
+    try {
+      renderWithProviders(<CustomerHierarchyUsagePage />, { searchParams: initialUrl });
+      await screen.findByRole("table", { name: "Models" });
+
+      act(() => {
+        vi.setSystemTime(new Date("2026-12-01T00:00:01Z"));
+        window.dispatchEvent(new Event("focus"));
+      });
+      expect(screen.getByRole("button", { name: /1 Nov 2026 - 3 Nov 2026/ })).toBeInTheDocument();
+      expect(activityUrl("customer_organizations", "org-1")?.searchParams.get("start_date")).toBe("2026-11-01");
+      expect(activityUrl("customer_organizations", "org-1")?.searchParams.get("end_date")).toBe("2026-11-03");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("advances an open customer usage page at UTC midnight", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-30T23:59:59.800Z"));
+    try {
+      renderWithProviders(<CustomerHierarchyUsagePage />, { searchParams: "?org=org-1&range=today" });
+      await waitFor(() =>
+        expect(
+          activityUrl("customer_organizations", "org-1", "2026-11-30", "2026-11-30")?.searchParams.get("end_date"),
+        ).toBe("2026-11-30"),
+      );
+
+      act(() => vi.setSystemTime(new Date("2026-12-01T00:00:00.001Z")));
+      await waitFor(() =>
+        expect(
+          activityUrl("customer_organizations", "org-1", "2026-12-01", "2026-12-01")?.searchParams.get("end_date"),
+        ).toBe("2026-12-01"),
+      );
+      expect(
+        activityUrl("customer_organizations", "org-1", "2026-12-01", "2026-12-01")?.searchParams.get("start_date"),
+      ).toBe("2026-12-01");
+    } finally {
+      vi.useRealTimers();
     }
   });
 

@@ -3,6 +3,7 @@
 import { ArrowLeft, History, Wrench } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ParseKeys } from "i18next";
+import moment from "moment";
 import React, { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +21,7 @@ import TeamDropdown from "@/components/common_components/team_dropdown";
 import { LogViewer } from "@/components/GuardrailsMonitor/LogViewer";
 import type { LogEntry } from "@/components/GuardrailsMonitor/mockData";
 import { PolicySelect } from "@/components/ToolPolicies/PolicySelect";
+import { beijingDay } from "@/components/shared/date_range_presets";
 import {
   deleteToolPolicyOverride,
   fetchToolDetail,
@@ -56,11 +58,9 @@ const BLOCK_SUBMIT_KEYS: Record<"team" | "key", ParseKeys> = {
 const LOGS_PAGE_SIZE = 50;
 
 function getDefaultLogsDateRange(): { start: string; end: string } {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - 90);
-  const fmt = (d: Date) => d.toISOString().slice(0, 19).replace("T", " ");
-  return { start: fmt(start), end: fmt(end) };
+  const end = beijingDay(new Date());
+  const start = moment.utc(end, "YYYY-MM-DD", true).subtract(90, "days").format("YYYY-MM-DD");
+  return { start, end };
 }
 
 export function ToolDetail({ toolName, onBack, accessToken }: ToolDetailProps) {

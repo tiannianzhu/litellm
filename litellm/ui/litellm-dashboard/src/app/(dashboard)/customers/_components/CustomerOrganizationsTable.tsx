@@ -1,19 +1,17 @@
 import { useTranslation } from "react-i18next";
 import type { SortingState } from "@tanstack/react-table";
 import { ArrowDown, ArrowUp, ArrowUpDown } from "lucide-react";
-import { createSerializer, parseAsString } from "nuqs";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/cva.config";
-import { uiHref } from "@/utils/uiHref";
 import { $api } from "@/lib/http/api";
 import CustomerBudgetSpend, { CustomerBudgetWindow } from "./CustomerBudgetSpend";
 import { customerOrganizationBudgetSource, type CustomerOrganizationRow } from "./customerOrganizations";
+import { useCustomerHierarchyLinks } from "./CustomerHierarchyNavigation";
 import { CustomerBudgetLimitCell } from "./CustomerBudgetColumn";
 import CustomerTokenTotal from "./CustomerTokenTotal";
 import { EMPTY_CUSTOMER_USAGE, type CustomerUsageTotals } from "./customerUsageTotals";
 
-const usageHref = createSerializer({ org: parseAsString, from: parseAsString, to: parseAsString });
 const SORT_DIRECTIONS = ["ascending", "descending"] as const;
 const COLUMNS = [
   { id: "customer", label: "customerPortal.list.columns.customer" },
@@ -31,8 +29,6 @@ export default function CustomerOrganizationsTable({
   onSort,
   loading,
   searching,
-  startDate,
-  endDate,
   usageTotals,
 }: {
   rows: readonly CustomerOrganizationRow[];
@@ -40,12 +36,11 @@ export default function CustomerOrganizationsTable({
   onSort: (sorting: SortingState) => void;
   loading: boolean;
   searching: boolean;
-  startDate: string;
-  endDate: string;
   usageTotals: CustomerUsageTotals | null;
 }) {
   const { t } = useTranslation();
   const groups = $api.useQuery("get", "/management/v1/customer_organization_budget_groups", {});
+  const { customerHierarchyHref } = useCustomerHierarchyLinks();
   return (
     <Table aria-label={t("customerPortal.list.title")}>
       <TableHeader>
@@ -112,6 +107,11 @@ export default function CustomerOrganizationsTable({
                 ? budgetSource.name ?? t("customerPortal.organizationGroups.groupBadge")
                 : customLabel;
             const usage = usageTotals ? usageTotals.get(organization.customer_org_id) ?? EMPTY_CUSTOMER_USAGE : null;
+            const usageLink = customerHierarchyHref("usage", {
+              org: organization.customer_org_id,
+              team: null,
+              member: null,
+            });
             return (
               <TableRow key={organization.customer_org_id}>
                 <TableCell className="px-4 py-5">
@@ -131,11 +131,7 @@ export default function CustomerOrganizationsTable({
                       <a
                         className="block max-w-40 truncate font-medium hover:text-primary hover:underline"
                         title={label}
-                        href={usageHref(uiHref("customers/usage"), {
-                          org: organization.customer_org_id,
-                          from: startDate,
-                          to: endDate,
-                        })}
+                        href={usageLink}
                       >
                         {label}
                       </a>
@@ -149,7 +145,7 @@ export default function CustomerOrganizationsTable({
                       )}
                       <a
                         className="mt-1 inline-block text-xs text-muted-foreground hover:text-foreground hover:underline"
-                        href={`${usageHref(uiHref("customers/usage"), { org: organization.customer_org_id, from: startDate, to: endDate })}#app-budgets`}
+                        href={`${usageLink}#app-budgets`}
                       >
                         {t("apps.organizationTitle")}
                       </a>

@@ -5,10 +5,11 @@ GET /guardrails/usage/overview, /guardrails/usage/detail/:id, /guardrails/usage/
 
 import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from itertools import groupby
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, overload
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, TypeAdapter
@@ -18,6 +19,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
 from litellm.proxy.guardrails.usage_tracking import guardrail_status_to_action
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.repositories.table_repositories import (
@@ -55,7 +57,7 @@ _USAGE_MAX_RANGE_DAYS: Final = 366
 def _resolve_usage_window(start_date: str | None, end_date: str | None) -> tuple[str, str]:
     from fastapi import HTTPException, status
 
-    now: Final = datetime.now(timezone.utc)
+    now: Final = datetime.now(ZoneInfo(get_budget_reset_timezone()))
     end: Final = end_date or now.strftime("%Y-%m-%d")
     start: Final = start_date or (now - timedelta(days=7)).strftime("%Y-%m-%d")
     try:
@@ -755,15 +757,22 @@ def _build_usage_logs_where(
     if start_date or end_date:
         st_filter: Final[prisma_types.DateTimeFilter] = {}
         if start_date:
-            sd = start_date.replace("Z", "+00:00").strip()
-            if "T" not in sd:
-                sd += "T00:00:00+00:00"
-            st_filter["gte"] = datetime.fromisoformat(sd)
+            sd: Final = start_date.replace("Z", "+00:00").strip()
+            st_filter["gte"] = (
+                datetime.fromisoformat(sd)
+                if "T" in sd
+                else datetime.combine(date.fromisoformat(sd), time.min, tzinfo=ZoneInfo(get_budget_reset_timezone()))
+            )
         if end_date:
-            ed = end_date.replace("Z", "+00:00").strip()
-            if "T" not in ed:
-                ed += "T23:59:59+00:00"
-            st_filter["lte"] = datetime.fromisoformat(ed)
+            ed: Final = end_date.replace("Z", "+00:00").strip()
+            if "T" in ed:
+                st_filter["lte"] = datetime.fromisoformat(ed)
+            else:
+                st_filter["lt"] = datetime.combine(
+                    date.fromisoformat(ed) + timedelta(days=1),
+                    time.min,
+                    tzinfo=ZoneInfo(get_budget_reset_timezone()),
+                )
         where["start_time"] = st_filter
     return where
 

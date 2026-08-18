@@ -22,6 +22,7 @@ import type { UsageClient } from "../hooks/clientUsageData";
 import { useClientUsage } from "../hooks/useClientUsage";
 import { topAgents, type AgentRow } from "./overview/agentCatalog";
 import { useClientAgentModels } from "../hooks/useClientAgentModels";
+import { beijingDayBounds } from "@/components/shared/date_range_presets";
 import UsageBreakdownChart from "./overview/UsageBreakdownChart";
 import { clientAgentDetail, type ClientAgentDetail } from "./overview/clientAgentDetail";
 import { modelColorMap, formatCompact, formatUsd, overviewTotals } from "./overview/overviewData";
@@ -87,10 +88,11 @@ export default function ClientUsagePanel({
   const { t } = useTranslation();
   const label = client === "claude-desktop" ? "Claude Desktop" : "Claude Code";
   const scopedRequest = Boolean(userId || teamId) && !accessError;
+  const scopedDates = startTime && endTime ? beijingDayBounds(startTime, endTime) : null;
   const personRequest = {
     accessToken,
-    startTime,
-    endTime,
+    startTime: scopedDates?.from ?? null,
+    endTime: scopedDates?.to ?? null,
     userId,
     teamId,
     client: scopedRequest ? client : null,
@@ -177,6 +179,7 @@ export default function ClientUsagePanel({
               value={dateValue}
               presetShortLabel={presetShortLabel}
               onValueChange={onDateChange}
+              timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
             />
           </div>
           {teams.length > 0 && onTeamChange && (

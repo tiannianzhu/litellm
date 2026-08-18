@@ -8,10 +8,11 @@ detail 404'd, overview omitted them (or rendered them as Custom/Guardrail
 orphans), and logs missed their logical-name alias.
 """
 
-from datetime import datetime
-from typing import Any, Optional
+from datetime import datetime, timezone, tzinfo
+from typing import Any, Final, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 
 
@@ -21,6 +22,7 @@ from prisma.errors import TableNotFoundError
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.guardrails.guardrail_registry import InMemoryGuardrailHandler
 from litellm.proxy.guardrails.usage_endpoints import (
+    _resolve_usage_window,
     guardrails_usage_detail,
     guardrails_usage_logs,
     guardrails_usage_overview,
@@ -483,6 +485,70 @@ async def test_logs_resolves_config_guardrail_logical_name():
         )
     where = prisma.db.litellm_spendlogguardrailindex.find_many.call_args.kwargs["where"]
     assert where["guardrail_id"] == {"in": ["yaml-uuid", "yaml-pii"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "usage_timezone,start_date,end_date,utc_start,end_operator,utc_end",
+    (
+        ("Asia/Shanghai", "2026-11-04", "2026-11-04", "2026-11-03T16:00:00+00:00", "lt", "2026-11-04T16:00:00+00:00"),
+        (
+            "America/New_York",
+            "2026-03-08",
+            "2026-03-08",
+            "2026-03-08T05:00:00+00:00",
+            "lt",
+            "2026-03-09T04:00:00+00:00",
+        ),
+        (None, "2026-11-04", "2026-11-04", "2026-11-04T00:00:00+00:00", "lt", "2026-11-05T00:00:00+00:00"),
+        (
+            "Asia/Shanghai",
+            "2026-11-04T00:00:00+08:00",
+            "2026-11-04T00:00:01.123456+08:00",
+            "2026-11-03T16:00:00+00:00",
+            "lte",
+            "2026-11-03T16:00:01.123456+00:00",
+        ),
+    ),
+)
+async def test_logs_use_business_dates_and_preserve_explicit_instants(
+    monkeypatch: pytest.MonkeyPatch,
+    usage_timezone: str | None,
+    start_date: str,
+    end_date: str,
+    utc_start: str,
+    end_operator: str,
+    utc_end: str,
+) -> None:
+    monkeypatch.setattr(litellm, "timezone", usage_timezone, raising=False)
+    prisma: Final = _prisma()
+    p1, p2 = _patches(prisma, _config_handler())
+    with p1, p2:
+        await guardrails_usage_logs(
+            guardrail_id="date-window",
+            policy_id=None,
+            page=1,
+            page_size=50,
+            action=None,
+            start_date=start_date,
+            end_date=end_date,
+            user_api_key_dict=ADMIN,
+        )
+    expected: Final = {"gte": datetime.fromisoformat(utc_start), end_operator: datetime.fromisoformat(utc_end)}
+    assert prisma.db.litellm_spendlogguardrailindex.find_many.call_args.kwargs["where"]["start_time"] == expected
+    assert prisma.db.litellm_spendlogguardrailindex.count.call_args.kwargs["where"]["start_time"] == expected
+
+
+def test_default_usage_window_includes_the_current_business_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    instant: Final = datetime(2026, 11, 3, 16, 0, 1, tzinfo=timezone.utc)
+
+    def current_time(tz: tzinfo | None = None) -> datetime:
+        return instant.astimezone(tz)
+
+    with patch("litellm.proxy.guardrails.usage_endpoints.datetime", wraps=datetime) as clock:
+        clock.now.side_effect = current_time
+        assert _resolve_usage_window(None, None) == ("2026-10-28", "2026-11-04")
 
 
 def _index_row(request_id: str, guardrail_id: str = "cc-flag") -> Any:

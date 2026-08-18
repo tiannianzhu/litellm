@@ -319,6 +319,74 @@ describe("customer hierarchy management", () => {
     },
   );
 
+  it("refreshes the team month and year spend when the UTC year changes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-12-31T23:59:59Z"));
+    try {
+      const days = [
+        { date: "2026-05-06", spend: 6 },
+        { date: "2026-12-30", spend: 3 },
+        { date: "2027-01-01", spend: 2 },
+      ];
+      fetchMock.mockImplementation(async (input) => {
+        const url = requestUrl(input);
+        if (url.pathname === "/management/v1/customer_teams") {
+          return json({
+            data: [{ ...product, budget: null, budget_usage: [] }],
+            meta: { total_count: 1, page: 1, page_size: 20, total_pages: 1 },
+          });
+        }
+        if (url.pathname.endsWith("/daily/activity/aggregated"))
+          return json({ results: [], metadata: { ...EMPTY_DAILY_ACTIVITY_METADATA, total_spend: 20 } });
+        if (!url.pathname.endsWith("/daily/activity")) return serve(input);
+        const results = days
+          .filter(
+            (day) =>
+              day.date >= (url.searchParams.get("start_date") ?? "") &&
+              day.date <= (url.searchParams.get("end_date") ?? ""),
+          )
+          .map(({ date, spend }) => {
+            const metrics = {
+              spend,
+              total_tokens: 10,
+              prompt_tokens: 10,
+              completion_tokens: 0,
+              api_requests: 1,
+              successful_requests: 1,
+              failed_requests: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            };
+            return {
+              date,
+              metrics,
+              breakdown: {
+                models: {},
+                model_groups: {},
+                providers: {},
+                mcp_servers: {},
+                api_keys: {},
+                entities: { "team-a": { metrics, metadata: {}, api_key_breakdown: {} } },
+              },
+            };
+          });
+        return json({ results, metadata: EMPTY_DAILY_ACTIVITY_METADATA });
+      });
+      renderWithProviders(<CustomerHierarchyManager />, { searchParams: "?org=org-1" });
+      const row = await screen.findByRole("row", { name: /Product/ });
+      expect(await within(row).findByRole("cell", { name: "$3.00 No limit" })).toBeInTheDocument();
+      expect(within(row).getByRole("cell", { name: "$9.00 No limit" })).toBeInTheDocument();
+
+      act(() => {
+        vi.setSystemTime(new Date("2027-01-01T00:00:01Z"));
+        window.dispatchEvent(new Event("focus"));
+      });
+      await waitFor(() => expect(within(row).getAllByRole("cell", { name: "$2.00 No limit" })).toHaveLength(2));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["/daily/activity", "/daily/activity/aggregated"])(
     "should keep row actions without showing zero usage when %s fails",
     async (route) => {

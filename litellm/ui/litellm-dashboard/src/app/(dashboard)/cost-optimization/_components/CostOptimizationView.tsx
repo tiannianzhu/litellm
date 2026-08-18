@@ -13,6 +13,7 @@ import UsageTab from "./UsageTab";
 import PromptCompressionTab from "./PromptCompressionTab";
 import PromptCachingTab from "./PromptCachingTab";
 import AutoRouterBenchmarksTab from "./AutoRouterBenchmarksTab";
+import { useAutoRouterDateRange } from "./useAutoRouterBenchmarks";
 import { useDailyActivityRange } from "./useDailyActivityRange";
 
 interface CostOptimizationViewProps {
@@ -24,6 +25,7 @@ interface CostOptimizationViewProps {
 const CostOptimizationView: React.FC<CostOptimizationViewProps> = ({ accessToken, userId, userRole }) => {
   const { t } = useTranslation();
   const activity = useDailyActivityRange(accessToken, userId, userRole);
+  const autoRouterActivity = useAutoRouterDateRange();
   const canViewProxyWideCostData = useCan("viewProxyWideCostData");
   const [visitedTabs, setVisitedTabs] = React.useState<readonly string[]>(["usage"]);
 
@@ -100,7 +102,7 @@ const CostOptimizationView: React.FC<CostOptimizationViewProps> = ({ accessToken
               <PromptCachingTab accessToken={accessToken} activity={activity} />
             </TabsContent>
             <TabsContent value="autorouter-usage" keepMounted={visitedTabs.includes("autorouter-usage")}>
-              <AutoRouterBenchmarksTab accessToken={accessToken} activity={activity} />
+              <AutoRouterBenchmarksTab accessToken={accessToken} activity={autoRouterActivity} />
             </TabsContent>
           </>
         )}

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolSpendResponse } from "@/components/networking";
@@ -142,6 +142,17 @@ describe("UsageTab", () => {
     mockGetToolSpend.mockReset();
   });
 
+  it("requests tool spend for the selected calendar dates", async () => {
+    vi.stubEnv("TZ", "Asia/Shanghai");
+    try {
+      renderWith([]);
+
+      await waitFor(() => expect(mockGetToolSpend).toHaveBeenCalledWith("test-token", "2026-07-01", "2026-07-14"));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("sums compression and caching dollars across days into the summary cards", () => {
     // Total caching and the LiteLLM-injected share deliberately differ so these
     // assertions pin which one each figure uses: the caching headline and the
@@ -242,9 +253,9 @@ describe("UsageTab", () => {
   it("says what the line means and over what range", async () => {
     renderWith(twoDays());
 
-    expect(screen.getByText("Running total saved · Jul 1 – Jul 14 (UTC)")).toBeInTheDocument();
+    expect(screen.getByText("Running total saved · Jul 1 – Jul 14")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: "Per day" }));
-    expect(screen.getByText("Saved per day · Jul 1 – Jul 14 (UTC)")).toBeInTheDocument();
+    expect(screen.getByText("Saved per day · Jul 1 – Jul 14")).toBeInTheDocument();
   });
 
   it("builds the per-driver donut from the range totals, not the running total", () => {

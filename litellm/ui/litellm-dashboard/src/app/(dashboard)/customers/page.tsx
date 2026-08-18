@@ -104,6 +104,7 @@ function CustomerOrganizations() {
             presetShortLabel={preset}
             presets={customerUsagePresets}
             maxRangeDays={CUSTOMER_USAGE_MAX_RANGE_DAYS}
+            timeZoneLabel={t("shared.scopedSavingsTab.bucketedByUtc")}
             label={t("customerPortal.range.label")}
             showTimeRange={false}
             compact
@@ -151,8 +152,6 @@ function CustomerOrganizations() {
             onSort={onSortingChange}
             loading={loading}
             searching={Boolean(search)}
-            startDate={startDate}
-            endDate={endDate}
             usageTotals={usageTotals}
           />
         )}

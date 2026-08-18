@@ -18,7 +18,8 @@ import {
   type ToolUsageLogsResponse,
 } from "@/components/networking";
 
-vi.mock("@/components/networking", () => ({
+vi.mock("@/components/networking", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/networking")>()),
   deleteToolPolicyOverride: vi.fn(),
   fetchToolDetail: vi.fn(),
   fetchToolPolicyOptions: vi.fn(),
@@ -74,6 +75,26 @@ describe("ToolDetail", () => {
     vi.mocked(deleteToolPolicyOverride).mockResolvedValue(
       undefined as unknown as { deleted: boolean; tool_name: string },
     );
+  });
+
+  it("requests logs through the current Beijing date in a UTC browser", async () => {
+    vi.stubEnv("TZ", "UTC");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-05-01T16:00:00Z"));
+    try {
+      renderDetail();
+      const expectedRange = {
+        page: 1,
+        pageSize: 50,
+        startDate: "2026-02-01",
+        endDate: "2026-05-02",
+      };
+
+      await waitFor(() => expect(getToolUsageLogs).toHaveBeenCalledWith("tok", "search_docs", expectedRange));
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    }
   });
 
   it("shows the tool identity once loaded", async () => {

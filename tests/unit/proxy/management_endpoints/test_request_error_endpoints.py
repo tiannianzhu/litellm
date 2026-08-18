@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,11 +13,13 @@ for _key, _value in _THROWAWAY_ENV.items():
 import pytest
 from fastapi import HTTPException
 
+import litellm
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.management_endpoints.request_error_endpoints import (
     _DateRow,
     _EntityRow,
     _EntityStatusRow,
+    _default_range,
     fold_by_date,
     fold_by_status_code,
     fold_entities,
@@ -119,6 +122,20 @@ async def test_missing_database_is_a_500() -> None:
         with pytest.raises(HTTPException) as refused:
             await get_request_error_activity(user_api_key_dict=_auth(LitellmUserRoles.PROXY_ADMIN))
     assert refused.value.status_code == 500
+
+
+@pytest.mark.parametrize(
+    ("business_timezone", "expected_range"),
+    ((None, ("2026-10-04", "2026-11-03")), ("Asia/Shanghai", ("2026-10-05", "2026-11-04"))),
+)
+def test_default_window_uses_the_business_day(
+    monkeypatch: pytest.MonkeyPatch, business_timezone: str | None, expected_range: tuple[str, str]
+) -> None:
+    monkeypatch.setattr(litellm, "timezone", business_timezone, raising=False)
+    now: Final = datetime(2026, 11, 3, 16, 0, 1, tzinfo=timezone.utc)
+    with patch("litellm.proxy.management_endpoints.request_error_endpoints.datetime") as clock:
+        clock.now.return_value = now
+        assert _default_range() == expected_range
 
 
 @pytest.mark.asyncio
