@@ -208,41 +208,56 @@ describe("computeCacheLeakage", () => {
 });
 
 describe("computeCacheLeakage by model", () => {
-  it("lists every provider's models, not only Anthropic", () => {
+  it("aggregates priced cache leakage for every model provider", () => {
     const models: Record<string, Partial<SpendMetrics>> = {
-      "claude-sonnet-5": { prompt_tokens: 10000, cache_read_input_tokens: 0 },
-      "vertex_ai/gemini-2.5-pro": { prompt_tokens: 9000, cache_read_input_tokens: 3000 },
-      "bedrock/openai.gpt-5.6-luna": { prompt_tokens: 8000, cache_read_input_tokens: 0 },
-      "deepseek-chat": { prompt_tokens: 4000, cache_read_input_tokens: 0 },
+      "claude-sonnet-5": { prompt_tokens: 10000, cache_read_input_tokens: 100, prompt_caching_savings_spend: 0.1 },
+      "anthropic/claude-haiku-4-5": {
+        prompt_tokens: 4000,
+        cache_read_input_tokens: 100,
+        prompt_caching_savings_spend: 0.1,
+      },
+      "bedrock/anthropic.claude-3-5-sonnet": {
+        prompt_tokens: 2000,
+        cache_read_input_tokens: 100,
+        prompt_caching_savings_spend: 0.1,
+      },
+      "gpt-4o": { prompt_tokens: 9000, cache_read_input_tokens: 100, prompt_caching_savings_spend: 0.1 },
+      "deepseek-chat": { prompt_tokens: 8000, cache_read_input_tokens: 100, prompt_caching_savings_spend: 0.1 },
     };
     const { rows } = computeCacheLeakage([modelDay("2026-07-01", models)], "model");
     expect(rows.map((r) => r.id)).toEqual([
       "claude-sonnet-5",
-      "bedrock/openai.gpt-5.6-luna",
-      "vertex_ai/gemini-2.5-pro",
+      "gpt-4o",
       "deepseek-chat",
+      "anthropic/claude-haiku-4-5",
+      "bedrock/anthropic.claude-3-5-sonnet",
     ]);
-    expect(rows.find((r) => r.id === "vertex_ai/gemini-2.5-pro")?.cacheHitRatio).toBeCloseTo(1 / 3, 6);
   });
 
   it("labels model rows by model name with no sublabel", () => {
-    const results = [modelDay("2026-07-01", { "claude-sonnet-5": { prompt_tokens: 1000 } })];
+    const results = [
+      modelDay("2026-07-01", {
+        "claude-sonnet-5": { prompt_tokens: 1000, cache_read_input_tokens: 100, prompt_caching_savings_spend: 0.1 },
+      }),
+    ];
     const { rows } = computeCacheLeakage(results, "model");
     expect(rows[0].label).toBe("claude-sonnet-5");
     expect(rows[0].sublabel).toBeNull();
   });
 
-  it("prices model leakage at the realized cache-read discount across providers", () => {
+  it("prices each model at its own realized cache-read discount", () => {
     const results = [
       modelDay("2026-07-01", {
-        "claude-sonnet-5": { prompt_tokens: 1000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2.0 },
-        "gemini-2.5-flash": { prompt_tokens: 500 },
+        "high-discount": { prompt_tokens: 2000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2.0 },
+        "low-discount": { prompt_tokens: 2500, cache_read_input_tokens: 500, prompt_caching_savings_spend: 0.25 },
+        "no-cache-sample": { prompt_tokens: 3000 },
       }),
     ];
     const { rows, netSavingsPerCachedToken } = computeCacheLeakage(results, "model");
-    expect(netSavingsPerCachedToken).toBeCloseTo(0.002, 6);
-    expect(rows.map((r) => r.id)).toEqual(["gemini-2.5-flash"]);
-    expect(rows[0].potentialSavings).toBeCloseTo(1.0, 6);
+    expect(netSavingsPerCachedToken).toBeCloseTo(0.0015, 6);
+    expect(rows.map((r) => r.id)).toEqual(["high-discount", "low-discount"]);
+    expect(rows[0].potentialSavings).toBeCloseTo(2.0, 6);
+    expect(rows[1].potentialSavings).toBeCloseTo(1.0, 6);
   });
 
   it("merges rows logged under a deployment's resolved and requested names into one model group row", () => {
@@ -264,7 +279,7 @@ describe("computeCacheLeakage by model", () => {
         },
         model_groups: {
           "bedrock/claude-sonnet-4-6": {
-            metrics: metrics({ prompt_tokens: 275000 }),
+            metrics: metrics({ prompt_tokens: 276000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 1 }),
             metadata: {},
             api_key_breakdown: {},
           },
@@ -284,7 +299,11 @@ describe("computeCacheLeakage by model", () => {
     const results = [
       modelDay("2026-07-01", { "bedrock/claude-sonnet-4-6": { prompt_tokens: 1000 } }),
       modelDay("2026-07-02", {
-        "bedrock/claude-sonnet-4-6": { prompt_tokens: 2500, cache_read_input_tokens: 500 },
+        "bedrock/claude-sonnet-4-6": {
+          prompt_tokens: 2500,
+          cache_read_input_tokens: 500,
+          prompt_caching_savings_spend: 0.5,
+        },
       }),
     ];
     const { rows } = computeCacheLeakage(results, "model");
