@@ -177,6 +177,7 @@ describe("daily activity helpers", () => {
 
     expect(parsed.pathname).toBe("/tag/daily/activity");
     expect(parsed.searchParams.get("tags")).toBe("alpha,beta");
+    expect(parsed.searchParams.has("timezone")).toBe(false);
   });
 
   it("always includes exclude_team_ids but only adds team_ids when given", async () => {
