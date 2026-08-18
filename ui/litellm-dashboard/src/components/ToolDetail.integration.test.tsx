@@ -18,7 +18,8 @@ import {
   type ToolUsageLogsResponse,
 } from "@/components/networking";
 
-vi.mock("@/components/networking", () => ({
+vi.mock("@/components/networking", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/components/networking")>()),
   deleteToolPolicyOverride: vi.fn(),
   fetchToolDetail: vi.fn(),
   fetchToolPolicyOptions: vi.fn(),
@@ -74,6 +75,24 @@ describe("ToolDetail", () => {
     vi.mocked(deleteToolPolicyOverride).mockResolvedValue(
       undefined as unknown as { deleted: boolean; tool_name: string },
     );
+  });
+
+  it("requests logs using calendar dates accepted by the API", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 4, 2, 1));
+    try {
+      renderDetail();
+      const expectedRange = {
+        page: 1,
+        pageSize: 50,
+        startDate: "2026-02-01",
+        endDate: "2026-05-02",
+      };
+
+      await waitFor(() => expect(getToolUsageLogs).toHaveBeenCalledWith("tok", "search_docs", expectedRange));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows the tool identity once loaded", async () => {

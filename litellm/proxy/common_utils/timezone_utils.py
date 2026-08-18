@@ -1,4 +1,6 @@
 from datetime import datetime, time, timezone
+from typing import Final, overload
+from zoneinfo import ZoneInfo
 
 from pydantic import ConfigDict
 
@@ -51,6 +53,31 @@ def get_budget_reset_timezone() -> str:
     by proxy_server.py at startup (via setattr(litellm, key, value)).
     """
     return getattr(litellm, "timezone", None) or "UTC"
+
+
+@overload
+def get_daily_spend_date(start_time: datetime) -> str: ...
+
+
+@overload
+def get_daily_spend_date(start_time: object) -> str | None: ...
+
+
+def get_daily_spend_date(start_time: object) -> str | None:
+    if not isinstance(start_time, (datetime, str)):
+        return None
+    try:
+        parsed_datetime: Final = (
+            start_time
+            if isinstance(start_time, datetime)
+            else datetime.fromisoformat(f"{start_time[:-1]}+00:00" if start_time.endswith("Z") else start_time)
+        )
+    except ValueError:
+        return None
+    normalized_datetime: Final = (
+        parsed_datetime.replace(tzinfo=timezone.utc) if parsed_datetime.tzinfo is None else parsed_datetime
+    )
+    return normalized_datetime.astimezone(ZoneInfo(get_budget_reset_timezone())).date().isoformat()
 
 
 def get_budget_reset_settings() -> BudgetResetSettings:
