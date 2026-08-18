@@ -126,6 +126,50 @@ def test_finalize_with_no_block_clears_rules():
         set_fallback_generalizations(previous)
 
 
+def test_finalize_merges_local_pricing_over_official_model_metadata():
+    finalized = _finalize_model_cost_map(
+        {"deepseek-v4-flash": {"litellm_provider": "deepseek", "max_input_tokens": 131072}},
+        local_overrides={
+            "deepseek-v4-flash": {
+                "litellm_provider": "hosted_vllm",
+                "input_cost_per_token": 0.00000044,
+            }
+        },
+    )
+
+    model = finalized["deepseek-v4-flash"]
+    assert model["litellm_provider"] == "hosted_vllm"
+    assert model["max_input_tokens"] == 131072
+    assert model["input_cost_per_token"] == 0.00000044
+
+
+def test_load_local_model_cost_overrides_uses_configured_path(tmp_path, monkeypatch):
+    override_path = tmp_path / "model-prices.json"
+    override_path.write_text(
+        json.dumps(
+            {
+                "hosted_vllm/test-model": {
+                    "litellm_provider": "hosted_vllm",
+                    "input_cost_per_token": 0.00000044,
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("LITELLM_MODEL_COST_OVERRIDES_PATH", str(override_path))
+
+    overrides = GetModelCostMap.load_local_model_cost_overrides()
+
+    assert overrides["hosted_vllm/test-model"]["input_cost_per_token"] == 0.00000044
+
+
+def test_load_local_model_cost_overrides_fails_when_configured_path_is_missing(tmp_path, monkeypatch):
+    missing_path = tmp_path / "missing.json"
+    monkeypatch.setenv("LITELLM_MODEL_COST_OVERRIDES_PATH", str(missing_path))
+
+    with pytest.raises(FileNotFoundError):
+        GetModelCostMap.load_local_model_cost_overrides()
+
+
 def test_shipped_backup_carries_the_claude_routing_rules():
     """The bundled backup must ship the Claude routing rules so a fresh install
     (or an offline fallback) routes unknown Claude models without code changes.

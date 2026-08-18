@@ -37,8 +37,6 @@ export interface CacheLeakageResult {
   netSavingsPerCachedToken: number | null;
 }
 
-export const isAnthropicModel = (model: string): boolean => /claude|anthropic/i.test(model);
-
 interface LeakageAccumulator {
   alias: string | null;
   teamId: string | null;
@@ -89,7 +87,6 @@ const aggregateByModel = (results: readonly DailyData[]): Map<string, LeakageAcc
   const byModel = new Map<string, LeakageAccumulator>();
   for (const day of results) {
     for (const [model, entry] of Object.entries(day.breakdown?.models ?? {})) {
-      if (!isAnthropicModel(model)) continue;
       const acc = byModel.get(model) ?? emptyAccumulator();
       byModel.set(model, addMetrics(acc, entry.metrics, null, null));
     }
@@ -117,27 +114,37 @@ export const computeCacheLeakage = (
   // traffic where the net is negative, would flip the sign of a real loss into a saving
   const netSavingsPerCachedToken = totals.cachedTokens > 0 ? totals.realizedCachingSavings / totals.cachedTokens : null;
   // A non-positive rate prices no leakage: there is no saving to extrapolate from
-  const rate = netSavingsPerCachedToken != null && netSavingsPerCachedToken > 0 ? netSavingsPerCachedToken : null;
+  const portfolioRate =
+    dimension === "key" && netSavingsPerCachedToken != null && netSavingsPerCachedToken > 0
+      ? netSavingsPerCachedToken
+      : null;
 
   const rows: CacheLeakageRow[] = [...byEntity.entries()]
     .map(([id, a]) => {
       const uncachedPromptTokens = Math.max(0, a.promptTokens - a.cacheReadTokens - a.cacheCreationTokens);
+      const entityCachedTokens = a.cacheReadTokens + a.cacheCreationTokens;
+      const candidateRate =
+        dimension === "model" && entityCachedTokens > 0 ? a.realizedCachingSavings / entityCachedTokens : portfolioRate;
+      const entityRate = candidateRate != null && candidateRate > 0 ? candidateRate : null;
       return {
         id,
         label: dimension === "model" ? id : a.alias ?? `${id.slice(0, 8)}...`,
         sublabel: dimension === "model" ? null : a.teamId,
         uncachedPromptTokens,
         cacheHitRatio: a.promptTokens > 0 ? a.cacheReadTokens / a.promptTokens : 0,
-        potentialSavings: rate != null ? uncachedPromptTokens * rate : null,
+        potentialSavings: entityRate != null ? uncachedPromptTokens * entityRate : null,
       };
     })
-    .filter((row) => row.uncachedPromptTokens > 0);
+    .filter((row) => row.uncachedPromptTokens > 0 && (dimension !== "model" || row.potentialSavings != null));
 
-  const sorted = rows.sort((x, y) =>
-    rate != null
-      ? (y.potentialSavings ?? 0) - (x.potentialSavings ?? 0)
-      : y.uncachedPromptTokens - x.uncachedPromptTokens,
-  );
+  const sorted = rows.sort((x, y) => {
+    if (x.potentialSavings != null && y.potentialSavings != null) {
+      return y.potentialSavings - x.potentialSavings;
+    }
+    if (x.potentialSavings != null) return -1;
+    if (y.potentialSavings != null) return 1;
+    return y.uncachedPromptTokens - x.uncachedPromptTokens;
+  });
 
   return { rows: sorted.slice(0, limit), netSavingsPerCachedToken };
 };

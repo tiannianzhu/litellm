@@ -17,9 +17,11 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.resources import files
-from typing import Final, Protocol
+from pathlib import Path
+from typing import Final, Protocol, TypeAlias
 
 import httpx
+from pydantic import TypeAdapter
 
 from litellm import verbose_logger
 from litellm.constants import (
@@ -35,6 +37,9 @@ FALLBACK_GENERALIZATIONS_KEY: Final = "fallback_generalizations"
 # Reserved top-level keys that are not model entries. They must be excluded
 # from the model-count integrity check so a real upstream shrink can't be masked.
 RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", FALLBACK_GENERALIZATIONS_KEY})
+ModelCostMap: TypeAlias = dict[str, dict[str, object]]
+_MODEL_COST_MAP_ADAPTER: Final = TypeAdapter(ModelCostMap)
+_FALLBACK_RULES_ADAPTER: Final = TypeAdapter(list[object])
 
 
 def _count_model_entries(model_cost: dict) -> int:
@@ -60,6 +65,19 @@ class GetModelCostMap:
             files("litellm").joinpath("model_prices_and_context_window_backup.json").read_text(encoding="utf-8")
         )
         return content
+
+    @staticmethod
+    def load_local_model_cost_overrides() -> (
+        ModelCostMap
+    ):  # mutable-ok: callers merge this JSON object into the cost map
+        configured_path: Final = os.getenv("LITELLM_MODEL_COST_OVERRIDES_PATH")
+        if configured_path:
+            return _MODEL_COST_MAP_ADAPTER.validate_json(Path(configured_path).read_text(encoding="utf-8"))
+
+        path: Final = files("litellm").joinpath("model_prices.local.json")
+        if not path.is_file():
+            return {}  # mutable-ok: callers merge into this public cost-map contract
+        return _MODEL_COST_MAP_ADAPTER.validate_json(path.read_text(encoding="utf-8"))
 
     @classmethod
     def _get_backup_model_count(cls) -> int:
@@ -397,7 +415,9 @@ def get_model_cost_map_loaded_at() -> "datetime | None":
     return _cost_map_source_info.loaded_at
 
 
-def _expand_model_aliases(model_cost: dict) -> dict:
+def _expand_model_aliases(
+    model_cost: ModelCostMap,  # mutable-ok: aliases are installed in the public mutable cost map
+) -> ModelCostMap:
     """
     Expand ``aliases`` lists in model cost entries into top-level entries.
 
@@ -408,14 +428,15 @@ def _expand_model_aliases(model_cost: dict) -> dict:
     If an alias collides with an existing canonical entry the alias is
     skipped and a warning is logged.
     """
-    aliases_to_add: Final[dict[str, dict]] = {}
+    aliases_to_add: Final[ModelCostMap] = {}
     keys_with_aliases: Final[list[str]] = []
 
     for model_name, model_info in model_cost.items():
-        aliases: list | None = model_info.get("aliases")
+        aliases = model_info.get(  # rebind-ok: each model has its own optional aliases
+            "aliases"
+        )
         if aliases is None:
             continue
-        keys_with_aliases.append(model_name)
         if not isinstance(aliases, list):
             verbose_logger.warning(
                 "LiteLLM model alias field for '%s' is not a list (got %s) — skipping.",
@@ -423,9 +444,12 @@ def _expand_model_aliases(model_cost: dict) -> dict:
                 type(aliases).__name__,
             )
             continue
+        keys_with_aliases.append(model_name)
         if not aliases:
             continue
         for alias in aliases:
+            if not isinstance(alias, str):
+                continue
             if alias in model_cost:
                 verbose_logger.warning(
                     "LiteLLM model alias conflict: alias '%s' (from '%s') "
@@ -452,16 +476,31 @@ def _expand_model_aliases(model_cost: dict) -> dict:
     return model_cost
 
 
-def _finalize_model_cost_map(model_cost: dict) -> dict:
+def _finalize_model_cost_map(  # mutable-ok: this consumes and returns the mutable public cost-map contract
+    model_cost: object, local_overrides: object | None = None
+) -> ModelCostMap:
     """Extract fallback generalizations out of the raw map, then expand aliases.
 
     The ``fallback_generalizations`` block is installed into the generalizations
     module and removed from the map so it is never treated as a model entry.
     """
-    raw: Final = model_cost.pop(FALLBACK_GENERALIZATIONS_KEY, None)
-    rules: Final = raw.get("rules") if isinstance(raw, dict) else None
+    validated_model_cost: Final = _MODEL_COST_MAP_ADAPTER.validate_python(model_cost)
+    overrides: Final = (
+        _MODEL_COST_MAP_ADAPTER.validate_python(local_overrides)
+        if local_overrides is not None
+        else GetModelCostMap.load_local_model_cost_overrides()
+    )
+    merged: Final = {  # mutable-ok: fallback extraction and alias expansion mutate this private working copy
+        **validated_model_cost,
+        **{  # mutable-ok: each override entry becomes a mutable public model-info object
+            model: {**validated_model_cost.get(model, {}), **override} for model, override in overrides.items()
+        },
+    }
+    raw: Final = merged.pop(FALLBACK_GENERALIZATIONS_KEY, None)
+    raw_rules: Final = raw.get("rules") if isinstance(raw, dict) else None
+    rules: Final = _FALLBACK_RULES_ADAPTER.validate_python(raw_rules) if isinstance(raw_rules, list) else None
     set_fallback_generalizations(rules)
-    return _expand_model_aliases(model_cost)
+    return _expand_model_aliases(merged)
 
 
 def get_model_cost_map(
