@@ -43,7 +43,27 @@ export interface CacheLeakageRow {
 export interface CacheLeakageResult {
   rows: CacheLeakageRow[];
   netSavingsPerCachedToken: number | null;
+  hasUsage: boolean;
 }
+
+export type CacheLeakageSortColumn = "uncachedPromptTokens" | "cacheHitRatio" | "potentialSavings";
+
+export interface CacheLeakageSort {
+  column: CacheLeakageSortColumn;
+  dir: "asc" | "desc";
+}
+
+export const sortCacheLeakageRows = (rows: readonly CacheLeakageRow[], sort: CacheLeakageSort): CacheLeakageRow[] =>
+  [...rows].sort((a, b) => {
+    const av = a[sort.column];
+    const bv = b[sort.column];
+    if (av == null && bv == null) {
+      return sort.column === "potentialSavings" ? b.uncachedPromptTokens - a.uncachedPromptTokens : 0;
+    }
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return sort.dir === "asc" ? av - bv : bv - av;
+  });
 
 interface LeakageAccumulator {
   alias: string | null;
@@ -137,15 +157,11 @@ const toLeakageRow = (
   };
 };
 
-const sortAndLimit = (rows: CacheLeakageRow[], rate: number | null, limit: number): CacheLeakageRow[] =>
-  rows
-    .filter((row) => row.uncachedPromptTokens > 0)
-    .sort((x, y) =>
-      rate != null
-        ? (y.potentialSavings ?? 0) - (x.potentialSavings ?? 0)
-        : y.uncachedPromptTokens - x.uncachedPromptTokens,
-    )
-    .slice(0, limit);
+const sortAndLimit = (rows: CacheLeakageRow[], limit: number): CacheLeakageRow[] =>
+  sortCacheLeakageRows(
+    rows.filter((row) => row.uncachedPromptTokens > 0),
+    { column: "potentialSavings", dir: "desc" },
+  ).slice(0, limit);
 
 export const leakageRowsFromKeyRows = (
   rows: readonly KeySpendActivityRow[],
@@ -163,7 +179,6 @@ export const leakageRowsFromKeyRows = (
       };
       return toLeakageRow(row.api_key, metrics, rate, "key");
     }),
-    rate,
     limit,
   );
 
@@ -187,15 +202,23 @@ export const computeCacheLeakage = (
   // traffic where the net is negative, would flip the sign of a real loss into a saving
   const netSavingsPerCachedToken = totals.cachedTokens > 0 ? totals.realizedCachingSavings / totals.cachedTokens : null;
   // A non-positive rate prices no leakage: there is no saving to extrapolate from
-  const rate = netSavingsPerCachedToken != null && netSavingsPerCachedToken > 0 ? netSavingsPerCachedToken : null;
+  const portfolioRate =
+    dimension === "key" && netSavingsPerCachedToken != null && netSavingsPerCachedToken > 0
+      ? netSavingsPerCachedToken
+      : null;
 
-  const rows = sortAndLimit(
-    [...byEntity.entries()].map(([id, a]) => toLeakageRow(id, a, rate, dimension)),
-    rate,
-    limit,
-  );
-
-  return { rows, netSavingsPerCachedToken };
+  const rows: CacheLeakageRow[] = [...byEntity.entries()].map(([id, a]) => {
+    const entityCachedTokens = a.cacheReadTokens + a.cacheCreationTokens;
+    const candidateRate =
+      dimension === "model" && entityCachedTokens > 0 ? a.realizedCachingSavings / entityCachedTokens : portfolioRate;
+    const entityRate = candidateRate != null && candidateRate > 0 ? candidateRate : null;
+    return toLeakageRow(id, a, entityRate, dimension);
+  });
+  return {
+    rows: sortAndLimit(rows, limit),
+    netSavingsPerCachedToken,
+    hasUsage: byEntity.size > 0,
+  };
 };
 
 export interface DailyToolSpendPoint {

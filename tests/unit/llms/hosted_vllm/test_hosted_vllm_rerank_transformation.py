@@ -20,6 +20,7 @@ from litellm.types.rerank import (
     RerankResponseResult,
     RerankTokens,
 )
+from litellm.types.utils import ModelInfo
 
 
 class TestHostedVLLMRerankTransform:
@@ -293,3 +294,20 @@ class TestHostedVLLMRerankTruncationParams:
         assert mock_post.call_args.kwargs["url"] == "http://vllm.local:8000/rerank"
         assert sent_body["truncate_prompt_tokens"] == 512
         assert sent_body["truncation_side"] == "left"
+
+
+@pytest.mark.parametrize("rate", (0.0, 0.001, None))
+def test_rerank_cost_uses_reported_input_tokens_and_preserves_query_fallback(rate: float | None) -> None:
+    query_rate: Final = 0.02
+    total_tokens: Final = 75
+    search_units: Final = 2
+    info: Final[ModelInfo] = (
+        {"input_cost_per_token": rate}
+        if rate is not None
+        else {"input_cost_per_token": 0.0, "input_cost_per_query": query_rate}
+    )
+    billed: Final = RerankBilledUnits(total_tokens=total_tokens, search_units=search_units)
+    expected: Final = rate * total_tokens if rate is not None else query_rate * search_units
+    assert HostedVLLMRerankConfig().calculate_rerank_cost(
+        model="fixture-reranker", custom_llm_provider="hosted_vllm", billed_units=billed, model_info=info
+    ) == pytest.approx((expected, 0.0))
