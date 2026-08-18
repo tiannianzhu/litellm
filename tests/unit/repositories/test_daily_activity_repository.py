@@ -126,6 +126,9 @@ class _FakeTable:
         self.find_many_calls.append(where)
         self.pagination_calls.append((skip, take, order))
         if "token" not in where:
+            date_filter: Final = where.get("date")
+            if isinstance(date_filter, Mapping) and "in" in date_filter:
+                return tuple(row for row in self.rows if getattr(row, "date", None) in date_filter["in"])
             return self.rows
         token_filter: Final = where["token"]
         if not isinstance(token_filter, Mapping):
@@ -480,7 +483,7 @@ async def test_aggregated_passes_api_key_limit_to_entity_rollup_query() -> None:
 async def test_daily_rows_selects_the_table_and_applies_filters_and_pagination(
     table: DailyActivityTable, entity_field: str
 ) -> None:
-    database = _FakeDatabase()
+    database = _FakeDatabase((({"date": "2026-01-02", "total_count": 1},),))
     repository, _ = _repository(database)
     scope = _scope(
         table=table,
@@ -493,7 +496,7 @@ async def test_daily_rows_selects_the_table_and_applies_filters_and_pagination(
     result = await repository.daily_rows(scope, page=3, page_size=2)
 
     expected_where: Final = {
-        "date": {"gte": "2026-01-01", "lte": "2026-01-31"},
+        "date": {"in": ["2026-01-02"]},
         entity_field: {"in": ["entity-1"]},
         "OR": [{entity_field: None}, {entity_field: {"not": {"in": ["excluded-1"]}}}],
         "model": "model-1",
@@ -509,28 +512,59 @@ async def test_daily_rows_selects_the_table_and_applies_filters_and_pagination(
     }
     selected_table: Final = tables[table]
 
-    assert result.total_count == 0
+    assert result.total_count == 1
     assert result.rows == ()
-    assert selected_table.count_calls == [expected_where]
+    assert selected_table.count_calls == []
     assert selected_table.find_many_calls == [expected_where]
-    assert selected_table.pagination_calls == [(4, 2, ({"date": "desc"}, {"id": "asc"}))]
+    assert selected_table.pagination_calls == [(None, None, ({"date": "desc"}, {"id": "asc"}))]
     assert sum(len(daily_table.find_many_calls) for daily_table in tables.values()) == 1
 
 
 @pytest.mark.asyncio
 async def test_daily_rows_exclusion_without_entity_filter_keeps_null_entity_rows() -> None:
-    database = _FakeDatabase()
+    database = _FakeDatabase((({"date": "2026-01-02", "total_count": 1},),))
     repository, _ = _repository(database)
     scope = _scope(table=DailyActivityTable.TEAM, entity_ids=None, exclude_entity_ids=("litellm-dashboard",))
 
     await repository.daily_rows(scope, page=1, page_size=10)
 
     expected_where: Final = {
-        "date": {"gte": "2026-01-01", "lte": "2026-01-31"},
+        "date": {"in": ["2026-01-02"]},
         "OR": [{"team_id": None}, {"team_id": {"not": {"in": ["litellm-dashboard"]}}}],
     }
-    assert database.litellm_dailyteamspend.count_calls == [expected_where]
+    assert database.litellm_dailyteamspend.count_calls == []
     assert database.litellm_dailyteamspend.find_many_calls == [expected_where]
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeDailyRow:
+    id: str
+    date: str
+
+
+@pytest.mark.asyncio
+async def test_daily_rows_keeps_every_row_for_each_paginated_date() -> None:
+    first: Final = _FakeDailyRow("first", "2026-01-02")
+    second: Final = _FakeDailyRow("second", "2026-01-02")
+    third: Final = _FakeDailyRow("third", "2026-01-01")
+    database: Final = _FakeDatabase(
+        (
+            ({"date": first.date, "total_count": 2},),
+            ({"date": third.date, "total_count": 2},),
+            ({"date": None, "total_count": 2},),
+        )
+    )
+    database.litellm_dailyuserspend = _FakeTable((first, second, third))
+    repository, _ = _repository(database)
+
+    first_page: Final = await repository.daily_rows(_scope(), page=1, page_size=1)
+    second_page: Final = await repository.daily_rows(_scope(), page=2, page_size=1)
+    empty_page: Final = await repository.daily_rows(_scope(), page=3, page_size=1)
+
+    assert first_page.rows == (first, second)
+    assert second_page.rows == (third,)
+    assert empty_page.rows == ()
+    assert (first_page.total_count, second_page.total_count, empty_page.total_count) == (2, 2, 2)
 
 
 @pytest.mark.asyncio

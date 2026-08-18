@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import groupby
 from types import MappingProxyType
@@ -24,6 +25,7 @@ from litellm.repositories.daily_activity_sql import (
     build_key_page_sql,
     build_key_search_sql,
     build_model_top_keys_sql,
+    build_paginated_dates_sql,
 )
 from litellm.repositories.prisma_protocols import TableActions
 from litellm.types.repositories.daily_activity import (
@@ -89,6 +91,13 @@ class DailyActivityDatabase(Protocol):
     def db(self) -> _DailyActivityDatabase: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _DatePageRow:
+    date: str | None
+    total_count: int
+
+
+_DATE_PAGE_ADAPTER: Final = TypeAdapter(tuple[_DatePageRow, ...])
 _GROUPING_ADAPTER: Final = TypeAdapter(tuple[GroupingSetsRow, ...])
 _ENTITY_ADAPTER: Final = TypeAdapter(tuple[EntityRollupRow, ...])
 _KEY_SPEND_ADAPTER: Final = TypeAdapter(tuple[KeySpendRow, ...])
@@ -304,13 +313,16 @@ class DailyActivityRepository:
             **({"model": scope.model} if scope.model else {}),
             **({"api_key": {"in": list(scope.api_keys)}} if scope.api_keys is not None else {}),
         }
-        count, rows = await asyncio.gather(
-            table.count(where=conditions),
-            table.find_many(
-                where=conditions,
-                skip=(page - 1) * page_size,
-                take=page_size,
-                order=({"date": "desc"}, {"id": "asc"}),
-            ),
+        date_page: Final = _DATE_PAGE_ADAPTER.validate_python(
+            await self._query(build_paginated_dates_sql(scope, page=page, page_size=page_size))
         )
-        return DailyRowsPage(total_count=count, rows=tuple(rows))
+        dates: Final = tuple(row.date for row in date_page if row.date is not None)
+        rows: Final = (
+            await table.find_many(
+                where={**conditions, "date": {"in": list(dates)}},
+                order=({"date": "desc"}, {"id": "asc"}),
+            )
+            if dates
+            else ()
+        )
+        return DailyRowsPage(total_count=date_page[0].total_count if date_page else 0, rows=tuple(rows))
