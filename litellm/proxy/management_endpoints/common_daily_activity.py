@@ -6,7 +6,8 @@ from types import MappingProxyType, SimpleNamespace
 from typing import TYPE_CHECKING, Final, Protocol
 
 from fastapi import HTTPException, status
-from typing_extensions import ReadOnly, TypedDict
+from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict, runtime_checkable
 
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import PTU_SENTINEL_API_KEY
@@ -50,6 +51,15 @@ _PRISMA_TO_PG_TABLE: Final[Mapping[str, str]] = {
     "litellm_dailyagentspend": "LiteLLM_DailyAgentSpend",
     "litellm_dailytagspend": "LiteLLM_DailyTagSpend",
 }
+
+
+class _DateRow(TypedDict, total=False):
+    date: ReadOnly[object]
+    total_count: ReadOnly[object]
+
+
+_DATE_ROWS_ADAPTER: Final = TypeAdapter(list[_DateRow])
+_INT_ADAPTER: Final = TypeAdapter(int)
 
 
 class DailySpendRecord(Protocol):
@@ -112,6 +122,11 @@ class DailySpendRecord(Protocol):
 
     @property
     def failed_requests(self) -> int: ...
+
+
+@runtime_checkable
+class _DailySpendTable(Protocol):
+    async def find_many(self, *, where: object, order: object) -> Sequence[DailySpendRecord]: ...
 
 
 class _KeyMetadataDict(TypedDict, total=False):
@@ -538,11 +553,11 @@ def _adjust_dates_for_timezone(
 def _build_where_conditions(
     *,
     entity_id_field: str,
-    entity_id: str | list[str] | None,
+    entity_id: str | list[str] | None,  # mutable-ok: public query filter accepts repeated entity IDs
     start_date: str,
     end_date: str,
     model: str | None,
-    api_key: str | list[str] | None,
+    api_key: str | list[str] | None,  # mutable-ok: public query filter accepts repeated API keys
     exclude_entity_ids: list[str] | None = None,
     timezone_offset_minutes: int | None = None,
     include_current_utc_day: bool = False,
@@ -827,6 +842,62 @@ def _build_entity_rollup_sql_query(
         )
     """
 
+    return sql_query, sql_params
+
+
+def _build_paginated_dates_sql_query(
+    *,
+    table_name: str,
+    entity_id_field: str,
+    entity_id: str | list[str] | None,
+    start_date: str,
+    end_date: str,
+    model: str | None,
+    api_key: str | list[str] | None,
+    page: int,
+    page_size: int,
+    exclude_entity_ids: list[str] | None = None,  # mutable-ok: caller supplies the exclusion filter list
+) -> tuple[str, list[str | int]]:  # mutable-ok: asyncpg consumes an ordered mutable parameter list
+    pg_table: Final = _PRISMA_TO_PG_TABLE.get(table_name)
+    if pg_table is None:
+        raise ValueError(f"Unknown table name: {table_name}")
+
+    effective_api_key: Final = None if not api_key else api_key
+    where_clause, where_params = _build_aggregated_where_clause(
+        entity_id_field=entity_id_field,
+        entity_id=entity_id,
+        adjusted_start=start_date,
+        adjusted_end=end_date,
+        model=model,
+        api_key=effective_api_key,
+        exclude_entity_ids=exclude_entity_ids,
+    )
+    limit_parameter: Final = len(where_params) + 1
+    offset_parameter: Final = limit_parameter + 1
+    sql_params: Final[list[str | int]] = [  # mutable-ok: asyncpg variadic parameters require ordered values
+        *where_params,
+        page_size,
+        (page - 1) * page_size,
+    ]
+    sql_query: Final = f"""
+        WITH grouped_dates AS (
+            SELECT date
+            FROM "{pg_table}"
+            WHERE {where_clause}
+            GROUP BY date
+        ),
+        page_dates AS (
+            SELECT date
+            FROM grouped_dates
+            ORDER BY date DESC
+            LIMIT ${limit_parameter}
+            OFFSET ${offset_parameter}
+        )
+        SELECT page_dates.date, totals.total_count
+        FROM (SELECT COUNT(*)::bigint AS total_count FROM grouped_dates) AS totals
+        LEFT JOIN page_dates ON TRUE
+        ORDER BY page_dates.date DESC
+    """
     return sql_query, sql_params
 
 
@@ -1155,27 +1226,49 @@ async def get_daily_activity(
             include_current_utc_day=include_current_utc_day,
         )
 
-        # Get total count for pagination
-        total_count: Final[int] = await getattr(prisma_client.db, table_name).count(where=where_conditions)
-
-        # Fetch paginated results.
-        # ``date`` alone is not a unique sort key -- a busy tenant has many
-        # rows per date (one per api_key, model, model_group, provider,
-        # endpoint, ...), so offset pagination over ``date desc`` lands on
-        # arbitrary boundaries and the same row can be skipped on one page
-        # and returned on another. A client that pages through and sums the
-        # per-page metrics (the Usage dashboard) then gets a non-deterministic
-        # total. Adding ``id`` (the row's UUID primary key, present on both
-        # LiteLLM_DailyUserSpend and LiteLLM_DailyTeamSpend) as a tiebreaker
-        # gives every page a stable cursor (#30164).
-        daily_spend_data: Final[Sequence[DailySpendRecord]] = await getattr(prisma_client.db, table_name).find_many(
-            where=where_conditions,
-            order=[
-                {"date": "desc"},
-                {"id": "asc"},
-            ],
-            skip=(page - 1) * page_size,
-            take=page_size,
+        adjusted_start, adjusted_end = _adjust_dates_for_timezone(
+            start_date, end_date, timezone_offset_minutes, include_current_utc_day
+        )
+        dates_sql, dates_params = _build_paginated_dates_sql_query(
+            table_name=table_name,
+            entity_id_field=entity_id_field,
+            entity_id=entity_id,
+            start_date=adjusted_start,
+            end_date=adjusted_end,
+            model=model,
+            api_key=api_key,
+            page=page,
+            page_size=page_size,
+            exclude_entity_ids=exclude_entity_ids,
+        )
+        date_rows: Final = _DATE_ROWS_ADAPTER.validate_python(
+            await prisma_client.db.query_raw(dates_sql, *dates_params)
+        )
+        total_count: Final = (
+            _INT_ADAPTER.validate_python(date_rows[0]["total_count"])
+            if date_rows and "total_count" in date_rows[0]
+            else 0
+        )
+        page_dates: Final = [  # mutable-ok: Prisma `in` filter expects a JSON-compatible list
+            str(row["date"]) for row in date_rows if "date" in row and row["date"] is not None
+        ]
+        page_where_conditions: Final = {  # mutable-ok: Prisma where input is a nested mutable JSON object
+            **where_conditions,
+            "date": {"in": page_dates},
+        }
+        daily_spend_table: Final = getattr(prisma_client.db, table_name)
+        if not isinstance(daily_spend_table, _DailySpendTable):
+            raise TypeError(f"Prisma table accessor {table_name!r} does not provide find_many")
+        daily_spend_data: Final[Sequence[DailySpendRecord]] = (
+            await daily_spend_table.find_many(
+                where=page_where_conditions,
+                order=[  # mutable-ok: Prisma order input is a list of JSON objects
+                    {"date": "desc"},
+                    {"id": "asc"},
+                ],
+            )
+            if page_dates
+            else ()
         )
 
         resolved_entity_metadata = entity_metadata_field

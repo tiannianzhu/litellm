@@ -26,6 +26,41 @@ from litellm.types.proxy.management_endpoints.common_daily_activity import (
 
 
 @pytest.mark.asyncio
+async def test_get_daily_activity_accepts_dynamically_forwarded_query_raw():
+    """PrismaWrapper exposes query_raw through __getattr__, not on its class."""
+    query_raw = AsyncMock(return_value=[{"date": None, "total_count": 0}])
+    mock_table = MagicMock()
+    mock_table.find_many = AsyncMock(return_value=[])
+
+    class DynamicDatabase:
+        def __getattr__(self, name: str) -> object:
+            if name == "query_raw":
+                return query_raw
+            if name == "litellm_dailyteamspend":
+                return mock_table
+            raise AttributeError(name)
+
+    mock_prisma = MagicMock()
+    mock_prisma.db = DynamicDatabase()
+    result = await get_daily_activity(
+        prisma_client=mock_prisma,
+        table_name="litellm_dailyteamspend",
+        entity_id_field="team_id",
+        entity_id=None,
+        entity_metadata_field=None,
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        model=None,
+        api_key=None,
+        page=1,
+        page_size=10,
+    )
+
+    query_raw.assert_awaited_once()
+    assert result.results == []
+
+
+@pytest.mark.asyncio
 async def test_get_daily_activity_empty_entity_id_list():
     # Mock PrismaClient
     mock_prisma = MagicMock()
@@ -35,16 +70,17 @@ async def test_get_daily_activity_empty_entity_id_list():
     mock_table = MagicMock()
     mock_table.count = AsyncMock(return_value=0)
     mock_table.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": None, "total_count": 0}])
     mock_prisma.db.litellm_verificationtoken = MagicMock()
     mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
 
     # Set the table name dynamically
-    mock_prisma.db.litellm_dailyspend = mock_table
+    mock_prisma.db.litellm_dailyteamspend = mock_table
 
     # Call the function with empty entity_id list
-    result = await get_daily_activity(
+    await get_daily_activity(
         prisma_client=mock_prisma,
-        table_name="litellm_dailyspend",
+        table_name="litellm_dailyteamspend",
         entity_id_field="team_id",
         entity_id=[],
         entity_metadata_field=None,
@@ -56,42 +92,59 @@ async def test_get_daily_activity_empty_entity_id_list():
         page_size=10,
     )
 
-    # Verify the where conditions were set correctly
-    mock_table.find_many.assert_called_once()
-    call_args = mock_table.find_many.call_args[1]
-    where_conditions = call_args["where"]
-
-    # Check that team_id is set to empty list
-    assert "team_id" in where_conditions
-    assert where_conditions["team_id"] == {"in": []}
+    sql, *params = mock_prisma.db.query_raw.await_args.args
+    assert "FALSE" in sql
+    assert '"team_id" IN ()' not in sql
+    assert params == ["2024-01-01", "2024-01-02", 10, 0]
+    mock_table.find_many.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_get_daily_activity_order_has_id_tiebreaker():
-    """Regression for #30164.
+async def test_get_daily_activity_empty_api_key_list_does_not_filter():
+    mock_prisma = MagicMock()
+    mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-02", "total_count": 1}])
 
-    ``date`` alone is not a unique sort key for either
-    ``LiteLLM_DailyUserSpend`` or ``LiteLLM_DailyTeamSpend`` -- a busy
-    tenant has many rows per date (one per api_key, model, model_group,
-    provider, endpoint, ...).  Offset pagination over a non-unique sort
-    landed on arbitrary page boundaries between queries, so summing
-    per-page totals across pages produced non-deterministic results
-    (sometimes inflated, sometimes deflated).  The tiebreaker on the
-    UUID primary key pins the row order so a client paging through all
-    results gets the correct total.
-    """
+    mock_table = MagicMock()
+    mock_table.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_dailyteamspend = mock_table
+
+    await get_daily_activity(
+        prisma_client=mock_prisma,
+        table_name="litellm_dailyteamspend",
+        entity_id_field="team_id",
+        entity_id=None,
+        entity_metadata_field=None,
+        start_date="2024-01-01",
+        end_date="2024-01-02",
+        model=None,
+        api_key=[],
+        page=1,
+        page_size=10,
+    )
+
+    sql, *params = mock_prisma.db.query_raw.await_args.args
+    assert "FALSE" not in sql
+    assert params == ["2024-01-01", "2024-01-02", 10, 0]
+    assert mock_table.find_many.await_args.kwargs["where"]["date"] == {"in": ["2024-01-02"]}
+
+
+@pytest.mark.asyncio
+async def test_get_daily_activity_orders_rows_within_selected_dates():
+    """Rows sharing a selected date have a stable order."""
     mock_prisma = MagicMock()
     mock_prisma.db = MagicMock()
     mock_table = MagicMock()
     mock_table.count = AsyncMock(return_value=0)
     mock_table.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-02", "total_count": 1}])
     mock_prisma.db.litellm_verificationtoken = MagicMock()
     mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
-    mock_prisma.db.litellm_dailyspend = mock_table
+    mock_prisma.db.litellm_dailyteamspend = mock_table
 
     await get_daily_activity(
         prisma_client=mock_prisma,
-        table_name="litellm_dailyspend",
+        table_name="litellm_dailyteamspend",
         entity_id_field="team_id",
         entity_id="team-1",
         entity_metadata_field=None,
@@ -105,9 +158,45 @@ async def test_get_daily_activity_order_has_id_tiebreaker():
 
     mock_table.find_many.assert_called_once()
     order = mock_table.find_many.call_args[1]["order"]
-    assert order == [{"date": "desc"}, {"id": "asc"}], (
-        f"order must include the id tiebreaker after date for stable offset pagination (see #30164); got {order!r}"
+    assert order == [{"date": "desc"}, {"id": "asc"}]
+
+
+@pytest.mark.asyncio
+async def test_get_daily_activity_paginates_grouped_dates_in_database():
+    mock_prisma = MagicMock()
+    mock_prisma.db = MagicMock()
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-02", "total_count": 3}])
+
+    mock_table = MagicMock()
+    mock_table.find_many = AsyncMock(return_value=[])
+    mock_prisma.db.litellm_dailyteamspend = mock_table
+
+    result = await get_daily_activity(
+        prisma_client=mock_prisma,
+        table_name="litellm_dailyteamspend",
+        entity_id_field="team_id",
+        entity_id="team-1",
+        entity_metadata_field=None,
+        start_date="2024-01-01",
+        end_date="2024-01-03",
+        model=None,
+        api_key=None,
+        page=2,
+        page_size=1,
     )
+
+    sql, *params = mock_prisma.db.query_raw.await_args.args
+    assert 'FROM "LiteLLM_DailyTeamSpend"' in sql
+    assert "GROUP BY date" in sql
+    assert "LIMIT $4" in sql
+    assert "OFFSET $5" in sql
+    assert params == ["2024-01-01", "2024-01-03", "team-1", 1, 1]
+
+    find_many_where = mock_table.find_many.await_args.kwargs["where"]
+    assert find_many_where["date"] == {"in": ["2024-01-02"]}
+    assert result.metadata.page == 2
+    assert result.metadata.total_pages == 3
+    assert result.metadata.has_more is True
 
 
 def test_is_user_agent_tag():
@@ -664,6 +753,7 @@ async def test_tag_daily_activity_metadata_totals_not_zero():
     mock_table = MagicMock()
     mock_table.count = AsyncMock(return_value=2)
     mock_table.find_many = AsyncMock(return_value=[mock_record_1, mock_record_2])
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-01", "total_count": 1}])
     mock_prisma.db.litellm_dailytagspend = mock_table
     mock_prisma.db.litellm_verificationtoken = MagicMock()
     mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
@@ -835,6 +925,7 @@ async def test_get_daily_activity_applies_resolve_entity_metadata_to_breakdown()
     mock_table = MagicMock()
     mock_table.count = AsyncMock(return_value=len(records))
     mock_table.find_many = AsyncMock(return_value=records)
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-01", "total_count": 1}])
     mock_prisma.db.litellm_dailyuserspend = mock_table
     mock_prisma.db.litellm_verificationtoken = MagicMock()
     mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
@@ -889,8 +980,8 @@ async def test_model_groups_breakdown_keys_by_public_name_with_model_fallback():
     ]
 
     mock_table = MagicMock()
-    mock_table.count = AsyncMock(return_value=len(records))
     mock_table.find_many = AsyncMock(return_value=records)
+    mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2024-01-01", "total_count": 1}])
     mock_prisma.db.litellm_dailyuserspend = mock_table
     mock_prisma.db.litellm_verificationtoken = MagicMock()
     mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[])
@@ -1844,6 +1935,7 @@ class TestPtuCostAttributionDisabled:
 
         mock_prisma = MagicMock()
         mock_prisma.db = MagicMock()
+        mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2026-07-01", "total_count": 1}])
         mock_table = MagicMock()
         mock_table.count = AsyncMock(return_value=2)
         mock_table.find_many = AsyncMock(
@@ -1882,6 +1974,7 @@ class TestPtuCostAttributionDisabled:
 
         mock_prisma = MagicMock()
         mock_prisma.db = MagicMock()
+        mock_prisma.db.query_raw = AsyncMock(return_value=[{"date": "2026-07-01", "total_count": 1}])
         mock_table = MagicMock()
         mock_table.count = AsyncMock(return_value=2)
         mock_table.find_many = AsyncMock(
