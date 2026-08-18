@@ -5,6 +5,7 @@ plus the LiteLLM_DailyToolSpend rollup in one transaction.
 """
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+import litellm
 from litellm.proxy.db import rollup_lock_timeout, spend_log_tool_index
 from litellm.proxy.db.log_db_metrics import record_db_io
 from litellm.proxy.db.rollup_lock_timeout import ROLLUP_LOCK_TIMEOUT_SQL
@@ -107,14 +109,20 @@ class TestBuildToolUsageTransaction:
         assert transaction is not None
         assert transaction.tool_names == ("srv/tool_a", "tool_b")
 
-    def test_date_matches_daily_spend_writer_derivation(self):
-        # The daily spend writer derives its date bucket as
-        # payload["startTime"].split("T")[0] (db_spend_update_writer.py), i.e. the
-        # timestamp's own calendar date, NOT the astimezone-UTC date. A non-UTC
-        # isoformat pins the difference: 2026-07-25T22:00:00-07:00 is 2026-07-26
-        # in UTC but must bucket as 2026-07-25 to match LiteLLM_DailyUserSpend.
-        start_time_iso = "2026-07-25T22:00:00-07:00"
-        transaction = build_tool_usage_transaction(
+    @pytest.mark.parametrize(
+        ("start_time_iso", "expected_day", "expected_instant"),
+        (
+            ("2026-05-01T15:59:59.999999Z", "2026-05-01", "2026-05-01T15:59:59.999999+00:00"),
+            ("2026-05-01T16:00:00Z", "2026-05-02", "2026-05-01T16:00:00+00:00"),
+            ("2026-05-01T09:00:00-07:00", "2026-05-02", "2026-05-01T16:00:00+00:00"),
+            ("2026-05-01 16:00:00", "2026-05-02", "2026-05-01T16:00:00+00:00"),
+        ),
+    )
+    def test_date_uses_business_timezone_without_changing_index_timestamp(
+        self, monkeypatch: pytest.MonkeyPatch, start_time_iso: str, expected_day: str, expected_instant: str
+    ) -> None:
+        monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+        transaction: Final = build_tool_usage_transaction(
             request_id="r1",
             start_time_iso=start_time_iso,
             mcp_namespaced_tool_name="srv/tool_a",
@@ -123,7 +131,8 @@ class TestBuildToolUsageTransaction:
             completion_response=None,
         )
         assert transaction is not None
-        assert transaction.date == start_time_iso.split("T")[0] == "2026-07-25"
+        assert transaction.date == expected_day
+        assert transaction.start_time == datetime.fromisoformat(expected_instant)
 
     def test_realtime_tool_calls_reach_the_transaction(self):
         # Realtime sessions carry invoked tools in kwargs["realtime_tool_calls"]

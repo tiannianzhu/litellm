@@ -1,12 +1,13 @@
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Final
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
+import litellm
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.proxy.db import rollup_lock_timeout
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
@@ -95,6 +96,14 @@ def test_build_model_usage_transaction_keys_on_day_model_and_task() -> None:
         completion_tokens=20,
         successful=False,
     )
+
+
+def test_model_usage_uses_the_configured_business_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    transaction: Final = build_model_usage_transaction(_payload(startTime="2026-05-01T16:00:00Z"))
+
+    assert transaction is not None
+    assert transaction.key.date == "2026-05-02"
 
 
 def test_build_model_usage_transaction_falls_back_for_missing_model_fields() -> None:

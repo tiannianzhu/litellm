@@ -6,13 +6,14 @@ LiteLLM_DailyGatewayRequests.
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from itertools import chain
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import litellm
 from litellm.constants import (
     GATEWAY_REQUESTS_MAX_ROWS_PER_UPSERT,
     MAX_REDIS_BUFFER_DEQUEUE_COUNT,
@@ -81,25 +82,35 @@ def test_folds_failed_status_codes_into_distinct_keys_for_the_same_route():
     }
 
 
-def test_records_each_request_under_the_date_of_its_clock_read():
+@pytest.mark.parametrize(
+    ("business_timezone", "midnight"),
+    (
+        (None, datetime(2026, 2, 1, tzinfo=timezone.utc)),
+        ("Asia/Shanghai", datetime(2026, 1, 31, 16, tzinfo=timezone.utc)),
+    ),
+)
+def test_records_successes_and_failures_across_business_midnight(
+    monkeypatch: pytest.MonkeyPatch, business_timezone: str | None, midnight: datetime
+) -> None:
+    monkeypatch.setattr(litellm, "timezone", business_timezone, raising=False)
     accumulator: Final = GatewayRequestAccumulator(
         clock=iter(
             (
-                datetime(2026, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
-                datetime(2026, 2, 1, 0, 0, 0, 1, tzinfo=timezone.utc),
+                midnight - timedelta(microseconds=1),
+                midnight,
             )
         ).__next__
     )
     _record(accumulator, 200)
-    _record(accumulator, 200)
+    _record(accumulator, 503)
 
     assert accumulator.drain() == {
         GatewayRequestKey(
             date="2026-01-31", category="llm", route="/chat/completions", status_code=200
         ): GatewayRequestCounts(successful_requests=1, failed_requests=0),
         GatewayRequestKey(
-            date="2026-02-01", category="llm", route="/chat/completions", status_code=200
-        ): GatewayRequestCounts(successful_requests=1, failed_requests=0),
+            date="2026-02-01", category="llm", route="/chat/completions", status_code=503
+        ): GatewayRequestCounts(successful_requests=0, failed_requests=1),
     }
 
 

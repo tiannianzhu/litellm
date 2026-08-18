@@ -10,8 +10,7 @@ import {
 import { DailyData } from "@/components/UsagePage/types";
 import { spendScopeUserId } from "@/utils/roles";
 import { useAggregatedDailyActivity } from "@/app/(dashboard)/usage/_components/hooks/useAggregatedDailyActivity";
-
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+import { presetRange } from "@/components/shared/date_range_presets";
 
 export interface DateRange {
   from?: Date;
@@ -39,9 +38,7 @@ export interface DailyActivityRange {
 export type ActivityDateRange = Pick<DailyActivityRange, "dateValue" | "onDateChange">;
 
 export const useActivityDateRange = (): ActivityDateRange => {
-  const initialFrom = useMemo(() => new Date(new Date().getTime() - THIRTY_DAYS_MS), []);
-  const initialTo = useMemo(() => new Date(), []);
-  const [dateValue, setDateValue] = useState<DateRange>({ from: initialFrom, to: initialTo });
+  const [dateValue, setDateValue] = useState<DateRange>(() => presetRange("last_30_days"));
   return { dateValue, onDateChange: setDateValue };
 };
 
@@ -68,7 +65,6 @@ export const useScopedDailyActivityRange = (
             endTime,
             entityIds: userId ? [userId] : null,
             apiKey,
-            includeCurrentUtcDay: true,
           }
         : null,
     [accessToken, startTime, endTime, userId, apiKey],

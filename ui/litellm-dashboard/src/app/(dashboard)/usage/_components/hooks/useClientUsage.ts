@@ -17,7 +17,7 @@ interface ClientUsageOptions {
   client: UsageClient | null;
 }
 
-const utcSecond = (time: number) => new Date(time).toISOString().slice(0, 19).replace("T", " ");
+const utcTimestamp = (time: number) => new Date(time).toISOString().slice(0, -1).replace("T", " ");
 
 export function useClientUsage({ accessToken, startTime, endTime, userId, teamId = null, client }: ClientUsageOptions) {
   const start = startTime?.getTime() ?? Number.NaN;
@@ -43,8 +43,8 @@ export function useClientUsage({ accessToken, startTime, endTime, userId, teamId
     const scope = { userId, teamId, client, startTime: new Date(start), endTime: new Date(end) };
     const request = {
       accessToken,
-      start_date: utcSecond(Math.floor(start / 1000) * 1000),
-      end_date: utcSecond(Math.ceil(end / 1000) * 1000),
+      start_date: utcTimestamp(start),
+      end_date: utcTimestamp(end),
       page: 1,
       page_size: CLIENT_REQUEST_LIMIT,
       params: {

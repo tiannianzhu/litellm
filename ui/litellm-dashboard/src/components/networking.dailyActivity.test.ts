@@ -59,7 +59,7 @@ describe("dailyActivityAggregatedCall", () => {
     expect(url.searchParams.get(param)).toBe(expected);
     expect(url.searchParams.get("start_date")).toBe("2025-01-05");
     expect(url.searchParams.get("end_date")).toBe("2025-01-31");
-    expect(url.searchParams.has("timezone")).toBe(true);
+    expect(url.searchParams.has("timezone")).toBe(false);
     expect(url.searchParams.has("page")).toBe(false);
     expect(url.searchParams.has("page_size")).toBe(false);
   });

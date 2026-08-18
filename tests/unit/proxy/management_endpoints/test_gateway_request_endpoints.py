@@ -7,6 +7,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+import litellm
 from litellm.models.gateway_activity import GatewayRouteActivity, GatewayStatusCodeActivity
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -28,7 +29,7 @@ from litellm.repositories.gateway_activity_repository import GatewayActivityRepo
 # A date in the past on purpose. Pinning "today" would let these assertions pass
 # on a day the fixture silently failed to patch, which is the same vacuous pass a
 # mutation check exists to catch.
-_FROZEN_NOW = datetime(2023, 3, 15, 12, 0, tzinfo=timezone.utc)
+_FROZEN_NOW = datetime(2023, 3, 15, 17, 0, tzinfo=timezone.utc)
 _FROZEN_RANGE = ("2023-02-13", "2023-03-15")
 
 
@@ -77,8 +78,19 @@ class TestDefaultRange:
         span = datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")
         assert span == timedelta(days=30)
 
-    def test_ends_today_in_utc(self, frozen_clock):
-        assert _default_range() == _FROZEN_RANGE
+    @pytest.mark.parametrize(
+        ("business_timezone", "expected_range"),
+        ((None, _FROZEN_RANGE), ("Asia/Shanghai", ("2023-02-14", "2023-03-16"))),
+    )
+    def test_ends_today_in_the_business_timezone(
+        self,
+        frozen_clock: None,
+        monkeypatch: pytest.MonkeyPatch,
+        business_timezone: str | None,
+        expected_range: tuple[str, str],
+    ) -> None:
+        monkeypatch.setattr(litellm, "timezone", business_timezone, raising=False)
+        assert _default_range() == expected_range
 
 
 class TestFoldByDate:

@@ -46,6 +46,7 @@ import { extractMcpEntitlement } from "@/components/mcp_server_management/mcpEnt
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import ScopedSavingsTab from "@/components/shared/ScopedSavingsTab";
 import { AutoRouterUsageView } from "@/app/(dashboard)/cost-optimization/_components/AutoRouterBenchmarksTab";
+import { useAutoRouterDateRange } from "@/app/(dashboard)/cost-optimization/_components/useAutoRouterBenchmarks";
 import { useActivityDateRange } from "@/app/(dashboard)/cost-optimization/_components/useDailyActivityRange";
 import { BudgetPeriodTooltip } from "@/components/shared/BudgetPeriodTooltip";
 
@@ -93,6 +94,7 @@ export default function UserInfoView({
   const canViewAutoRouterUsage = hasProxyWideSpendView(userRole);
   const canViewSavings = canViewAutoRouterUsage || (Boolean(userId.trim()) && userId === signedInUserId);
   const activityDateRange = useActivityDateRange();
+  const autoRouterActivity = useAutoRouterDateRange();
   const [userData, setUserData] = useState<UserInfoV2Response | null>(null);
   const [teamDetails, setTeamDetails] = useState<TeamDisplayInfo[]>([]);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
@@ -745,7 +747,7 @@ export default function UserInfoView({
                   key={userId}
                   accessToken={accessToken}
                   userId={userId}
-                  activity={activityDateRange}
+                  activity={autoRouterActivity}
                 />
               ) : (
                 <p role="alert">Auto-router usage is unavailable because this user has no ID.</p>

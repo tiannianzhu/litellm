@@ -12,7 +12,7 @@ Deployment-wide, so admin-only.
 """
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Final, Literal, TypeAlias
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -21,6 +21,7 @@ from pydantic import ConfigDict, TypeAdapter
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.proxy.request_errors import (
     RequestErrorActivityResponse,
@@ -156,9 +157,9 @@ _ENTITY_STATUS_ROWS: Final = TypeAdapter(tuple[_EntityStatusRow, ...])
 
 
 def _default_range() -> tuple[str, str]:
-    end: Final = datetime.now(timezone.utc)
-    start: Final = end - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+    end: Final = get_daily_spend_date(datetime.now(timezone.utc))
+    start: Final = date.fromisoformat(end) - timedelta(days=_DEFAULT_LOOKBACK_DAYS)
+    return start.isoformat(), end
 
 
 def _is_client_error(status_code: int | None) -> bool:

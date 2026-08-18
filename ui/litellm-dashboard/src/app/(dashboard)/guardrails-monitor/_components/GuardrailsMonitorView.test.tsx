@@ -7,7 +7,10 @@ import { renderWithProviders, screen, testQueryClient, waitFor } from "@/../test
 
 vi.mock("@/components/networking", () => ({
   getGuardrailsUsageLogs: vi.fn(),
-  formatDate: vi.fn((d: Date) => d.toISOString().slice(0, 10)),
+  formatDate: vi.fn(
+    (d: Date) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
+  ),
 }));
 
 const mockUseGuardrailsUsageOverview = vi.fn();
@@ -99,6 +102,20 @@ describe("GuardrailsMonitorView", () => {
   it("should render without crashing when accessToken is null", async () => {
     renderWithProviders(<GuardrailsMonitorView accessToken={null} />);
     expect(await screen.findByRole("heading", { name: /Guardrails Monitor/i })).toBeInTheDocument();
+  });
+
+  it("defaults to seven Beijing calendar days at the time the page opens", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-12-31T16:00:00Z"));
+      renderWithProviders(<GuardrailsMonitorView accessToken="test-token" />);
+
+      expect(mockUseGuardrailsUsageOverview).toHaveBeenCalledWith(
+        expect.objectContaining({ startDate: "2026-12-26", endDate: "2027-01-01" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   describe("guardrail detail deep link (?guardrail=)", () => {

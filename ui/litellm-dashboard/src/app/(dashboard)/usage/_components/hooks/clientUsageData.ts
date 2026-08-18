@@ -7,6 +7,7 @@ import {
 import type { components } from "@/lib/http/schema";
 import { extractPromptCacheTokens } from "@/utils/promptCacheUsage";
 import { isUserAgentTag, usageClientFromUserAgent, UsageClient } from "../components/overview/agentCatalog";
+import { beijingDay } from "@/components/shared/date_range_presets";
 
 type DailyData = components["schemas"]["DailySpendData"];
 type MetricWithMetadata = components["schemas"]["MetricWithMetadata"];
@@ -163,12 +164,11 @@ const breakdownFor = (
     ]),
   );
 
-const localDay = (date: Date) =>
-  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 const modelName = (row: ClientLog) => row.model || "Unknown model";
-const dailyData = (rows: readonly ClientLog[]): DailyData[] =>
-  [...new Set(rows.map((row) => localDay(row.startTime)))].sort().map((date) => {
-    const day = rows.filter((row) => localDay(row.startTime) === date);
+const dailyData = (rows: readonly ClientLog[]): DailyData[] => {
+  const datedRows = rows.map((row) => ({ row, date: beijingDay(row.startTime) }));
+  return [...new Set(datedRows.map(({ date }) => date))].sort().map((date) => {
+    const day = datedRows.filter((entry) => entry.date === date).map((entry) => entry.row);
     return {
       date,
       metrics: metricsFor(day),
@@ -183,6 +183,7 @@ const dailyData = (rows: readonly ClientLog[]): DailyData[] =>
       },
     };
   });
+};
 
 export function clientUsageFromLogs(response: unknown, scope: ClientUsageScope): ClientUsageResult {
   if (!scope.userId && !scope.teamId) return emptyClientUsage("Select a user or team to view client usage");

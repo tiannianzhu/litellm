@@ -34,6 +34,7 @@ from litellm.proxy.auth.auth_checks import (  # noqa: F401  # legacy module expo
     virtual_key_max_budget_check,
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
 from litellm.proxy.db.autorouter_session_rollup import (
     AUTOROUTER_BENCHMARKS_SQL,
     bounded_session_id,
@@ -860,8 +861,10 @@ def _summed_agg_row(rows: Sequence[_SessionAggRow]) -> _SessionAggRow:
 
 async def _recorded_autorouter_savings(
     prisma_client: "PrismaClient", start_day: str, end_day: str, api_key: str | None, user_id: str | None
-) -> float:
-    """The selected days' auto-router savings exactly as the Overall view sums them: same table, same filters."""
+) -> float | None:
+    """Read the Overall savings only when its business days match the benchmark's UTC days."""
+    if get_budget_reset_timezone() != "UTC":
+        return None
     where, params = build_where_clause(
         daily_activity_scope(
             table="litellm_dailyuserspend",
@@ -884,11 +887,14 @@ async def _recorded_autorouter_savings(
 
 
 def _with_recorded_savings(
-    totals: AutoRouterBenchmarkTotals, rows: Sequence[_SessionAggRow], recorded: float
+    totals: AutoRouterBenchmarkTotals, rows: Sequence[_SessionAggRow], recorded: float | None
 ) -> AutoRouterBenchmarkTotals:
-    """The headline is the recorded total. Savings outside the compared routers void the cost comparison,
-    and the part no router's day rows account for is reported as unattributed."""
-    if math.isclose(recorded, totals.saved_spend or 0.0, abs_tol=1e-9):
+    """Use recorded savings from the same UTC dates when available.
+
+    Savings outside the compared routers void the cost comparison. The difference from the router totals
+    is reported as unattributed.
+    """
+    if recorded is None or math.isclose(recorded, totals.saved_spend or 0.0, abs_tol=1e-9):
         return totals
     unattributed: Final = recorded - sum(row.saved_spend for row in rows)
     return totals.model_copy(
@@ -957,7 +963,7 @@ def _idle_router_groups(
 async def get_auto_router_benchmarks(
     user_api_key_dict: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
     start_date: Annotated[
-        str | None, Query(description="YYYY-MM-DD UTC, inclusive (defaults to 30 days before end_date)")
+        str | None, Query(description="YYYY-MM-DD UTC, inclusive (defaults to 29 days before end_date)")
     ] = None,
     end_date: Annotated[str | None, Query(description="YYYY-MM-DD UTC, inclusive (defaults to today)")] = None,
     api_key: Annotated[str | None, Query(min_length=1, description="Filter to one virtual key token hash")] = None,
@@ -971,11 +977,11 @@ async def get_auto_router_benchmarks(
 
     Reads session rollups folded once per request at spend-write time, so this endpoint
     never scans LiteLLM_SpendLogs. A user filter selects only turns attributed to that
-    internal user when written; older key-only history remains outside user views. Money counts
-    only requests on the selected UTC days, and the all-router savings headline is the same daily
-    total the Overall view reads. Session shape and caching cover every session that overlaps the
-    window, whole. Overall hit rate is over telemetry-bearing turns; each bucket's hit rate is
-    over that bucket's turns.
+    internal user when written. Older key-only history remains outside user views. Money counts
+    only requests on the selected UTC days. The all-router savings headline uses the Overall
+    daily total when the proxy's business timezone is UTC. In other timezones, it uses the UTC
+    benchmark cohort. Session shape and caching cover whole sessions that overlap the window.
+    Overall hit rate is over telemetry-bearing turns. Each bucket's hit rate is over that bucket's turns.
 
     The rollup supplies the measures, never the list. Which routers appear comes from the
     model registry, so one shows up as soon as it is configured and reads zero until it
@@ -993,7 +999,7 @@ async def get_auto_router_benchmarks(
         if end_date
         else datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     )
-    start_day: Final = _parse_benchmark_day(start_date) if start_date else end_day - timedelta(days=30)
+    start_day: Final = _parse_benchmark_day(start_date) if start_date else end_day - timedelta(days=29)
     if end_day < start_day:
         raise HTTPException(status_code=400, detail="end_date must not be earlier than start_date")
 

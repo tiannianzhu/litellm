@@ -2704,7 +2704,9 @@ async def ui_view_spend_logs(
                     param=None,
                     code=status.HTTP_400_BAD_REQUEST,
                 )
-            formats: Final = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] if is_v2 else ["%Y-%m-%d %H:%M:%S"]
+            formats: Final = (
+                ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d") if is_v2 else ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S")
+            )
 
             def parse_date(date_str: str) -> datetime:
                 date_str = date_str.strip()
@@ -2713,7 +2715,11 @@ async def ui_view_spend_logs(
                         return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
                     except ValueError:
                         continue
-                expected: Final = "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'" if is_v2 else "'YYYY-MM-DD HH:MM:SS'"
+                expected: Final = (
+                    "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'"
+                    if is_v2
+                    else "'YYYY-MM-DD HH:MM:SS' or 'YYYY-MM-DD HH:MM:SS.ffffff'"
+                )
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid date format: {date_str}. Expected: {expected}",

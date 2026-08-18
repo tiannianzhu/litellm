@@ -58,7 +58,7 @@ const ScopedSavingsTab = ({ accessToken, scope, activity, entityType, scopeNote 
   const rangeLabel = formatRangeLabel(startTime, endTime);
   const savingsSubtitle = [
     accumulation === "cumulative" ? "Running total saved" : `Saved ${intervalLabel.toLowerCase()}`,
-    rangeLabel && `${rangeLabel} (UTC)`,
+    rangeLabel && `${rangeLabel} (Beijing time)`,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -81,8 +81,11 @@ const ScopedSavingsTab = ({ accessToken, scope, activity, entityType, scopeNote 
   return (
     <div className="w-full space-y-6">
       <div className="flex flex-wrap items-center justify-end gap-4">
-        <span className="text-sm text-muted-foreground">Spend is bucketed by UTC day</span>
-        <AdvancedDatePicker value={dateValue} onValueChange={onDateChange} />
+        <AdvancedDatePicker
+          value={dateValue}
+          onValueChange={onDateChange}
+          timeZoneLabel="Beijing time (Asia/Shanghai)"
+        />
       </div>
 
       {scopeNote && (

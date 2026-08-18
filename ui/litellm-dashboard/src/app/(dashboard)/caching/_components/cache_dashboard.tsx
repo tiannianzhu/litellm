@@ -2,6 +2,7 @@ import type { DateRangePickerValue } from "@/components/shared/date_picker_types
 import React, { useEffect, useState } from "react";
 import { toast } from "@/lib/toast";
 import AdvancedDatePicker from "@/components/shared/advanced_date_picker";
+import { beijingDayBounds, presetRange } from "@/components/shared/date_range_presets";
 import { BarChart } from "@/components/shared/charts";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -51,11 +52,6 @@ const toChartDatum = (group: CacheActivityGroup) => ({
   "Generated Completion Tokens": group.generated_completion_tokens,
 });
 
-const formatDateWithoutTZ = (date: Date | undefined) => {
-  if (!date) return undefined;
-  return date.toISOString().split("T")[0];
-};
-
 const resolveDrilldownCallType = (selected: string | null, groups: readonly CacheActivityGroup[]): string | null =>
   selected !== null && groups.some((group) => group.call_type === selected && group.failed_requests > 0)
     ? selected
@@ -88,10 +84,8 @@ const CacheDashboard: React.FC<CachePageProps> = ({ accessToken, token, userRole
   const [selectedModels, setSelectedModels] = useState<string[]>([]);
   const [errorDrilldownCallType, setErrorDrilldownCallType] = useState<string | null>(null);
 
-  const [dateValue, setDateValue] = useState<DateRangePickerValue>({
-    from: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
-    to: new Date(),
-  });
+  const [dateValue, setDateValue] = useState<DateRangePickerValue>(() => presetRange("last_7_days"));
+  const bounds = dateValue.from && dateValue.to ? beijingDayBounds(dateValue.from, dateValue.to) : null;
 
   const [lastRefreshed, setLastRefreshed] = useState("");
   const [healthCheckResponse, setHealthCheckResponse] = useState<any>("");
@@ -102,8 +96,8 @@ const CacheDashboard: React.FC<CachePageProps> = ({ accessToken, token, userRole
     error: activityError,
     refetch,
   } = useCacheActivity({
-    startDate: formatDateWithoutTZ(dateValue.from),
-    endDate: formatDateWithoutTZ(dateValue.to),
+    startDate: bounds?.from.toISOString(),
+    endDate: bounds ? new Date(bounds.to.getTime() + 1).toISOString() : undefined,
     keyAliases: selectedApiKeys,
     models: selectedModels,
   });
@@ -274,6 +268,7 @@ const CacheDashboard: React.FC<CachePageProps> = ({ accessToken, token, userRole
 
               <AdvancedDatePicker
                 value={dateValue}
+                timeZoneLabel="Beijing time (Asia/Shanghai)"
                 onValueChange={(value) => {
                   setDateValue(value);
                 }}

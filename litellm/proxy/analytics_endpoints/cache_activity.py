@@ -1,7 +1,6 @@
 import asyncio
 import json
 from collections.abc import Sequence
-from datetime import datetime
 from typing import Final, Protocol
 
 from pydantic import TypeAdapter
@@ -79,7 +78,7 @@ GROUPS_SQL: Final = """
     LEFT JOIN "LiteLLM_VerificationToken" vt ON sl."api_key" = vt."token"
     WHERE
         sl."startTime" >= ($1::timestamptz AT TIME ZONE 'UTC')
-        AND sl."startTime" <  (($2::timestamptz + INTERVAL '1 day') AT TIME ZONE 'UTC')
+        AND sl."startTime" <  ($2::timestamptz AT TIME ZONE 'UTC')
         AND ($3::jsonb = '[]'::jsonb
             OR COALESCE(vt."key_alias", 'Unnamed Key') IN (SELECT jsonb_array_elements_text($3::jsonb)))
         AND ($4::jsonb = '[]'::jsonb
@@ -103,7 +102,7 @@ ERROR_BREAKDOWN_SQL: Final = """
     WHERE
         sl."status" = 'failure'
         AND sl."startTime" >= ($1::timestamptz AT TIME ZONE 'UTC')
-        AND sl."startTime" <  (($2::timestamptz + INTERVAL '1 day') AT TIME ZONE 'UTC')
+        AND sl."startTime" <  ($2::timestamptz AT TIME ZONE 'UTC')
         AND ($3::jsonb = '[]'::jsonb
             OR COALESCE(vt."key_alias", 'Unnamed Key') IN (SELECT jsonb_array_elements_text($3::jsonb)))
         AND ($4::jsonb = '[]'::jsonb
@@ -122,7 +121,7 @@ KEY_ALIAS_OPTIONS_SQL: Final = """
     LEFT JOIN "LiteLLM_VerificationToken" vt ON sl."api_key" = vt."token"
     WHERE
         sl."startTime" >= ($1::timestamptz AT TIME ZONE 'UTC')
-        AND sl."startTime" <  (($2::timestamptz + INTERVAL '1 day') AT TIME ZONE 'UTC')
+        AND sl."startTime" <  ($2::timestamptz AT TIME ZONE 'UTC')
         AND sl."call_type" NOT IN (SELECT jsonb_array_elements_text($3::jsonb))
         AND ($4::boolean
             OR sl."user" = $5
@@ -135,7 +134,7 @@ MODEL_OPTIONS_SQL: Final = """
     FROM "LiteLLM_SpendLogs" sl
     WHERE
         sl."startTime" >= ($1::timestamptz AT TIME ZONE 'UTC')
-        AND sl."startTime" <  (($2::timestamptz + INTERVAL '1 day') AT TIME ZONE 'UTC')
+        AND sl."startTime" <  ($2::timestamptz AT TIME ZONE 'UTC')
         AND sl."model" != ''
         AND sl."call_type" NOT IN (SELECT jsonb_array_elements_text($3::jsonb))
         AND ($4::boolean
@@ -176,8 +175,8 @@ def compute_totals(groups: Sequence[CacheActivityGroup]) -> CacheActivityTotals:
 async def get_cache_activity(
     prisma_client: _SupportsRawQueryDb,
     read_scope: ReadScope,
-    start_date: datetime,
-    end_date: datetime,
+    start: str,
+    end_exclusive: str,
     key_aliases: Sequence[str],
     models: Sequence[str],
 ) -> CacheActivityResponse:
@@ -186,13 +185,13 @@ async def get_cache_activity(
     scope_params: Final = read_scope_bind_params(read_scope)
     group_rows, error_rows, key_alias_rows, model_rows = await asyncio.gather(
         prisma_client.db.query_raw(
-            GROUPS_SQL, start_date, end_date, key_aliases_json, models_json, INFO_ROUTES_JSON, *scope_params
+            GROUPS_SQL, start, end_exclusive, key_aliases_json, models_json, INFO_ROUTES_JSON, *scope_params
         ),
         prisma_client.db.query_raw(
-            ERROR_BREAKDOWN_SQL, start_date, end_date, key_aliases_json, models_json, INFO_ROUTES_JSON, *scope_params
+            ERROR_BREAKDOWN_SQL, start, end_exclusive, key_aliases_json, models_json, INFO_ROUTES_JSON, *scope_params
         ),
-        prisma_client.db.query_raw(KEY_ALIAS_OPTIONS_SQL, start_date, end_date, INFO_ROUTES_JSON, *scope_params),
-        prisma_client.db.query_raw(MODEL_OPTIONS_SQL, start_date, end_date, INFO_ROUTES_JSON, *scope_params),
+        prisma_client.db.query_raw(KEY_ALIAS_OPTIONS_SQL, start, end_exclusive, INFO_ROUTES_JSON, *scope_params),
+        prisma_client.db.query_raw(MODEL_OPTIONS_SQL, start, end_exclusive, INFO_ROUTES_JSON, *scope_params),
     )
     groups: Final = _groups_adapter.validate_python(group_rows or [])
     return CacheActivityResponse(

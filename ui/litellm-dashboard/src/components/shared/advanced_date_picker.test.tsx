@@ -75,6 +75,29 @@ describe("AdvancedDatePicker", () => {
     expect(screen.getByText("Custom Label")).toBeInTheDocument();
   });
 
+  it("uses the supplied presets and displays their time zone", () => {
+    const customRange = { from: new Date(2026, 11, 26), to: new Date(2027, 0, 1, 23, 59, 59, 999) };
+    const options = [
+      { label: "Last 7 days", shortLabel: "7d", settingValue: "last_7_days", getValue: () => customRange },
+    ];
+    render(
+      <AdvancedDatePicker
+        value={defaultValue}
+        onValueChange={mockOnValueChange}
+        options={options}
+        timeZoneLabel="Beijing time (Asia/Shanghai)"
+      />,
+    );
+
+    expect(screen.getByText("Beijing time (Asia/Shanghai)")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    fireEvent.click(screen.getByRole("button", { name: /Last 7 days/ }));
+    expect(screen.getByLabelText("Start date")).toHaveValue("2026-12-26");
+    expect(screen.getByLabelText("End date")).toHaveValue("2027-01-01");
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(mockOnValueChange).toHaveBeenNthCalledWith(1, customRange, "7d");
+  });
+
   it("should display formatted date range", () => {
     const { container } = render(<AdvancedDatePicker value={defaultValue} onValueChange={mockOnValueChange} />);
     expect(getTrigger(container)).toHaveTextContent(/\d{1,2} \w{3}, \d{2}:\d{2} - \d{1,2} \w{3}, \d{2}:\d{2}/);

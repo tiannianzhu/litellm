@@ -35,7 +35,7 @@ import { classificationRatePer1kTurns, formatRangeLabel, usd } from "./costOptim
 import AutoRouterSummaryTable from "./AutoRouterSummaryTable";
 import ShadowEvalSection from "./ShadowEvalSection";
 import TierTurnsChart from "./TierTurnsChart";
-import { useAutoRouterBenchmarks } from "./useAutoRouterBenchmarks";
+import { autoRouterDateOptions, useAutoRouterBenchmarks } from "./useAutoRouterBenchmarks";
 import { DailyActivityRange } from "./useDailyActivityRange";
 
 const Message: React.FC<{ children: React.ReactNode }> = ({ children }) => (
@@ -379,7 +379,7 @@ export const AutoRouterUsageView: React.FC<AutoRouterBenchmarksTabProps> = ({
           {rangeLabel && <p className="mt-1 text-sm text-muted-foreground">{rangeLabel} (UTC)</p>}
         </div>
         <div className="flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center">
-          <AdvancedDatePicker value={dateValue} onValueChange={onDateChange} />
+          <AdvancedDatePicker value={dateValue} onValueChange={onDateChange} options={autoRouterDateOptions} />
           <div className="w-full sm:w-64">
             <Select value={selectedKey} onValueChange={(value: string | null) => setSelectedKey(value ?? ALL_ROUTERS)}>
               <SelectTrigger className="w-full">

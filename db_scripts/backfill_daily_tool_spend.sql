@@ -26,13 +26,14 @@
 --    such buckets keep the writer's numbers and skip the backfill's.
 --
 -- Usage:
---   psql "$DATABASE_URL" -v cutover="'2026-07-25T00:00:00Z'" -f db_scripts/backfill_daily_tool_spend.sql
+--   psql "$DATABASE_URL" -v cutover="'2026-07-25T00:00:00Z'" -v usage_timezone=Asia/Shanghai -f db_scripts/backfill_daily_tool_spend.sql
+-- Set usage_timezone to litellm_settings.timezone, or UTC when it is unset
 
 SET TIME ZONE 'UTC';
 
 INSERT INTO "LiteLLM_DailyToolSpend" (date, tool_name, spend, total_tokens, request_count, created_at, updated_at)
 SELECT
-    to_char(ti.start_time, 'YYYY-MM-DD') AS date,
+    to_char(ti.start_time AT TIME ZONE 'UTC' AT TIME ZONE :'usage_timezone', 'YYYY-MM-DD') AS date,
     ti.tool_name,
     COALESCE(SUM(sl.spend), 0) AS spend,
     COALESCE(SUM(sl.total_tokens), 0) AS total_tokens,

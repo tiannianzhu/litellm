@@ -133,6 +133,7 @@ from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
 from litellm.proxy.common_utils.callback_utils import encrypt_callback_vars
 from litellm.proxy.common_utils.json_merge_patch import apply_json_merge_patch
 from litellm.proxy.common_utils.openai_error_payload import proxy_exception_for
+from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
 from litellm.proxy.common_utils.user_api_key_cache import (
     UserApiKeyCache,
     team_membership_auth_cache_key,
@@ -7432,6 +7433,7 @@ def aggregated_date_range_error(start_date: str | None, end_date: str | None) ->
 def _team_user_spend_sql(*, team_count: int, restrict_to_user: bool) -> str:
     team_placeholders: Final = ", ".join(f"${i}" for i in range(3, 3 + team_count))
     user_clause: Final = f' AND sl."user" = ${3 + team_count}' if restrict_to_user else ""
+    timezone_param: Final = f"${3 + team_count + int(restrict_to_user)}::text"
     return f"""
         SELECT
             sl.team_id,
@@ -7447,8 +7449,8 @@ def _team_user_spend_sql(*, team_count: int, restrict_to_user: bool) -> str:
             COUNT(*) FILTER (WHERE sl.status = 'failure')::bigint AS failed_requests
         FROM "LiteLLM_SpendLogs" sl
         LEFT JOIN "LiteLLM_UserTable" u ON u.user_id = sl."user"
-        WHERE sl."startTime" >= $1::timestamp
-            AND sl."startTime" < $2::timestamp + INTERVAL '1 day'
+        WHERE sl."startTime" >= ($1::timestamp AT TIME ZONE {timezone_param} AT TIME ZONE 'UTC')
+            AND sl."startTime" < (($2::timestamp + INTERVAL '1 day') AT TIME ZONE {timezone_param} AT TIME ZONE 'UTC')
             AND sl.team_id IN ({team_placeholders}){user_clause}
         GROUP BY sl.team_id, sl."user", u.user_email, u.user_alias
         ORDER BY spend DESC, sl.team_id, sl."user"
@@ -7525,6 +7527,7 @@ async def get_team_spend_by_user(
             end_date,
             *scoped_team_ids,
             *user_param,
+            get_budget_reset_timezone(),
         )
     results: Final = tuple(
         TeamUserSpendRow(

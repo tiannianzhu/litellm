@@ -19,6 +19,7 @@ import type { UsageClient } from "../hooks/clientUsageData";
 import { useClientUsage } from "../hooks/useClientUsage";
 import { topAgents, type AgentRow } from "./overview/agentCatalog";
 import { useClientAgentModels } from "../hooks/useClientAgentModels";
+import { beijingDayBounds } from "@/components/shared/date_range_presets";
 import UsageBreakdownChart from "./overview/UsageBreakdownChart";
 import { clientAgentDetail, type ClientAgentDetail } from "./overview/clientAgentDetail";
 import { modelColorMap, formatCompact, formatUsd, overviewTotals } from "./overview/overviewData";
@@ -82,10 +83,11 @@ export default function ClientUsagePanel({
 }: ClientUsagePanelProps) {
   const label = client === "claude-desktop" ? "Claude Desktop" : "Claude Code";
   const scopedRequest = Boolean(userId || teamId) && !accessError;
+  const scopedDates = startTime && endTime ? beijingDayBounds(startTime, endTime) : null;
   const personRequest = {
     accessToken,
-    startTime,
-    endTime,
+    startTime: scopedDates?.from ?? null,
+    endTime: scopedDates?.to ?? null,
     userId,
     teamId,
     client: scopedRequest ? client : null,
@@ -171,6 +173,7 @@ export default function ClientUsagePanel({
               value={dateValue}
               presetShortLabel={presetShortLabel}
               onValueChange={onDateChange}
+              timeZoneLabel="Beijing time (Asia/Shanghai)"
             />
           </div>
           {teams.length > 0 && onTeamChange && (
@@ -293,7 +296,7 @@ export default function ClientUsagePanel({
               <p className="border-t pt-3 text-xs leading-5 text-muted-foreground">
                 {scopedRequest
                   ? "Based on retained request logs within the exact selected time range."
-                  : "All-user totals use UTC daily aggregates for the selected dates. Filtering by person uses the exact selected times. Cache values are reported counts."}{" "}
+                  : "All-user totals use daily aggregates for the selected dates. Filtering by person uses Beijing dates. Cache values are reported counts."}{" "}
                 Spend is the cost recorded by LiteLLM.
               </p>
             </>

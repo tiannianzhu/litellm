@@ -37,5 +37,7 @@ describe("useScopedDailyActivityRange wiring", () => {
     expect(url).toContain("api_key=hash-abc");
     expect(url).toContain("start_date=2026-08-01");
     expect(url).toContain("end_date=2026-08-10");
+    expect(url).not.toContain("include_current_utc_day");
+    expect(url).not.toContain("timezone=");
   });
 });

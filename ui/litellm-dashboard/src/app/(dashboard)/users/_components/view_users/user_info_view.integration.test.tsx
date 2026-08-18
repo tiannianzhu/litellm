@@ -376,6 +376,8 @@ describe("UserInfoView auto-router usage", () => {
   const mockFetch = vi.fn<typeof fetch>();
 
   beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-05T16:15:00Z"));
     testQueryClient.clear();
     vi.clearAllMocks();
     mockUserGetInfoV2.mockImplementation((_token: string, userId: string) =>
@@ -386,6 +388,7 @@ describe("UserInfoView auto-router usage", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     testQueryClient.clear();
     vi.unstubAllGlobals();
   });
@@ -404,6 +407,9 @@ describe("UserInfoView auto-router usage", () => {
       const params = new URL(request.url).searchParams;
       expect(params.get("user_id")).toBe("user-123");
       expect(params.has("api_key")).toBe(false);
+      expect(params.get("start_date")).toBe("2026-10-07");
+      expect(params.get("end_date")).toBe("2026-11-05");
+      expect(screen.getByText("UTC")).toBeInTheDocument();
       expect(screen.getByText(/Older sessions recorded without a user ID are not included/)).toBeInTheDocument();
     },
   );
@@ -518,7 +524,6 @@ describe("UserInfoView savings", () => {
       expect.objectContaining({
         accessToken: "admin-token",
         entityIds: ["user-123"],
-        includeCurrentUtcDay: true,
       }),
     );
     expect(screen.getByTestId("user-savings-scope-note")).toHaveTextContent("JWT-authenticated requests");
@@ -546,7 +551,6 @@ describe("UserInfoView savings", () => {
       expect.objectContaining({
         accessToken: "admin-token",
         entityIds: ["user-456"],
-        includeCurrentUtcDay: true,
       }),
     );
     await act(async () => {
@@ -566,7 +570,7 @@ describe("UserInfoView savings", () => {
       .mockReturnValue(nextRange.promise);
     const committedTotals: Array<string | null> = [];
     const captureNewRange = () => {
-      if (screen.queryByText("Running total saved · Sep 1 – Sep 2 (UTC)")) {
+      if (screen.queryByText("Running total saved · Sep 1 – Sep 2 (Beijing time)")) {
         committedTotals.push(screen.queryByTestId("summary-card-total-recorded-savings")?.textContent ?? null);
       }
     };

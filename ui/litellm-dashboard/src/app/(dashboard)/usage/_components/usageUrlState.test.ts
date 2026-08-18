@@ -192,13 +192,6 @@ describe("date range", () => {
     });
   });
 
-  it("re-resolves a rolling range against the current day", () => {
-    const range = dateRangeFromParams(load("?range=7d"));
-
-    expect(moment(range?.from).isSame(moment().subtract(7, "days"), "day")).toBe(true);
-    expect(moment(range?.to).isSame(moment(), "day")).toBe(true);
-  });
-
   it("round-trips a custom range as whole local calendar days", () => {
     const custom = { from: new Date(2026, 0, 5, 8, 0, 0, 0), to: new Date(2026, 0, 9, 20, 30, 0, 0) };
     const query = applyPatch("?range=7d", dateRangePatch(custom, null));
@@ -376,75 +369,57 @@ describe("client team scope", () => {
 describe("configured Usage default", () => {
   afterEach(() => vi.useRealTimers());
 
-  it.each([undefined, null, "unknown", "last_7_days"])("preserves the rolling seven-day fallback for %s", (setting) => {
-    vi.useFakeTimers();
-    const now = new Date(2026, 9, 24, 12, 34, 56, 789);
-    vi.setSystemTime(now);
-    expect(defaultUsageDateRange(setting)).toEqual({
-      value: { from: new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000), to: now },
-      preset: null,
-    });
-  });
-
-  it.each([
-    ["America/Los_Angeles", 2, 9],
-    ["Europe/London", 2, 30],
-  ])("preserves untouched fallback dates after spring DST in %s", (timezone, month, day) => {
-    withTimezone(timezone, () => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date(2026, month, day, 0, 30));
-      for (const setting of [undefined, "last_7_days"]) {
-        const fallback = defaultUsageDateRange(setting);
-        const restored = dateRangeFromParams(load(applyPatch("", dateRangePatch(fallback.value, fallback.preset))));
-        expect(moment(restored?.from).format("YYYY-MM-DD")).toBe(moment(fallback.value.from).format("YYYY-MM-DD"));
-        expect(moment(restored?.to).format("YYYY-MM-DD")).toBe(moment(fallback.value.to).format("YYYY-MM-DD"));
-      }
-    });
-  });
-
-  it.each(["UTC", "America/Los_Angeles", "Europe/London", "Asia/Tokyo"])(
-    "uses local calendar boundaries in %s",
+  it.each(["America/Los_Angeles", "Pacific/Auckland"])(
+    "uses Beijing calendar days for defaults and rolling URLs across Beijing midnight in %s",
     (timezone) => {
       withTimezone(timezone, () => {
-        vi.useFakeTimers();
-        for (const [year, month, day] of [
-          [2024, 1, 29],
-          [2026, 2, 8],
-          [2026, 10, 1],
-          [2026, 11, 31],
-          [2027, 0, 1],
-        ]) {
-          vi.setSystemTime(new Date(year, month, day, 12));
-          const end = new Date(year, month, day, 23, 59, 59, 999);
-          expect(defaultUsageDateRange("month_to_date")).toEqual({
-            value: { from: new Date(year, month, 1), to: end },
-            preset: "MTD",
-          });
-          expect(defaultUsageDateRange("year_to_date")).toEqual({
-            value: { from: new Date(year, 0, 1), to: end },
-            preset: "YTD",
-          });
-          expect(defaultUsageDateRange("today")).toEqual({
-            value: { from: new Date(year, month, day), to: end },
-            preset: "today",
-          });
-          expect(defaultUsageDateRange("last_30_days")).toEqual({
-            value: { from: new Date(year, month, day - 30), to: end },
-            preset: "30d",
-          });
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(new Date("2026-12-31T15:59:59Z"));
+        expect(dateRangeFromParams(load("?range=today"))).toEqual({
+          from: new Date(2026, 11, 31),
+          to: new Date(2026, 11, 31, 23, 59, 59, 999),
+        });
+
+        vi.setSystemTime(new Date("2026-12-31T16:00:00Z"));
+        const end = new Date(2027, 0, 1, 23, 59, 59, 999);
+        for (const setting of [undefined, null, "unknown", "last_7_days"]) {
+          const fallback = defaultUsageDateRange(setting);
+          expect(fallback).toEqual({ value: { from: new Date(2026, 11, 26), to: end }, preset: null });
+          const restored = dateRangeFromParams(load(applyPatch("", dateRangePatch(fallback.value, fallback.preset))));
+          expect(restored).toEqual(fallback.value);
         }
+
+        for (const [setting, preset, start] of [
+          ["today", "today", new Date(2027, 0, 1)],
+          ["last_30_days", "30d", new Date(2026, 11, 3)],
+          ["month_to_date", "MTD", new Date(2027, 0, 1)],
+          ["year_to_date", "YTD", new Date(2027, 0, 1)],
+        ] as const) {
+          const expected = { from: start, to: end };
+          expect(defaultUsageDateRange(setting)).toEqual({ value: expected, preset });
+          expect(dateRangeFromParams(load(`?range=${preset}`))).toEqual(expected);
+          expect(clientDateRangeFromParams(load(`?client_range=${preset}`))).toEqual(expected);
+        }
+        const week = { from: new Date(2026, 11, 26), to: end };
+        expect(dateRangeFromParams(load("?range=7d"))).toEqual(week);
+        expect(clientDateRangeFromParams(load("?client_range=7d"))).toEqual(week);
       });
     },
   );
 
-  it("recalculates month to date across midnight instead of storing absolute dates", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(2026, 11, 31, 23, 59));
-    expect(defaultUsageDateRange("month_to_date").value.from).toEqual(new Date(2026, 11, 1));
-    vi.setSystemTime(new Date(2027, 0, 1));
-    expect(defaultUsageDateRange("month_to_date")).toEqual({
-      value: { from: new Date(2027, 0, 1), to: new Date(2027, 0, 1, 23, 59, 59, 999) },
-      preset: "MTD",
+  it.each([
+    ["America/Los_Angeles", "2026-03-08T16:30:00Z", 3, 9],
+    ["Europe/London", "2026-03-29T16:30:00Z", 24, 30],
+  ])("keeps seven calendar days across the local DST change in %s", (timezone, instant, firstDay, lastDay) => {
+    withTimezone(timezone, () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(instant));
+      const fallback = defaultUsageDateRange(undefined);
+      expect(fallback.value).toEqual({
+        from: new Date(2026, 2, firstDay),
+        to: new Date(2026, 2, lastDay, 23, 59, 59, 999),
+      });
+      expect(dateRangeFromParams(load(applyPatch("", dateRangePatch(fallback.value, null))))).toEqual(fallback.value);
     });
   });
 });

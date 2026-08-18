@@ -19,14 +19,14 @@ describe("useClientUsage", () => {
     vi.clearAllMocks();
   });
 
-  it("should send a bounded authenticated user query with UTC bounds covering the selected interval", async () => {
+  it("should send the selected UTC bounds without rounding", async () => {
     vi.mocked(uiSpendLogsCall).mockResolvedValue(emptyPage);
     const { result } = renderHook(() => useClientUsage(options));
     await waitFor(() => expect(result.current.loading).toBe(false));
     const expectedRequest = {
       accessToken: "test-token",
-      start_date: "2026-10-22 07:00:00",
-      end_date: "2026-10-23 07:00:00",
+      start_date: "2026-10-22 07:00:00.500",
+      end_date: "2026-10-23 06:59:59.999",
       page: 1,
       page_size: 1000,
       params: { user_id: "user-1", sort_by: "startTime", sort_order: "desc", group_by_session: false },

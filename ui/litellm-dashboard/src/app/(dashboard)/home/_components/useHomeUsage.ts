@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
 import { useCurrentUser } from "@/app/(dashboard)/hooks/users/useCurrentUser";
 import { gatewayDailyActivityCall } from "@/components/networking";
+import { presetRange } from "@/components/shared/date_range_presets";
 import { toDailyData } from "@/components/UsagePage/dailyActivityApi";
 import type { DailyData } from "@/components/UsagePage/types";
 import { all_admin_roles } from "@/utils/roles";
@@ -33,8 +34,7 @@ export function useHomeUsage(): HomeUsage {
   const isAdmin = all_admin_roles.includes(userRole || "");
   const [attempt, setAttempt] = useState(0);
   const range = useMemo(() => {
-    const endTime = new Date();
-    const startTime = new Date(endTime.getTime() - HOME_USAGE_DAYS * 24 * 60 * 60 * 1000);
+    const { from: startTime, to: endTime } = presetRange("last_7_days");
     return { startTime, endTime };
   }, []);
 

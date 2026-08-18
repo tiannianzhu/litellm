@@ -726,6 +726,7 @@ class TestAutoRouterBenchmarks:
         from litellm.proxy import proxy_server
 
         monkeypatch.setattr(proxy_server, "llm_router", None)
+        monkeypatch.setattr(litellm, "timezone", "UTC", raising=False)
 
     @staticmethod
     async def _benchmarks(
@@ -904,6 +905,33 @@ class TestAutoRouterBenchmarks:
         group: Final = response.groups[0]
         assert group.saved_spend == 30.0
         assert (group.baseline_spend, group.saved_pct) == ((40.0, 75.0) if unattributed is None else (None, None))
+
+    @pytest.mark.asyncio
+    async def test_business_day_savings_do_not_replace_the_utc_comparison(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai")
+
+        response: Final = await self._benchmarks(
+            monkeypatch, rows=[self.ROW.model_dump()], model_list=[], recorded=27.0
+        )
+
+        totals: Final = response.totals
+        assert (totals.saved_spend, totals.baseline_spend, totals.saved_pct) == (30.0, 40.0, 75.0)
+        assert totals.unattributed_saved_spend is None
+        assert response.groups[0].baseline_spend == 40.0
+
+    @pytest.mark.asyncio
+    async def test_default_start_includes_thirty_utc_days_through_the_end_date(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(proxy_server, "prisma_client", _benchmark_db([]))
+
+        response: Final = await auto_router_endpoints.get_auto_router_benchmarks(
+            user_api_key_dict=ADMIN, end_date="2026-11-05"
+        )
+
+        assert (response.start_date, response.end_date) == ("2026-10-07", "2026-11-05")
 
     @pytest.mark.asyncio
     async def test_a_window_holding_only_untracked_history_shows_no_router_baseline(
