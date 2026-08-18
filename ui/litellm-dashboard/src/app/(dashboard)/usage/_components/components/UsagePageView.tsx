@@ -226,6 +226,8 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
   }, [isAdmin, gatewayRequest, currentGatewayRangeKey]);
 
   const gatewayActivity = selectGatewayActivity(isAdmin, gatewayActivityData, currentGatewayRangeKey);
+  const isDeploymentWideView = isAdmin && usageView === "global" && selectedUserId === null;
+  const deploymentGatewayActivity = isDeploymentWideView ? gatewayActivity : null;
   const activeAggregated = selectForRange(aggregatedData, currentAggregatedRangeKey);
   // A failure belongs to the range it happened on. Reading it through the same
   // rule keeps the paginated hook disabled while a new range is in flight, and
@@ -266,6 +268,14 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
 
   // Derived states from userSpendData
   const totalSpend = userSpendData.metadata?.total_spend || 0;
+  const requestMetrics = {
+    total: deploymentGatewayActivity
+      ? deploymentGatewayActivity.total_successful_requests + deploymentGatewayActivity.total_failed_requests
+      : userSpendData.metadata?.total_api_requests ?? 0,
+    successful:
+      deploymentGatewayActivity?.total_successful_requests ?? userSpendData.metadata?.total_successful_requests ?? 0,
+    failed: deploymentGatewayActivity?.total_failed_requests ?? userSpendData.metadata?.total_failed_requests ?? 0,
+  };
 
   // Calculate top models from the breakdown data
   const topModels = useMemo(() => {
@@ -459,7 +469,10 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
     () => [...userSpendData.results].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
     [userSpendData.results],
   );
-  const gatewayRequestsByRoute = useMemo(() => topGatewayRoutes(gatewayActivity), [gatewayActivity]);
+  const gatewayRequestsByRoute = useMemo(
+    () => topGatewayRoutes(deploymentGatewayActivity),
+    [deploymentGatewayActivity],
+  );
   const modelMetrics = useMemo(
     () => processActivityData(userSpendData, modelViewType === "groups" ? "model_groups" : "models", teams),
     [userSpendData, modelViewType, teams],
@@ -572,41 +585,14 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                             <ShadcnCard>
                               <CardContent>
                                 <h3 className="text-lg font-medium text-foreground">Total Requests</h3>
-                                <p className="text-2xl font-bold mt-2">
-                                  {(gatewayActivity
-                                    ? gatewayActivity.total_successful_requests + gatewayActivity.total_failed_requests
-                                    : userSpendData.metadata?.total_api_requests
-                                  )?.toLocaleString() || 0}
-                                </p>
+                                <p className="text-2xl font-bold mt-2">{requestMetrics.total.toLocaleString()}</p>
                               </CardContent>
                             </ShadcnCard>
                             <ShadcnCard>
                               <CardContent>
-                                <div className="flex items-center gap-2">
-                                  <h3 className="text-lg font-medium text-foreground">Successful Requests</h3>
-                                  {gatewayActivity && (
-                                    <Tooltip>
-                                      <TooltipTrigger
-                                        render={<Info className="size-4 text-muted-foreground hover:text-foreground" />}
-                                      />
-                                      <TooltipContent>
-                                        Counted by the gateway when it answers a request, independent of spend logging.
-                                        Deployment-wide, so it will not match the per-key or per-model breakdowns below.
-                                      </TooltipContent>
-                                    </Tooltip>
-                                  )}
-                                </div>
-                                {/*
-                                  TODO: drop the userSpendData fallback once every deployment
-                                  is writing LiteLLM_DailyGatewayRequests. It covers two cases
-                                  today: a non-admin (who may not read deployment-wide counts)
-                                  and an admin on a proxy whose table is still backfilling.
-                                */}
+                                <h3 className="text-lg font-medium text-foreground">Successful Requests</h3>
                                 <p className="text-2xl font-bold mt-2 text-success">
-                                  {(
-                                    gatewayActivity?.total_successful_requests ??
-                                    userSpendData.metadata?.total_successful_requests
-                                  )?.toLocaleString() || 0}
+                                  {requestMetrics.successful.toLocaleString()}
                                 </p>
                               </CardContent>
                             </ShadcnCard>
@@ -619,19 +605,13 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                                       render={<Info className="size-4 text-muted-foreground hover:text-foreground" />}
                                     />
                                     <TooltipContent>
-                                      {gatewayActivity
-                                        ? "Counted by the gateway when it answers a request, independent of spend logging. Deployment-wide, so it will not match the per-key or per-model breakdowns below."
-                                        : "Includes requests that failed to route to a provider, tool usage failures, and other request errors where the provider cannot be determined."}
+                                      Includes requests that failed to route to a provider, tool usage failures, and
+                                      other request errors where the provider cannot be determined.
                                     </TooltipContent>
                                   </Tooltip>
                                 </div>
-                                {/* Same source as Successful Requests: the two must agree, or the
-                                    tile disagrees with the endpoint breakdown chart below it. */}
                                 <p className="text-2xl font-bold mt-2 text-destructive">
-                                  {(
-                                    gatewayActivity?.total_failed_requests ??
-                                    userSpendData.metadata?.total_failed_requests
-                                  )?.toLocaleString() || 0}
+                                  {requestMetrics.failed.toLocaleString()}
                                 </p>
                               </CardContent>
                             </ShadcnCard>
@@ -641,7 +621,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                                 <p className="text-2xl font-bold mt-2">
                                   $
                                   {formatNumberWithCommas(
-                                    (totalSpend || 0) / (userSpendData.metadata?.total_api_requests || 1),
+                                    totalSpend / (userSpendData.metadata?.total_api_requests || 1),
                                     4,
                                   )}
                                 </p>
@@ -746,7 +726,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                       </ShadcnCard>
                     </div>
                     {/* Gateway Requests by Endpoint (SGR) */}
-                    {gatewayActivity && gatewayActivity.by_route.length > 0 && (
+                    {deploymentGatewayActivity && deploymentGatewayActivity.by_route.length > 0 && (
                       <div className="col-span-2">
                         <ShadcnCard data-testid="gateway-requests-by-endpoint">
                           <CardHeader>

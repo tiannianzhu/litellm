@@ -77,6 +77,7 @@ vi.mock("./UsageViewSelect/UsageViewSelect", async () => {
         "data-testid": "usage-view-select",
       },
       React.createElement("option", { value: "global" }, "Global Usage"),
+      React.createElement("option", { value: "my-usage" }, "Your Usage"),
       React.createElement("option", { value: "team" }, "Team Usage"),
       React.createElement("option", { value: "organization" }, "Organization Usage"),
       React.createElement("option", { value: "customer" }, "Customer Usage"),
@@ -321,8 +322,7 @@ describe("UsagePage", () => {
     showSSOBanner: false,
   };
 
-  // Counts deliberately unlike anything in mockSpendData: the gateway tile must be
-  // readable as coming from /gateway/daily/activity and from nothing else.
+  // Keep gateway counts distinct from spend-derived request metrics.
   const mockGatewayActivity = {
     total_successful_requests: 424242,
     total_failed_requests: 909,
@@ -413,7 +413,7 @@ describe("UsagePage", () => {
     } as any);
   });
 
-  it("should render and fetch usage data on mount", async () => {
+  it("should use gateway counts for deployment-wide request cards", async () => {
     renderWithProviders(<UsagePage {...defaultProps} />);
 
     // Wait for data to be fetched
@@ -427,19 +427,65 @@ describe("UsagePage", () => {
     const successfulRequestLabelElements = screen.getAllByText("Successful Requests");
     expect(successfulRequestLabelElements.length).toBeGreaterThan(0);
     await waitFor(() => {
-      expect(screen.getAllByText("424,242").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("425,151").length).toBeGreaterThan(0);
     });
+    expect(screen.getAllByText("424,242").length).toBeGreaterThan(0);
     expect(screen.getAllByText("909").length).toBeGreaterThan(0);
-    expect(screen.getByText("425,151")).toBeInTheDocument();
+    expect(screen.getByText("$0.0838")).toBeInTheDocument();
     expect(screen.queryByText("1,500")).not.toBeInTheDocument();
     expect(screen.queryByText("1,450")).not.toBeInTheDocument();
+    expect(screen.getByTestId("gateway-requests-by-endpoint")).toBeInTheDocument();
+  });
+
+  it("should use spend-derived request cards after filtering the global view by user", async () => {
+    renderWithProviders(<UsagePage {...defaultProps} />);
+
+    expect(await screen.findByTestId("gateway-requests-by-endpoint")).toBeInTheDocument();
+
+    const userSelect = screen.getByPlaceholderText("Search users by email…");
+    await userEvent.setup().click(userSelect);
+    await userEvent.setup().click(screen.getByText("Alice (user-001)"));
+
+    await waitFor(() => {
+      expect(mockUserDailyActivityAggregatedCall).toHaveBeenCalledWith(
+        "test-token",
+        expect.any(Date),
+        expect.any(Date),
+        "user-001",
+      );
+      expect(screen.getAllByText("1,450").length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText("50").length).toBeGreaterThan(0);
+    expect(screen.queryByText("424,242")).not.toBeInTheDocument();
+    expect(screen.queryByText("909")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gateway-requests-by-endpoint")).not.toBeInTheDocument();
+  });
+
+  it("should use spend-derived request cards in the admin's own usage view", async () => {
+    renderWithProviders(<UsagePage {...defaultProps} />);
+
+    expect(await screen.findByTestId("gateway-requests-by-endpoint")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByTestId("usage-view-select"), { target: { value: "my-usage" } });
+
+    await waitFor(() => {
+      expect(mockUserDailyActivityAggregatedCall).toHaveBeenCalledWith(
+        "test-token",
+        expect.any(Date),
+        expect.any(Date),
+        "user-123",
+      );
+      expect(screen.getAllByText("1,450").length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText("50").length).toBeGreaterThan(0);
+    expect(screen.queryByText("424,242")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("gateway-requests-by-endpoint")).not.toBeInTheDocument();
   });
 
   it("should stop showing the previous range's totals while a new range is in flight", async () => {
-    // The request tiles read the gateway counts and fall through to the
-    // spend-derived ones. Withholding a superseded gateway result is only worth
-    // something if the fallback is withheld too, otherwise the tile keeps
-    // showing the previous range's number by the other route.
+    // The Total Requests card reads the range-stamped spend aggregate, so a
+    // superseded response must not remain visible while the next range is loading.
+    mockUseAuthorized.mockReturnValue(nonAdminSession);
     let releaseSecondFetch: () => void = () => {};
     mockUserDailyActivityAggregatedCall.mockReset();
     mockUserDailyActivityAggregatedCall.mockResolvedValueOnce(mockSpendData).mockImplementationOnce(
@@ -471,7 +517,7 @@ describe("UsagePage", () => {
     });
   });
 
-  it("should fall back to the spend-derived count when the gateway endpoint is unavailable", async () => {
+  it("should keep spend-derived cards when the gateway endpoint is unavailable", async () => {
     mockGatewayDailyActivityCall.mockRejectedValue(new Error("gateway activity unavailable"));
 
     renderWithProviders(<UsagePage {...defaultProps} />);
@@ -482,7 +528,7 @@ describe("UsagePage", () => {
     await waitFor(() => {
       expect(screen.getAllByText("1,450").length).toBeGreaterThan(0);
     });
-    expect(screen.getByText("1,500")).toBeInTheDocument();
+    expect(screen.getAllByText("50").length).toBeGreaterThan(0);
     expect(screen.queryByText("424,242")).not.toBeInTheDocument();
     expect(screen.queryByText("909")).not.toBeInTheDocument();
     expect(screen.queryByText("425,151")).not.toBeInTheDocument();
@@ -1026,6 +1072,10 @@ describe("UsagePage", () => {
   });
 
   describe("aggregated endpoint fallback", () => {
+    beforeEach(() => {
+      mockGatewayDailyActivityCall.mockRejectedValue(new Error("gateway activity unavailable"));
+    });
+
     it("should fall back to paginated calls when aggregated endpoint fails", async () => {
       mockUserDailyActivityAggregatedCall.mockRejectedValue(new Error("Aggregated endpoint not available"));
       mockUserDailyActivityCall.mockResolvedValue({
