@@ -14,10 +14,32 @@ from redis.exceptions import DataError
 
 import litellm
 from litellm.proxy._types import Litellm_EntityType
-from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+from litellm.proxy.db.db_spend_update_writer import (
+    DBSpendUpdateWriter,
+    _get_daily_spend_date,
+)
 from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import (
     build_window_spend_transaction,
 )
+
+
+def test_get_daily_spend_date_uses_configured_business_timezone(monkeypatch):
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    monkeypatch.setenv("TZ", "UTC")
+
+    assert _get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-02"
+
+
+def test_get_daily_spend_date_defaults_to_utc(monkeypatch):
+    monkeypatch.delattr(litellm, "timezone", raising=False)
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+
+    assert _get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-01"
+
+
+def test_get_daily_spend_date_rejects_invalid_start_time():
+    assert _get_daily_spend_date("not-a-date") is None
+    assert _get_daily_spend_date(1) is None
 
 
 @pytest.mark.asyncio
