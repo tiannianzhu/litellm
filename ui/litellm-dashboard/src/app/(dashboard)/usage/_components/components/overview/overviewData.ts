@@ -1,7 +1,6 @@
 import type { DailyData, SpendMetrics } from "@/components/UsagePage/types";
 import { stackedUsageColor } from "@/components/shared/charts";
 import { EMPTY_DAILY_ACTIVITY_METADATA, type DailyActivityMetadata } from "@/components/UsagePage/dailyActivityApi";
-import type { GatewayActivity } from "../gatewayActivity";
 
 export type BreakdownDimension = "models" | "model_groups" | "providers";
 
@@ -251,19 +250,15 @@ export interface OverviewTotals {
   successRate: number | null;
 }
 
-/**
- * Request counts prefer the gateway's own tallies, falling back to the spend
- * aggregate, the same precedence the request tiles have always used.
- */
-export const overviewTotals = (raw: DailyActivityMetadata, gateway: GatewayActivity | null): OverviewTotals => {
+export const overviewTotals = (raw: DailyActivityMetadata): OverviewTotals => {
   // The schema marks every total optional; filling the defaults once keeps the arithmetic below plain.
   const metadata = { ...EMPTY_DAILY_ACTIVITY_METADATA, ...raw };
-  const successful = gateway?.total_successful_requests ?? metadata.total_successful_requests;
-  const failed = gateway?.total_failed_requests ?? metadata.total_failed_requests;
+  const successful = metadata.total_successful_requests;
+  const failed = metadata.total_failed_requests;
   const timed = metadata.total_timed_requests;
   return {
     spend: metadata.total_spend,
-    requests: gateway ? successful + failed : metadata.total_api_requests,
+    requests: metadata.total_api_requests,
     successful,
     failed,
     tokens: metadata.total_tokens,

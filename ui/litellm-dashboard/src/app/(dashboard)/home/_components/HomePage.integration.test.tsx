@@ -126,10 +126,13 @@ describe("HomePage", () => {
   });
 
   it("shows the usage totals from the daily activity API and links Create New Virtual Key to the key creation flow", async () => {
+    network.gateway.mockResolvedValue({ total_successful_requests: 900, total_failed_requests: 100 });
     renderHome();
     expect(screen.getByRole("heading", { level: 1, name: "Home" })).toBeInTheDocument();
     expect(await screen.findByText("$501.74")).toBeInTheDocument();
     expect(screen.getByText("5,118")).toBeInTheDocument();
+    expect(screen.getByText("5,075")).toBeInTheDocument();
+    expect(screen.getByText("43")).toBeInTheDocument();
     expect(screen.getByText("98.6M")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /create new virtual key/i })).toHaveAttribute(
       "href",

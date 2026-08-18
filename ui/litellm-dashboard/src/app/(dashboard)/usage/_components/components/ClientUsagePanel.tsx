@@ -112,7 +112,7 @@ export default function ClientUsagePanel({
     [activeAgent, agentDaily],
   );
   const colorByModel = useMemo(() => (colorSource ? modelColorMap(colorSource) : undefined), [colorSource]);
-  const personTotals = overviewTotals(personUsage.data.metadata ?? EMPTY_DAILY_ACTIVITY_METADATA, null);
+  const personTotals = overviewTotals(personUsage.data.metadata ?? EMPTY_DAILY_ACTIVITY_METADATA);
   const pending =
     !accessError && (scopedRequest ? personUsage.loading : (loading || summaryQuery.isLoading) && activeAgent === null);
   const summaryError = summaryQuery.isError || summaryFailed ? "Could not load client totals" : null;

@@ -241,10 +241,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   // Everything the request tiles read is stamped with the range it answers and
   // selected during render, rather than cleared in an effect. An effect runs
   // after the render that follows a date change, so state cleared there is one
-  // render too late: that render still holds the previous range's numbers and
-  // can paint them. One source is not enough, since the tiles read the gateway
-  // counts, fall through to the aggregate, and fall through again to the
-  // paginated pages, so a stamp on any one of them is escaped by the next.
+  // render too late and can paint the previous range's numbers.
   const currentGatewayRangeKey = fetchedRangeKey(startTime, endTime);
 
   const dailyActivityRequest = useMemo<DailyActivityRequest | null>(
@@ -272,7 +269,8 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   });
   // Tag data is deployment-wide with no per-user dimension, so Top agents only appears where the
   // rest of the page is deployment-wide too: an admin's global view with no user selected.
-  const showTopAgents = isAdmin && usageView === "global" && effectiveUserId === null;
+  const isDeploymentWideView = isAdmin && usageView === "global" && effectiveUserId === null;
+  const showTopAgents = isDeploymentWideView;
   const globalClientScope = clientUserId === null && clientTeamId === null && !clientScope.error;
   const globalClientSelected = isAdmin && selectedClient !== null && globalClientScope;
   const needsAgentSummary = showTopAgents || globalClientSelected;
@@ -310,7 +308,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   );
   const gatewayFetchIdRef = useRef(0);
   useEffect(() => {
-    if (!isAdmin || !gatewayRequest) return;
+    if (!isDeploymentWideView || !gatewayRequest) return;
     const fetchId = ++gatewayFetchIdRef.current;
     gatewayDailyActivityCall(gatewayRequest.accessToken, gatewayRequest.startTime, gatewayRequest.endTime)
       .then((data) => {
@@ -321,10 +319,10 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
         if (gatewayFetchIdRef.current !== fetchId) return;
         setGatewayActivityData(null);
       });
-  }, [isAdmin, gatewayRequest, currentGatewayRangeKey]);
+  }, [isDeploymentWideView, gatewayRequest, currentGatewayRangeKey]);
 
-  const gatewayActivity = selectGatewayActivity(
-    isAdmin && effectiveUserId === null,
+  const deploymentGatewayActivity = selectGatewayActivity(
+    isDeploymentWideView,
     gatewayActivityData,
     currentGatewayRangeKey,
   );
@@ -332,7 +330,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   const [requestErrorData, setRequestErrorData] = useState<FetchedForRange<RequestErrorActivity | null> | null>(null);
   const requestErrorFetchIdRef = useRef(0);
   useEffect(() => {
-    if (!isAdmin || !gatewayRequest) return;
+    if (!isDeploymentWideView || !gatewayRequest) return;
     const fetchId = ++requestErrorFetchIdRef.current;
     requestErrorActivityCall(gatewayRequest.accessToken, gatewayRequest.startTime, gatewayRequest.endTime)
       .then((data) => {
@@ -343,8 +341,8 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
         if (requestErrorFetchIdRef.current !== fetchId) return;
         setRequestErrorData({ rangeKey: currentGatewayRangeKey, value: null });
       });
-  }, [isAdmin, gatewayRequest, currentGatewayRangeKey]);
-  const requestErrorsForRange = isAdmin ? requestErrorData : null;
+  }, [isDeploymentWideView, gatewayRequest, currentGatewayRangeKey]);
+  const requestErrorsForRange = isDeploymentWideView ? requestErrorData : null;
   const requestErrorsFailed =
     requestErrorsForRange?.rangeKey === currentGatewayRangeKey && requestErrorsForRange.value === null;
   const requestErrorActivity =
@@ -359,7 +357,6 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   );
 
   const loading = aggregatedLoading;
-  const requestCountsPending = loading && gatewayActivity === null;
 
   const summaryMetrics = useMemo(
     () => overallUsageMetrics(userSpendData.results, userSpendData.metadata),
@@ -372,10 +369,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
     [setUrlParams],
   );
 
-  const totals = useMemo(
-    () => overviewTotals(userSpendData.metadata, gatewayActivity),
-    [userSpendData.metadata, gatewayActivity],
-  );
+  const totals = useMemo(() => overviewTotals(userSpendData.metadata), [userSpendData.metadata]);
   const providerSpend = useMemo(
     () => rollUpBreakdown(userSpendData.results, "providers").map(({ key, ...row }) => ({ provider: key, ...row })),
     [userSpendData.results],
@@ -402,7 +396,10 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
     () => [...userSpendData.results].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
     [userSpendData.results],
   );
-  const gatewayRequestsByRoute = useMemo(() => topGatewayRoutes(gatewayActivity), [gatewayActivity]);
+  const gatewayRequestsByRoute = useMemo(
+    () => topGatewayRoutes(deploymentGatewayActivity),
+    [deploymentGatewayActivity],
+  );
   const modelMetrics = useMemo(
     () => processActivityData(userSpendData, modelViewType === "groups" ? "model_groups" : "models", teams),
     [userSpendData, modelViewType, teams],
@@ -542,7 +539,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
                     results={sortedDailyResults}
                     totals={totals}
                     loading={loading}
-                    requestCountsPending={requestCountsPending}
+                    requestCountsPending={loading}
                     budget={currentUser?.max_budget ?? null}
                     topKeys={
                       <TopKeyView
@@ -554,7 +551,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
                     }
                     topUsers={<TopUsersView fetchUserPage={fetchUserPage} />}
                     gatewayByEndpoint={
-                      gatewayActivity && gatewayActivity.by_route.length > 0 ? (
+                      deploymentGatewayActivity && deploymentGatewayActivity.by_route.length > 0 ? (
                         <Panel
                           testId="gateway-requests-by-endpoint"
                           title="Gateway Requests by Endpoint"
@@ -658,7 +655,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
                       activity={requestErrorActivity}
                       loading={requestErrorActivity === null && !requestErrorsFailed}
                       failed={requestErrorsFailed}
-                      userScoped={effectiveUserId !== null}
+                      userScoped={!isDeploymentWideView}
                     />
                   </TabsContent>
                 )}
