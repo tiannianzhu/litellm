@@ -18,6 +18,7 @@ from litellm.constants import (
     MODEL_INSIGHTS_TASK_TAG_PREFIX,
 )
 from litellm.proxy._types import DB_RETRY_SAFE_ERROR_TYPES, SpendLogsPayload
+from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
 from litellm.proxy.db.model_insights_tasks import load_model_insight_tasks
 from litellm.proxy.db.rollup_lock_timeout import ROLLUP_LOCK_TIMEOUT_SQL, rollup_lock_timeout_setting
 from litellm.types.utils import BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN
@@ -109,13 +110,11 @@ def utc_date_from_start_time(start_time: datetime | str) -> str | None:
 
 
 def date_from_start_time(start_time: datetime | str) -> str | None:
-    if isinstance(start_time, datetime):
-        return start_time.date().isoformat()
-    return start_time[:10] if len(start_time) >= 10 else None
+    return get_daily_spend_date(start_time)
 
 
 def build_model_usage_transaction(payload: SpendLogsPayload) -> ModelUsageTransaction | None:
-    date: Final = date_from_start_time(payload["startTime"])
+    date: Final = get_daily_spend_date(payload["startTime"])
     origin: Final = _internal_call_origin(payload["metadata"])
     if date is None or (origin and origin != BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN):
         return None

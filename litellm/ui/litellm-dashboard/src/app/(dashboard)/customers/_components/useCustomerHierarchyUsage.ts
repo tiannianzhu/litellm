@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { skipToken, useQuery } from "@tanstack/react-query";
 import { parseAsString, useQueryStates } from "nuqs";
 import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
+import { useUsageDay } from "@/app/(dashboard)/usage/_components/usageDates";
 import { overviewTotals } from "@/app/(dashboard)/usage/_components/components/overview/overviewData";
 import type { DateRangePickerValue } from "@/components/shared/date_picker_types";
 import { EMPTY_DAILY_ACTIVITY_METADATA } from "@/components/UsagePage/dailyActivityApi";
@@ -43,16 +44,21 @@ const usageRequest = (
 export default function useCustomerHierarchyUsage() {
   const { accessToken } = useAuthorized();
   const [params, setParams] = useQueryStates(usageParsers);
-  const { dateValue, preset } = useMemo(() => customerDateSelection(params), [params]);
+  const day = useUsageDay("UTC");
+  const now = new Date(`${day}T00:00:00Z`);
+  const { dateValue, preset } = useMemo(
+    () => customerDateSelection(params, new Date(`${day}T00:00:00Z`)),
+    [params, day],
+  );
   const startDate = calendarDate(dateValue.from);
   const endDate = calendarDate(dateValue.to);
   const scope = params.org ? { org: params.org, team: params.team, member: params.member } : null;
   const baseRequest = usageRequest(scope, accessToken, startDate, endDate);
   const request = baseRequest ? { ...baseRequest, appId: params.app_id } : null;
-  const month = customerPresetRange("month");
+  const month = customerPresetRange("month", now);
   const monthStartDate = calendarDate(month.from);
   const monthEndDate = calendarDate(month.to);
-  const year = customerPresetRange("YTD");
+  const year = customerPresetRange("YTD", now);
   const yearStartDate = calendarDate(year.from);
   const yearEndDate = calendarDate(year.to);
   const usage = useQuery({

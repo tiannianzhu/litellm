@@ -137,6 +137,38 @@ async def test_filters_are_passed_to_sql_as_json_arrays(mock_prisma: MagicMock):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start_date", "end_date", "start", "end"),
+    [
+        (
+            "2026-11-05",
+            "2026-11-05",
+            "2026-11-05T00:00:00+00:00",
+            "2026-11-06T00:00:00+00:00",
+        ),
+        (
+            "2026-11-04T16:00:00.000Z",
+            "2026-11-05T16:00:00.000Z",
+            "2026-11-04T16:00:00+00:00",
+            "2026-11-05T16:00:00+00:00",
+        ),
+        (
+            "9999-12-31",
+            "9999-12-31",
+            "9999-12-31T00:00:00+00:00",
+            "10000-01-01T00:00:00+00:00",
+        ),
+    ],
+)
+async def test_cache_activity_uses_exclusive_end_for_utc_dates_and_exact_timestamps(
+    mock_prisma: MagicMock, start_date: str, end_date: str, start: str, end: str
+) -> None:
+    await _activity(ADMIN, start_date=start_date, end_date=end_date)
+
+    assert {call.args[1:3] for call in _spend_log_reads(mock_prisma).call_args_list} == {(start, end)}
+
+
+@pytest.mark.asyncio
 async def test_every_query_excludes_the_same_info_routes(mock_prisma: MagicMock):
     """Regression for LIT-5884: failed info-route calls are spend-logged but are not inference traffic, so
     the groups, error breakdown and both filter-option queries all receive the same exclusion list. What

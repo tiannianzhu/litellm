@@ -60,7 +60,7 @@ describe("client usage from request logs", () => {
     expect(identifyUsageClient(agent, [])).toBe(expected);
   });
 
-  it("should preserve recorded totals, local days, model groups, providers and measured latency", () => {
+  it("should preserve recorded totals, model groups, providers and measured latency", () => {
     const result = clientUsageFromLogs(page([log(), log({ request_id: "request-2", status: "failure" })]), scope);
     expect(result.error).toBeNull();
     const expectedTotals = {
@@ -83,9 +83,22 @@ describe("client usage from request logs", () => {
     expect(day?.breakdown?.model_groups?.["deployment-alias"].metrics?.spend).toBe(0.026);
     expect(day?.breakdown?.providers?.anthropic.metrics?.total_tokens).toBe(2400);
     expect(day?.breakdown?.api_keys).toEqual({});
-    const timestamp = new Date("2026-10-22T10:00:00Z");
-    const localDay = `${timestamp.getFullYear()}-${String(timestamp.getMonth() + 1).padStart(2, "0")}-${String(timestamp.getDate()).padStart(2, "0")}`;
-    expect(day?.date).toBe(localDay);
+    expect(day?.date).toBe("2026-10-22");
+  });
+
+  it("groups requests on opposite sides of Beijing midnight into different days", () => {
+    const result = clientUsageFromLogs(
+      page([
+        log({ request_id: "before", startTime: "2026-10-21T15:59:59.999Z" }),
+        log({ request_id: "after", startTime: "2026-10-21T16:00:00.000Z" }),
+      ]),
+      scope,
+    );
+
+    expect(result.data.results?.map((day) => [day.date, day.metrics?.api_requests])).toEqual([
+      ["2026-10-21", 1],
+      ["2026-10-22", 1],
+    ]);
   });
 
   it("should report guardrail spend inside model spend, capped at what each request was charged", () => {
@@ -194,7 +207,7 @@ describe("client usage from request logs", () => {
     expect(result.data.metadata?.total_timed_requests).toBe(0);
   });
 
-  it("should enforce exact timestamp bounds after the API query rounds to seconds", () => {
+  it("should enforce exact timestamp bounds on returned logs", () => {
     const rows = [
       log({ request_id: "before", startTime: "2026-10-22T10:00:00.100Z" }),
       log({ request_id: "inside", startTime: "2026-10-22T10:00:00.500" }),

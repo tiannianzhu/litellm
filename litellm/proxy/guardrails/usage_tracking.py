@@ -7,7 +7,7 @@ import asyncio
 import json
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime
 from functools import partial
 from itertools import groupby
 from types import MappingProxyType
@@ -21,6 +21,7 @@ from litellm.constants import SPEND_LOG_WRITE_BATCH_MAX_BYTES, SPEND_LOG_WRITE_B
 from litellm.litellm_core_utils.core_helpers import require_attributes
 from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import billed_guardrail_cost_by_unit
 from litellm.proxy._types import DB_RETRY_SAFE_ERROR_TYPES
+from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
 from litellm.proxy.db.spend_log_batching import spend_log_write_batches
 from litellm.proxy.utils import PrismaClient
 from litellm.repositories.prisma_protocols import TableActions
@@ -235,13 +236,6 @@ def _parse_guardrail_info_from_payload(payload: Mapping[str, object]) -> Sequenc
     return info
 
 
-def _date_str(dt: datetime) -> str:
-    """YYYY-MM-DD in UTC."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
-
-
 def _parse_payload_start_time(payload: Mapping[str, object]) -> datetime | None:
     start_time: Final = payload.get("startTime")
     if isinstance(start_time, datetime):
@@ -261,7 +255,7 @@ def _iter_usage_unit_increments(
         start_time = _parse_payload_start_time(payload)
         if not payload.get("request_id") or start_time is None:
             continue
-        date_key = _date_str(start_time)
+        date_key = get_daily_spend_date(start_time)
         team_id = str(payload.get("team_id") or "")
         api_key = str(payload.get("api_key") or "")
         for entry in _parse_guardrail_info_from_payload(payload):
@@ -406,7 +400,7 @@ async def _record_guardrail_usage(
         start_time = _parse_payload_start_time(payload)
         if not isinstance(request_id, str) or not request_id or start_time is None:
             continue
-        date_key = _date_str(start_time)
+        date_key = get_daily_spend_date(start_time)
 
         entries = _parse_guardrail_info_from_payload(payload)
         ids_by_name = MappingProxyType(

@@ -9,10 +9,10 @@ import {
   type DailyActivityRequest,
 } from "@/components/UsagePage/dailyActivityApi";
 import { DailyData } from "@/components/UsagePage/types";
+import { presetRange } from "@/components/shared/date_range_presets";
 import { spendScopeUserId } from "@/utils/roles";
 import { useAggregatedDailyActivity } from "@/app/(dashboard)/usage/_components/hooks/useAggregatedDailyActivity";
 
-const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const activityDate = createParser({
   parse: (value) => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
@@ -49,15 +49,14 @@ export interface DailyActivityRange {
 export type ActivityDateRange = Pick<DailyActivityRange, "dateValue" | "onDateChange">;
 
 export const useActivityDateRange = (): ActivityDateRange => {
-  const initialFrom = useMemo(() => new Date(new Date().getTime() - THIRTY_DAYS_MS), []);
-  const initialTo = useMemo(() => new Date(), []);
+  const initialRange = useMemo(() => presetRange("last_30_days"), []);
   const [params, setParams] = useQueryStates(activityDates);
   const dateValue = useMemo<DateRange>(
     () =>
       params.activity_from && params.activity_to && params.activity_from <= params.activity_to
         ? { from: params.activity_from, to: params.activity_to }
-        : { from: initialFrom, to: initialTo },
-    [params.activity_from, params.activity_to, initialFrom, initialTo],
+        : initialRange,
+    [params.activity_from, params.activity_to, initialRange],
   );
   const onDateChange = (value: DateRange) => {
     void setParams({ activity_from: value.from ?? null, activity_to: value.to ?? null });
@@ -88,7 +87,6 @@ export const useScopedDailyActivityRange = (
             endTime,
             entityIds: userId ? [userId] : null,
             apiKey,
-            includeCurrentUtcDay: true,
           }
         : null,
     [accessToken, startTime, endTime, userId, apiKey],

@@ -9,7 +9,7 @@ import {
   type DailyActivityAggregatedResponse,
 } from "@/components/UsagePage/dailyActivityApi";
 import type { SpendMetrics } from "@/components/UsagePage/types";
-import { renderWithProviders, screen, testQueryClient, waitFor } from "../../../../../tests/test-utils";
+import { act, renderWithProviders, screen, testQueryClient, waitFor } from "../../../../../tests/test-utils";
 import CustomerUsageOverview from "./CustomerUsageOverview";
 
 const metrics = (spend: number, requests: number, tokens: number): SpendMetrics => ({
@@ -77,6 +77,7 @@ describe("CustomerUsageOverview", () => {
 
     expect(await screen.findByText("$15.00")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Daily usage" })).toBeInTheDocument();
+    expect(screen.getByText("Beijing time (Asia/Shanghai)")).toBeInTheDocument();
     expect(screen.getByTitle("700 tokens")).toBeInTheDocument();
     expect(screen.getByText("customer-primary")).toBeInTheDocument();
     expect(screen.getByText("customer-reserve")).toBeInTheDocument();
@@ -94,6 +95,52 @@ describe("CustomerUsageOverview", () => {
     expect(screen.getByText("200")).toBeInTheDocument();
     await user.click(screen.getByRole("radio", { name: "Requests" }));
     expect(screen.getByText("5")).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      search: "",
+      before: ["2026-11-01", "2026-11-30"],
+      after: ["2026-12-01", "2026-12-01"],
+    },
+    {
+      search: "&range=today",
+      before: ["2026-11-30", "2026-11-30"],
+      after: ["2026-12-01", "2026-12-01"],
+    },
+    {
+      search: "&from=2026-10-12&to=2026-10-14",
+      before: ["2026-10-12", "2026-10-14"],
+      after: ["2026-10-12", "2026-10-14"],
+    },
+  ])("advances rolling customer ranges at Beijing midnight for '$search'", async ({ search, before, after }) => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(new Date("2026-11-30T15:59:59Z"));
+    try {
+      const onUrlUpdate = vi.fn();
+      const { unmount } = renderWithProviders(<CustomerUsageOverview customerId="customer-1" />, {
+        searchParams: `?id=customer-1&source=overview${search}`,
+        onUrlUpdate,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      expect(requestedUrls().at(-1)?.searchParams.get("start_date")).toBe(before[0]);
+      expect(requestedUrls().at(-1)?.searchParams.get("end_date")).toBe(before[1]);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+
+      expect(requestedUrls().at(-1)?.searchParams.get("start_date")).toBe(after[0]);
+      expect(requestedUrls().at(-1)?.searchParams.get("end_date")).toBe(after[1]);
+      expect(requestedUrls().at(-1)?.searchParams.get("end_user_ids")).toBe("customer-1");
+      expect(onUrlUpdate).not.toHaveBeenCalled();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("should change the customer date range without losing the selected customer or unrelated URL state", async () => {

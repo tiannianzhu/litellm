@@ -147,8 +147,6 @@ function CustomerOrganizations() {
               onSort={onSortingChange}
               loading={loading}
               searching={Boolean(search)}
-              startDate={startDate}
-              endDate={endDate}
               usageTotals={usageTotals}
               canManage={canManage}
               onEdit={setEditingOrganizationId}

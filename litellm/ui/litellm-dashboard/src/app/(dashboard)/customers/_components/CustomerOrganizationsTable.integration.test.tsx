@@ -35,8 +35,6 @@ it("shows a custom-only organization cap without calling it uncapped", () => {
       onSort={vi.fn()}
       loading={false}
       searching={false}
-      startDate="2026-11-01"
-      endDate="2026-11-18"
       usageTotals={null}
       canManage
       onEdit={vi.fn()}

@@ -1,5 +1,6 @@
 import { createParser, parseAsStringLiteral, useQueryStates, type inferParserType } from "nuqs";
 import { useMemo } from "react";
+import { useUsageDay } from "@/app/(dashboard)/usage/_components/usageDates";
 import type { DateRangePickerValue } from "@/components/shared/date_picker_types";
 import { relativeTimeOptions, type RelativeTimeOption } from "@/components/shared/date_range_presets";
 
@@ -40,7 +41,7 @@ export const customerPresetRange = (preset: Preset, now = new Date()): Range => 
   if (preset === "YTD") return { from: new Date(year, 0, 1), to };
   if (preset === "MTD") return { from: new Date(year, month, 1), to };
   if (preset === "today" || preset === "7d" || preset === "30d") {
-    const days = { today: 0, "7d": 7, "30d": 30 }[preset];
+    const days = { today: 0, "7d": 6, "30d": 29 }[preset];
     return { from: new Date(year, month, day - days), to };
   }
   const targetMonth = preset === "previous" ? month - 1 : month;
@@ -106,7 +107,8 @@ export const customerDatePatch = (value: DateRangePickerValue, preset: string | 
 
 export const useCustomerUsageRange = () => {
   const [params, setParams] = useQueryStates(customerUsageDateParsers);
-  const selection = useMemo(() => customerDateSelection(params), [params]);
+  const day = useUsageDay("UTC");
+  const selection = useMemo(() => customerDateSelection(params, new Date(`${day}T00:00:00Z`)), [params, day]);
   const onDateChange = (value: DateRangePickerValue, preset: string | null) => {
     const patch = customerDatePatch(value, preset);
     if (patch) void setParams(patch, { history: "push" });

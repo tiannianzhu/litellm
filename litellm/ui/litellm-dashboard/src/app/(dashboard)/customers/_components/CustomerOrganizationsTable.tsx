@@ -1,16 +1,14 @@
 import { useTranslation } from "react-i18next";
 import type { SortingState } from "@tanstack/react-table";
-import { createSerializer, parseAsString } from "nuqs";
 import { TableCell, TableRow } from "@/components/ui/table";
-import { uiHref } from "@/utils/uiHref";
 import { $api } from "@/lib/http/api";
 import { customerOrganizationBudgetSource, type CustomerOrganizationRow } from "./customerOrganizations";
+import { useCustomerHierarchyLinks } from "./CustomerHierarchyNavigation";
 import { CustomerSpendCells, CustomerSpendIdentity, CustomerSpendTier } from "./CustomerSpendCells";
 import CustomerTokenTotal from "./CustomerTokenTotal";
 import { EMPTY_CUSTOMER_USAGE, type CustomerUsageTotals } from "./customerUsageTotals";
 import { CustomerUsageEditButton, CustomerUsageTable, CustomerUsageTableHeaders } from "./CustomerUsageTable";
 
-const usageHref = createSerializer({ org: parseAsString, from: parseAsString, to: parseAsString });
 const COLUMNS = [
   { id: "customer", label: "customerPortal.list.columns.customer", defaultDescending: false },
   { id: "group", label: "customerPortal.list.columns.tier" },
@@ -28,8 +26,6 @@ export default function CustomerOrganizationsTable({
   onSort,
   loading,
   searching,
-  startDate,
-  endDate,
   usageTotals,
   canManage,
   onEdit,
@@ -39,14 +35,13 @@ export default function CustomerOrganizationsTable({
   onSort: (sorting: SortingState) => void;
   loading: boolean;
   searching: boolean;
-  startDate: string;
-  endDate: string;
   usageTotals: CustomerUsageTotals | null;
   canManage: boolean;
   onEdit: (organizationId: string) => void;
 }) {
   const { t } = useTranslation();
   const groups = $api.useQuery("get", "/management/v1/customer_organization_budget_groups", {});
+  const { customerHierarchyHref } = useCustomerHierarchyLinks();
   const emptyMessage =
     rows.length === 0 ? t(searching ? "customerPortal.list.noMatches" : "customerPortal.list.empty") : undefined;
   return (
@@ -74,11 +69,7 @@ export default function CustomerOrganizationsTable({
                   usageLayout
                   nameClassName="max-w-40 hover:underline"
                   idClassName="max-w-40"
-                  href={usageHref(uiHref("customers/usage"), {
-                    org: organization.customer_org_id,
-                    from: startDate,
-                    to: endDate,
-                  })}
+                  href={customerHierarchyHref("usage", { org: organization.customer_org_id, team: null, member: null })}
                 />
               </TableCell>
               <CustomerSpendTier entity={{ ...entity, budgetGroup: budgetGroup ?? "-" }} />

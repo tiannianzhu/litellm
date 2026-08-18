@@ -6,7 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AutoRouterDeployment } from "@/app/(dashboard)/hooks/models/useModels";
 import { ApiError } from "@/lib/http/client";
 
-vi.mock("./useAutoRouterBenchmarks", () => ({ useAutoRouterBenchmarks: vi.fn() }));
+vi.mock("./useAutoRouterBenchmarks", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useAutoRouterBenchmarks")>()),
+  useAutoRouterBenchmarks: vi.fn(),
+}));
 vi.mock("@/app/(dashboard)/hooks/models/useModels", () => ({ useAutoRouters: vi.fn() }));
 vi.mock("./AutoRouterSummaryTable", () => ({ default: () => <div data-testid="router-summary" /> }));
 vi.mock("./ShadowEvalSection", () => ({ default: () => <div data-testid="shadow-eval-section" /> }));
@@ -467,7 +470,7 @@ describe("AutoRouterBenchmarksTab", () => {
     expect(screen.queryByText("-0%")).not.toBeInTheDocument();
   });
 
-  it("queries the shared picker's range and pushes picker changes back to the shared state", () => {
+  it("queries the selected UTC range and passes custom dates to the host", () => {
     mockHook({ data: response([group()]) });
     const { dateValue, onDateChange } = renderTab();
 

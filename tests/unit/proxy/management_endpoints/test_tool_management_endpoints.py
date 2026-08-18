@@ -9,8 +9,8 @@ imports these inside function bodies to avoid circular imports.
 
 import inspect
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Final, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from prisma.actions import LiteLLM_TeamTableActions
 
+import litellm
 
 from litellm.proxy.management_endpoints.tool_management_endpoints import router
 from litellm.types.tool_management import LiteLLM_ToolTableRow
@@ -383,14 +384,53 @@ class TestToolManagementEndpoints:
         assert resp.json()["start_date"] == "2026-01-01"
         assert resp.json()["end_date"] == "2026-07-01"
 
-    def test_tool_spend_defaults_to_trailing_30_days(self):
-        prisma = _rollup_prisma([])
-        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
-            resp = self.client.get("/v1/tool/spend")
+    def test_tool_spend_defaults_to_30_business_days(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+        prisma: Final = _rollup_prisma([])
+        with (
+            patch("litellm.proxy.proxy_server.prisma_client", prisma),
+            patch("litellm.proxy.management_endpoints.tool_management_endpoints.datetime", wraps=datetime) as clock,
+        ):
+            clock.now.side_effect = datetime(2026, 5, 1, 17, tzinfo=timezone.utc).astimezone
+            resp: Final = self.client.get("/v1/tool/spend")
         assert resp.status_code == 200
-        today = datetime.now(timezone.utc)
-        assert resp.json()["end_date"] == today.strftime("%Y-%m-%d")
-        assert resp.json()["start_date"] == (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        assert resp.json()["end_date"] == "2026-05-02"
+        assert resp.json()["start_date"] == "2026-04-02"
+
+    @pytest.mark.parametrize(
+        "zone, day, start, end",
+        (
+            ("Asia/Shanghai", "2026-05-02", "2026-05-01T16:00:00+00:00", "2026-05-02T16:00:00+00:00"),
+            ("America/New_York", "2026-03-08", "2026-03-08T05:00:00+00:00", "2026-03-09T04:00:00+00:00"),
+        ),
+    )
+    def test_tool_logs_filter_complete_business_days(
+        self, monkeypatch: pytest.MonkeyPatch, zone: str, day: str, start: str, end: str
+    ) -> None:
+        monkeypatch.setattr(litellm, "timezone", zone, raising=False)
+        prisma: Final = _rollup_prisma([])
+        prisma.db.litellm_spendlogtoolindex.count = AsyncMock(return_value=0)
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            response: Final = self.client.get(f"/v1/tool/search/logs?start_date={day}&end_date={day}")
+
+        assert response.status_code == 200
+        where: Final = {
+            "tool_name": "search",
+            "start_time": {"gte": datetime.fromisoformat(start), "lt": datetime.fromisoformat(end)},
+        }
+        prisma.db.litellm_spendlogtoolindex.count.assert_awaited_once_with(where=where)
+        prisma.db.litellm_spendlogtoolindex.find_many.assert_awaited_once_with(
+            where=where, order={"start_time": "desc"}, skip=0, take=50
+        )
+
+    def test_tool_logs_reject_invalid_dates(self) -> None:
+        prisma: Final = _rollup_prisma([])
+        prisma.db.litellm_spendlogtoolindex.count = AsyncMock(return_value=0)
+        with patch("litellm.proxy.proxy_server.prisma_client", prisma):
+            response: Final = self.client.get("/v1/tool/search/logs?start_date=invalid")
+
+        assert response.status_code == 400
+        prisma.db.litellm_spendlogtoolindex.find_many.assert_not_awaited()
 
     @pytest.mark.parametrize(
         "query",

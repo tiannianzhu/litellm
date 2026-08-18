@@ -18,8 +18,8 @@ describe("customer usage calendar ranges", () => {
     ["YTD", "2025-11-12T00:01:00Z", "2025-01-01..2025-11-12"],
     ["MTD", "2025-01-01T00:01:00Z", "2025-01-01..2025-01-01"],
     ["today", "2025-01-01T00:01:00Z", "2025-01-01..2025-01-01"],
-    ["7d", "2025-01-01T00:01:00Z", "2024-12-25..2025-01-01"],
-    ["30d", "2024-03-01T23:59:00Z", "2024-01-31..2024-03-01"],
+    ["7d", "2025-01-01T00:01:00Z", "2024-12-26..2025-01-01"],
+    ["30d", "2024-03-01T23:59:00Z", "2024-02-01..2024-03-01"],
   ] as const)("resolves %s at %s as UTC calendar days", (preset, now, expected) => {
     expect(customerRangeParser.serialize(customerPresetRange(preset, new Date(now)))).toBe(expected);
   });

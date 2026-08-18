@@ -42,8 +42,6 @@ const EMPTY_TOOL_SPEND: ToolSpendResponse = {
   end_date: null,
 };
 
-const isoDay = (d: Date): string => d.toISOString().slice(0, 10);
-
 const UsageTab: React.FC<UsageTabProps> = ({ accessToken, activity }) => {
   const { t } = useTranslation();
   const { dateValue, onDateChange, results, loading } = activity;
@@ -53,13 +51,13 @@ const UsageTab: React.FC<UsageTabProps> = ({ accessToken, activity }) => {
 
   const canViewProxyWideCostData = useCan("viewProxyWideCostData");
   const toolSpendEnabled = canViewProxyWideCostData && !!accessToken && !!startTime && !!endTime;
-  const rangeKey = startTime && endTime ? `${isoDay(startTime)}|${isoDay(endTime)}` : "";
+  const rangeKey = startTime && endTime ? `${localIsoDay(startTime)}|${localIsoDay(endTime)}` : "";
   const [toolSpendState, setToolSpendState] = useState<{ key: string; data: ToolSpendResponse } | null>(null);
 
   useEffect(() => {
     if (!canViewProxyWideCostData || !accessToken || !startTime || !endTime) return;
     let cancelled = false;
-    getToolSpend(accessToken, isoDay(startTime), isoDay(endTime))
+    getToolSpend(accessToken, localIsoDay(startTime), localIsoDay(endTime))
       .then((res) => {
         if (!cancelled) setToolSpendState({ key: rangeKey, data: res });
       })
@@ -92,7 +90,7 @@ const UsageTab: React.FC<UsageTabProps> = ({ accessToken, activity }) => {
     accumulation === "cumulative"
       ? t("costOptimization.usage.savings.runningTotal")
       : t("costOptimization.usage.savings.savedPerInterval", { interval: intervalLabel.toLowerCase() }),
-    rangeLabel && t("costOptimization.usage.savings.rangeUtc", { range: rangeLabel }),
+    rangeLabel,
   ]
     .filter(Boolean)
     .join(" \u00b7 ");
@@ -130,8 +128,12 @@ const UsageTab: React.FC<UsageTabProps> = ({ accessToken, activity }) => {
   return (
     <div className="w-full space-y-6">
       <div className="flex flex-wrap items-center justify-end gap-4">
-        <span className="text-sm text-muted-foreground">{t("costOptimization.usage.bucketedByUtcDay")}</span>
-        <AdvancedDatePicker value={dateValue} onValueChange={onDateChange} />
+        <span className="text-sm text-muted-foreground">{t("costOptimization.usage.groupedByBusinessDay")}</span>
+        <AdvancedDatePicker
+          value={dateValue}
+          onValueChange={onDateChange}
+          timeZoneLabel={t("shared.advancedDatePicker.beijingTimeZone")}
+        />
       </div>
 
       <SavingsTiles results={results} isLoading={loading} />

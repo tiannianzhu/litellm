@@ -48,6 +48,7 @@ const mockCustomerApi = ({
   cachePricing?: Readonly<Pick<SpendMetrics, "cache_cost" | "priced_cache_tokens">>;
 }> = {}) => {
   const updateOrganization = vi.fn<(id: string, body: components["schemas"]["OrganizationPatch"]) => void>();
+  const requests: URL[] = [];
   const createOrganization = vi.fn((body: components["schemas"]["OrganizationCreate"]) => ({
     ...original[1],
     customer_org_id: body.customer_org_id,
@@ -84,6 +85,7 @@ const mockCustomerApi = ({
       });
     }
     if (url.pathname === "/management/v1/customer_organizations/daily/activity/aggregated") {
+      requests.push(url);
       if (failed) return Response.json({ detail: "Unavailable" }, { status: 503 });
       const previous = url.searchParams.get("start_date") === "2024-02-01";
       const metrics = (spend: number) => ({
@@ -143,14 +145,19 @@ const mockCustomerApi = ({
     throw new Error(`Unexpected request ${request.method} ${url.pathname}`);
   });
   vi.stubGlobal("fetch", fetchMock);
-  return { createOrganization, updateOrganization };
+  return { createOrganization, updateOrganization, requests };
 };
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
   testQueryClient.clear();
-  const claims = { key: "sk-test", user_id: "admin", user_role: "proxy_admin", exp: NOW.getTime() / 1000 + 3600 };
+  const claims = {
+    key: "sk-test",
+    user_id: "admin",
+    user_role: "proxy_admin",
+    exp: new Date("2024-05-01T00:00:00Z").getTime() / 1000,
+  };
   document.cookie = `token=${btoa("{}")}.${btoa(JSON.stringify(claims))}.test; Path=/`;
   mockCustomerApi();
   vi.stubGlobal("requestIdleCallback", (callback: IdleRequestCallback) =>
@@ -275,7 +282,106 @@ describe("customer organization overview", () => {
     expect(within(row).queryByText("Custom")).not.toBeInTheDocument();
   });
 
+  it("refreshes the UTC month-to-date range when returning after month end", async () => {
+    const { requests } = mockCustomerApi();
+    vi.setSystemTime(new Date("2024-03-31T23:59:59Z"));
+    renderWithProviders(<CustomersPage />);
+    await screen.findByRole("link", { name: "Customer 29" });
+    expect(requests.at(-1)?.searchParams.get("start_date")).toBe("2024-03-01");
+    expect(requests.at(-1)?.searchParams.get("end_date")).toBe("2024-03-31");
+    act(() => {
+      vi.setSystemTime(new Date("2024-04-01T00:00:01Z"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(
+        requests.map((request) => [request.searchParams.get("start_date"), request.searchParams.get("end_date")]),
+      ).toEqual(
+        expect.arrayContaining([
+          ["2024-04-01", "2024-04-01"],
+          ["2024-04-01", "2024-04-30"],
+        ]),
+      ),
+    );
+    expect(await screen.findByRole("link", { name: "Customer 29" })).toHaveAttribute(
+      "href",
+      "/ui/customers/usage?org=customer-29",
+    );
+    expect(screen.getByText("Spend is bucketed by UTC day")).toBeInTheDocument();
+  });
+
+  it("keeps a custom range across month end and sends edited calendar days", async () => {
+    const { requests } = mockCustomerApi();
+    const user = userEvent.setup();
+    renderWithProviders(<CustomersPage />, { searchParams: "?range=2024-02-01..2024-02-29&period=previous" });
+    await screen.findByRole("link", { name: "Customer 29" });
+    act(() => {
+      vi.setSystemTime(new Date("2024-04-01T00:00:01Z"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(requests.some((request) => request.searchParams.get("start_date") === "2024-04-01")).toBe(true),
+    );
+    expect(
+      within(screen.getByRole("region", { name: "Overall customer usage" })).getByText("$20.00"),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "Customer 29" })).toHaveAttribute(
+      "href",
+      "/ui/customers/usage?org=customer-29&range=2024-02-01..2024-02-29&period=previous",
+    );
+    await user.click(screen.getByRole("button", { name: /1 Feb 2024/ }));
+    fireEvent.change(screen.getByLabelText("Start date"), { target: { value: "2024-01-03" } });
+    fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2024-01-10" } });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect(screen.getByRole("link", { name: "Customer 29" })).toHaveAttribute(
+        "href",
+        "/ui/customers/usage?org=customer-29&from=2024-01-03&to=2024-01-10",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        requests.map((request) => [request.searchParams.get("start_date"), request.searchParams.get("end_date")]),
+      ).toContainEqual(["2024-01-03", "2024-01-10"]),
+    );
+  });
+
+  it("keeps a relative range when opening customer usage after a UTC day change", async () => {
+    const { requests } = mockCustomerApi();
+    const user = userEvent.setup();
+    vi.setSystemTime(new Date("2024-03-31T23:59:59Z"));
+    renderWithProviders(<CustomersPage />);
+    await screen.findByRole("link", { name: "Customer 29" });
+    await user.click(screen.getByRole("button", { name: /31 Mar 2024/ }));
+    await user.click(screen.getByRole("button", { name: /^Today/ }));
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect(screen.getByRole("link", { name: "Customer 29" })).toHaveAttribute(
+        "href",
+        "/ui/customers/usage?org=customer-29&range=today",
+      ),
+    );
+    act(() => {
+      vi.setSystemTime(new Date("2024-04-01T00:00:01Z"));
+      window.dispatchEvent(new Event("focus"));
+    });
+    await waitFor(() =>
+      expect(
+        requests.some(
+          (request) =>
+            request.searchParams.get("start_date") === "2024-04-01" &&
+            request.searchParams.get("end_date") === "2024-04-01",
+        ),
+      ).toBe(true),
+    );
+    expect(await screen.findByRole("link", { name: "Customer 29" })).toHaveAttribute(
+      "href",
+      "/ui/customers/usage?org=customer-29&range=today",
+    );
+  });
+
   it("should keep complete totals and shares while sorting, paginating, and searching", async () => {
+    const { requests } = mockCustomerApi();
     const user = userEvent.setup();
     renderWithProviders(<CustomersPage />);
     await screen.findByRole("link", { name: "Customer 29" });
@@ -283,10 +389,10 @@ describe("customer organization overview", () => {
     expect(spendTable.getByRole("columnheader", { name: "Tokens", exact: true })).toBeInTheDocument();
     expect(spendTable.queryByRole("columnheader", { name: "Recorded cache cost" })).not.toBeInTheDocument();
     expect(customerLinks()[0]).toHaveTextContent("Customer 29");
-    expect(customerLinks()[0]).toHaveAttribute(
-      "href",
-      "/ui/customers/usage?org=customer-29&from=2024-03-01&to=2024-03-15",
-    );
+    expect(customerLinks()[0]).toHaveAttribute("href", "/ui/customers/usage?org=customer-29");
+    expect(
+      requests.map((request) => [request.searchParams.get("start_date"), request.searchParams.get("end_date")]),
+    ).toContainEqual(["2024-03-01", "2024-03-15"]);
     const overview = screen.getByRole("region", { name: "Overall customer usage" });
     expect(within(overview).getByText("$100.00")).toBeInTheDocument();
     expect(within(overview).getByText("20")).toBeInTheDocument();
@@ -324,39 +430,39 @@ describe("customer organization overview", () => {
     expect(within(overview).getByText("$100.00")).toBeInTheDocument();
   });
 
-  it.each(["range=2024-02-01..2024-02-29", "from=2024-02-01&to=2024-02-29"])(
-    "should restore saved sorting and %s without changing monthly shares",
-    async (dates) => {
-      const user = userEvent.setup();
-      renderWithProviders(<CustomersPage />, {
-        searchParams: `?sort_by=customer&sort_order=asc&${dates}`,
-      });
-      await screen.findByRole("link", { name: "Customer 00" });
-      expect(customerLinks()[0]).toHaveTextContent("Customer 00");
-      expect(
-        within(screen.getByRole("region", { name: "Overall customer usage" })).getByText("$20.00"),
-      ).toBeInTheDocument();
-      expect(within(screen.getByRole("row", { name: /Customer 00/ })).getByText("75%")).toBeInTheDocument();
-      const row = within(screen.getByRole("row", { name: /Customer 00/ }));
-      expect(row.getByText("20% cached")).toBeInTheDocument();
-      await user.click(row.getByRole("button", { name: "100 total tokens. View breakdown" }));
-      expect(await screen.findByRole("dialog", { name: "Token breakdown" })).toHaveTextContent(
-        /Cache read tokens\s*12\s*Cache write tokens\s*6\s*Output tokens\s*40\s*Recorded cache cost\s*\$0\.05$/,
-      );
-      await user.keyboard("{Escape}");
-      expect(screen.getByRole("link", { name: "Customer 00" })).toHaveAttribute(
-        "href",
-        "/ui/customers/usage?org=customer-00&from=2024-02-01&to=2024-02-29",
-      );
-      await user.click(screen.getByRole("button", { name: /1 Feb 2024/ }));
-      await user.click(screen.getByRole("button", { name: /This month/ }));
-      await user.click(screen.getByRole("button", { name: "Apply" }));
-      expect(
-        await within(screen.getByRole("region", { name: "Overall customer usage" })).findByText("$100.00"),
-      ).toBeInTheDocument();
-      expect(within(screen.getByRole("row", { name: /Customer 00/ })).getByText("75%")).toBeInTheDocument();
-    },
-  );
+  it.each([
+    ["range=2024-02-01..2024-02-29", "range=2024-02-01..2024-02-29"],
+    ["from=2024-02-01&to=2024-02-29", "from=2024-02-01&to=2024-02-29"],
+  ])("should restore saved sorting and %s without changing monthly shares", async (dates, linkDates) => {
+    const user = userEvent.setup();
+    renderWithProviders(<CustomersPage />, {
+      searchParams: `?sort_by=customer&sort_order=asc&${dates}`,
+    });
+    await screen.findByRole("link", { name: "Customer 00" });
+    expect(customerLinks()[0]).toHaveTextContent("Customer 00");
+    expect(
+      within(screen.getByRole("region", { name: "Overall customer usage" })).getByText("$20.00"),
+    ).toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: /Customer 00/ })).getByText("75%")).toBeInTheDocument();
+    const row = within(screen.getByRole("row", { name: /Customer 00/ }));
+    expect(row.getByText("20% cached")).toBeInTheDocument();
+    await user.click(row.getByRole("button", { name: "100 total tokens. View breakdown" }));
+    expect(await screen.findByRole("dialog", { name: "Token breakdown" })).toHaveTextContent(
+      /Cache read tokens\s*12\s*Cache write tokens\s*6\s*Output tokens\s*40\s*Recorded cache cost\s*\$0\.05$/,
+    );
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("link", { name: "Customer 00" })).toHaveAttribute(
+      "href",
+      `/ui/customers/usage?org=customer-00&${linkDates}`,
+    );
+    await user.click(screen.getByRole("button", { name: /1 Feb 2024/ }));
+    await user.click(screen.getByRole("button", { name: /This month/ }));
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    expect(
+      await within(screen.getByRole("region", { name: "Overall customer usage" })).findByText("$100.00"),
+    ).toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: /Customer 00/ })).getByText("75%")).toBeInTheDocument();
+  });
 
   it("should show a newly created customer first and resets the search, sort, and page", async () => {
     const { createOrganization } = mockCustomerApi();

@@ -12,6 +12,7 @@ from litellm.proxy.common_utils.timezone_utils import (
     get_budget_reset_time,
     get_budget_reset_timezone,
     get_budget_window_reset_fields,
+    get_daily_spend_date,
     parse_budget_reset_time,
 )
 
@@ -191,3 +192,22 @@ def test_new_window_keeps_scheduled_start_once_reset_time_passed(duration: str) 
     now: Final = datetime(2025, 6, 10, 7, 0, tzinfo=timezone.utc)
     fields: Final = get_budget_window_reset_fields(duration, settings=settings, now=now)
     assert datetime.fromisoformat(fields["window_start"]) < now
+
+
+def test_get_daily_spend_date_uses_configured_business_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    monkeypatch.setenv("TZ", "UTC")
+
+    assert get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-02"
+
+
+def test_get_daily_spend_date_defaults_to_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delattr(litellm, "timezone", raising=False)
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+
+    assert get_daily_spend_date("2026-05-01T17:00:00Z") == "2026-05-01"
+
+
+def test_get_daily_spend_date_rejects_invalid_start_time() -> None:
+    assert get_daily_spend_date("not-a-date") is None
+    assert get_daily_spend_date(1) is None

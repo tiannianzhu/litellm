@@ -30,6 +30,7 @@ import { KeyOverview } from "./key_detail/KeyOverview";
 import { KeyTabsList } from "./key_detail/KeyTabsList";
 import KeySavingsTab from "./KeySavingsTab";
 import KeyAutoRouterUsageTab from "./KeyAutoRouterUsageTab";
+import { useAutoRouterDateRange } from "@/app/(dashboard)/cost-optimization/_components/useAutoRouterBenchmarks";
 import { useActivityDateRange } from "@/app/(dashboard)/cost-optimization/_components/useDailyActivityRange";
 import { useEffect, useMemo, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
@@ -121,6 +122,7 @@ export default function KeyInfoView({
   const { accessToken, userId: userID, userRole, premiumUser, isViewOnly } = useAuthorized();
   const accessGroupNames = useModelAccessGroupNames();
   const activityDateRange = useActivityDateRange();
+  const autoRouterActivity = useAutoRouterDateRange();
   const [activeTab, setActiveTab] = useUrlTab(
     ["overview", "activity", "lens", "savings", "auto-router-usage", "settings"],
     "overview",
@@ -879,7 +881,7 @@ export default function KeyInfoView({
                 <KeyAutoRouterUsageTab
                   accessToken={accessToken}
                   keyToken={currentKeyData.token}
-                  activity={activityDateRange}
+                  activity={autoRouterActivity}
                 />
               </TabsContent>
             )}

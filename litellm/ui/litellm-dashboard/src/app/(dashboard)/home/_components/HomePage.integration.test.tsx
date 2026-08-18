@@ -139,6 +139,24 @@ describe("HomePage", () => {
     expect(network.aggregated).toHaveBeenCalledWith("user", expect.objectContaining({ accessToken: "sk-test" }));
   });
 
+  it("queries seven Beijing report dates including today", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-04T16:30:00Z"));
+    try {
+      renderHome();
+      await screen.findByText("$501.74");
+      expect(network.aggregated).toHaveBeenCalledWith(
+        "user",
+        expect.objectContaining({
+          startTime: new Date(2026, 9, 30),
+          endTime: new Date(2026, 10, 5, 23, 59, 59, 999),
+        }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("hides Create New Virtual Key from view-only users", () => {
     auth.isViewOnly = true;
     renderHome();

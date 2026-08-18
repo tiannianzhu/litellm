@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import { parseAsInteger, parseAsString, parseAsStringLiteral, useQueryStates } from "nuqs";
 import useAuthorized from "@/app/(dashboard)/hooks/useAuthorized";
+import { useUsageDay } from "@/app/(dashboard)/usage/_components/usageDates";
 import { fetchClient } from "@/lib/http/api";
 import i18n from "@/i18n/i18n";
 import { isProxyAdminRole } from "@/utils/roles";
@@ -121,8 +122,10 @@ function useChildSpend(
     list?.kind === "teams"
       ? list.data.map((team) => customerUsageEntity(team.customer_team_id, team))
       : list?.data.map((member) => customerUsageEntity(member.customer_member_id, member)) ?? [];
-  const month = customerPresetRange("month");
-  const year = customerPresetRange("YTD");
+  const day = useUsageDay("UTC");
+  const now = new Date(`${day}T00:00:00Z`);
+  const month = customerPresetRange("month", now);
+  const year = customerPresetRange("YTD", now);
   const monthStartDate = calendarDate(month.from);
   const monthEndDate = calendarDate(month.to);
   const yearStartDate = calendarDate(year.from);

@@ -15,6 +15,7 @@ export function CustomerUsageDatePicker(
       presets={customerUsagePresets}
       maxRangeDays={CUSTOMER_USAGE_MAX_RANGE_DAYS}
       label={t("customerPortal.range.label")}
+      timeZoneLabel={t("shared.scopedSavingsTab.bucketedByUtc")}
       showTimeRange={false}
       compact
       className="max-w-sm"
