@@ -25,7 +25,12 @@ from importlib.resources import files
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, Protocol, cast  # noqa: TID251  # adapts boto3 and botocore's dynamic client responses
+from typing import (
+    Final,
+    Protocol,
+    TypeAlias,
+    cast,  # noqa: TID251  # adapts boto3 and botocore's dynamic client responses
+)
 
 import httpx
 from pydantic import ConfigDict, TypeAdapter
@@ -54,6 +59,8 @@ def _is_cli_process() -> bool:
 # Reserved top-level keys that are not model entries. They must be excluded
 # from the model-count integrity check so a real upstream shrink can't be masked.
 RESERVED_TOP_LEVEL_KEYS: Final = frozenset({"sample_spec", FALLBACK_GENERALIZATIONS_KEY})
+ModelCostMap: TypeAlias = dict[str, dict[str, object]]
+_FALLBACK_RULES_ADAPTER: Final = TypeAdapter(list[object])
 
 
 def _count_model_entries(model_cost: dict) -> int:
@@ -578,7 +585,7 @@ def _alias_groups(alias_owners: Mapping[str, str]) -> Mapping[str, tuple[str, ..
     )
 
 
-def _expand_model_aliases(model_cost: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+def _expand_model_aliases(model_cost: ModelCostMap) -> ModelCostMap:
     """
     Expand ``aliases`` lists in model cost entries into top-level entries.
 
@@ -596,7 +603,6 @@ def _expand_model_aliases(model_cost: dict[str, dict[str, object]]) -> dict[str,
         aliases: object = model_info.get("aliases")
         if aliases is None:
             continue
-        keys_with_aliases.append(model_name)
         if not isinstance(aliases, list):
             verbose_logger.warning(
                 "LiteLLM model alias field for '%s' is not a list (got %s) — skipping.",
@@ -604,9 +610,12 @@ def _expand_model_aliases(model_cost: dict[str, dict[str, object]]) -> dict[str,
                 type(aliases).__name__,
             )
             continue
+        keys_with_aliases.append(model_name)
         if not aliases:
             continue
         for alias in aliases:
+            if not isinstance(alias, str):
+                continue
             if alias in model_cost:
                 verbose_logger.warning(
                     "LiteLLM model alias conflict: alias '%s' (from '%s') "
@@ -634,16 +643,18 @@ def _expand_model_aliases(model_cost: dict[str, dict[str, object]]) -> dict[str,
     return model_cost
 
 
-def _finalize_model_cost_map(model_cost: dict) -> dict:
+def _finalize_model_cost_map(model_cost: object) -> ModelCostMap:
     """Extract fallback generalizations out of the raw map, then expand aliases.
 
     The ``fallback_generalizations`` block is installed into the generalizations
     module and removed from the map so it is never treated as a model entry.
     """
-    raw: Final = model_cost.pop(FALLBACK_GENERALIZATIONS_KEY, None)
-    rules: Final = raw.get("rules") if isinstance(raw, dict) else None
+    validated_model_cost: Final = _CATALOG_ADAPTER.validate_python(model_cost)
+    raw: Final = validated_model_cost.pop(FALLBACK_GENERALIZATIONS_KEY, None)
+    raw_rules: Final = raw.get("rules") if isinstance(raw, dict) else None
+    rules: Final = _FALLBACK_RULES_ADAPTER.validate_python(raw_rules) if isinstance(raw_rules, list) else None
     set_fallback_generalizations(rules)
-    return _expand_model_aliases(model_cost)
+    return _expand_model_aliases(validated_model_cost)
 
 
 def _finalize_loaded_model_cost_map(loaded: ModelCostMapReloaded) -> ModelCostMapReloaded:

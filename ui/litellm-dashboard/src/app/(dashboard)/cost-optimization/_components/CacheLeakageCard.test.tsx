@@ -65,6 +65,24 @@ const dayWithModels = (date: string, models: Record<string, Partial<SpendMetrics
   },
 });
 
+const dayWithKeys = (date: string, keys: Record<string, Partial<SpendMetrics>>): DailyData => ({
+  date,
+  metrics: baseMetrics({}),
+  breakdown: {
+    models: {},
+    model_groups: {},
+    mcp_servers: {},
+    providers: {},
+    api_keys: Object.fromEntries(
+      Object.entries(keys).map(([hash, metrics]) => [
+        hash,
+        { metrics: baseMetrics(metrics), metadata: { key_alias: hash, team_id: null } },
+      ]),
+    ),
+    entities: {},
+  },
+});
+
 const renderWith = (results: DailyData[], overrides: Partial<DailyActivityRange> = {}) =>
   render(
     <CacheLeakageCard
@@ -108,7 +126,7 @@ describe("CacheLeakageCard", () => {
     [
       "Input tokens you sent in this range that weren't served from or written to the cache",
       "Share of your input tokens that were served from the cache",
-      "About how much you'd save if this uncached input used prompt caching. Estimated as uncached input tokens times what your cached traffic already nets per cached token (realized cache savings, after write premiums, ÷ cache read and write tokens). Blank when caching is not currently saving anything overall.",
+      "Estimated from cached traffic across all keys: net cache savings after write premiums, divided by cache read and write tokens. Shown as “Cannot estimate” when caching is not currently net positive or there is no cache sample.",
     ].forEach((info) => expect(screen.getByLabelText(info)).toBeInTheDocument());
   });
 
@@ -172,8 +190,34 @@ describe("CacheLeakageCard", () => {
     expect(screen.getByText("vertex_ai/gemini-2.5-pro")).toBeInTheDocument();
   });
 
+  it("shows unestimated model leakage after estimates, ranked by uncached tokens", () => {
+    renderWith([
+      dayWithModels("2026-07-12", {
+        "priced-model": { prompt_tokens: 2000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2 },
+        "net-negative-model": { prompt_tokens: 5000, cache_read_input_tokens: 500, prompt_caching_savings_spend: -0.1 },
+        "uncached-model": { prompt_tokens: 3000 },
+      }),
+    ]);
+
+    fireEvent.click(screen.getByText("By model"));
+
+    const dataRows = screen.getAllByRole("row").slice(1);
+    expect(dataRows.map((row) => row.textContent)).toEqual([
+      expect.stringContaining("priced-model"),
+      expect.stringContaining("net-negative-model"),
+      expect.stringContaining("uncached-model"),
+    ]);
+    expect(screen.getByText("$2.00")).toBeInTheDocument();
+    expect(screen.getAllByText("Cannot estimate")).toHaveLength(2);
+    expect(
+      screen.getByLabelText(
+        "Estimated from this model's own cached traffic: net cache savings after write premiums, divided by this model's cache read and write tokens. Shown as “Cannot estimate” when this model has no cache sample or caching is not currently net positive.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("shows an empty state when no key used tokens in the range", async () => {
-    renderWith([]);
+    renderWith([dayWithKeys("2026-07-12", {})]);
 
     expect(await screen.findByText("No key usage in this range.")).toBeInTheDocument();
     expect(screen.queryByRole("table")).not.toBeInTheDocument();
@@ -184,6 +228,14 @@ describe("CacheLeakageCard", () => {
     renderWith([]);
 
     expect(await screen.findByText("Could not load key usage for this range.")).toBeInTheDocument();
+    expect(screen.queryByText("No key usage in this range.")).not.toBeInTheDocument();
+  });
+
+  it("distinguishes cached-only activity from no key usage", async () => {
+    mockCacheLeakageKeysCall.mockResolvedValue({ api_keys: [] });
+    renderWith([dayWithKeys("2026-07-12", { "hash-cached": { prompt_tokens: 1000, cache_read_input_tokens: 1000 } })]);
+
+    expect(await screen.findByText("No uncached input tokens in this range.")).toBeInTheDocument();
     expect(screen.queryByText("No key usage in this range.")).not.toBeInTheDocument();
   });
 
