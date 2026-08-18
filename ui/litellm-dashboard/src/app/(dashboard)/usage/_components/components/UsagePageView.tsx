@@ -169,10 +169,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
   // Everything the request tiles read is stamped with the range it answers and
   // selected during render, rather than cleared in an effect. An effect runs
   // after the render that follows a date change, so state cleared there is one
-  // render too late: that render still holds the previous range's numbers and
-  // can paint them. One source is not enough, since the tiles read the gateway
-  // counts, fall through to the aggregate, and fall through again to the
-  // paginated pages, so a stamp on any one of them is escaped by the next.
+  // render too late and can paint the previous range's numbers.
   const currentGatewayRangeKey = fetchedRangeKey(startTime, endTime);
 
   const dailyActivityRequest = useMemo<DailyActivityRequest | null>(
@@ -203,9 +200,10 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
     () => (accessToken && startTime && endTime ? { accessToken, startTime, endTime } : null),
     [accessToken, startTime, endTime],
   );
+  const isDeploymentWideView = isAdmin && usageView === "global" && selectedUserId === null;
   const gatewayFetchIdRef = useRef(0);
   useEffect(() => {
-    if (!isAdmin || !gatewayRequest) return;
+    if (!isDeploymentWideView || !gatewayRequest) return;
     const fetchId = ++gatewayFetchIdRef.current;
     gatewayDailyActivityCall(gatewayRequest.accessToken, gatewayRequest.startTime, gatewayRequest.endTime)
       .then((data) => {
@@ -216,9 +214,10 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
         if (gatewayFetchIdRef.current !== fetchId) return;
         setGatewayActivityData(null);
       });
-  }, [isAdmin, gatewayRequest, currentGatewayRangeKey]);
+  }, [isDeploymentWideView, gatewayRequest, currentGatewayRangeKey]);
 
   const gatewayActivity = selectGatewayActivity(isAdmin, gatewayActivityData, currentGatewayRangeKey);
+  const deploymentGatewayActivity = isDeploymentWideView ? gatewayActivity : null;
 
   const userSpendData = useMemo(
     () => ({
@@ -229,7 +228,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
   );
 
   const loading = aggregatedLoading;
-  const requestCountsPending = loading && gatewayActivity === null;
+  const requestCountsPending = loading && deploymentGatewayActivity === null;
 
   const summaryMetrics = useMemo(
     () => overallUsageMetrics(userSpendData.results, userSpendData.metadata),
@@ -253,6 +252,11 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
 
   // Derived states from userSpendData
   const totalSpend = userSpendData.metadata?.total_spend || 0;
+  const requestMetrics = {
+    total: userSpendData.metadata?.total_api_requests ?? 0,
+    successful: userSpendData.metadata?.total_successful_requests ?? 0,
+    failed: userSpendData.metadata?.total_failed_requests ?? 0,
+  };
 
   // Calculate top models from the breakdown data
   const topModels = useMemo(() => {
@@ -403,7 +407,10 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
     () => [...userSpendData.results].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()),
     [userSpendData.results],
   );
-  const gatewayRequestsByRoute = useMemo(() => topGatewayRoutes(gatewayActivity), [gatewayActivity]);
+  const gatewayRequestsByRoute = useMemo(
+    () => topGatewayRoutes(deploymentGatewayActivity),
+    [deploymentGatewayActivity],
+  );
   const modelMetrics = useMemo(
     () => processActivityData(userSpendData, modelViewType === "groups" ? "model_groups" : "models", teams),
     [userSpendData, modelViewType, teams],
@@ -552,10 +559,11 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                               <CardContent>
                                 <h3 className="text-lg font-medium text-foreground">Total Requests</h3>
                                 <MetricValue pending={requestCountsPending} className="text-2xl font-bold mt-2">
-                                  {(gatewayActivity
-                                    ? gatewayActivity.total_successful_requests + gatewayActivity.total_failed_requests
-                                    : userSpendData.metadata?.total_api_requests
-                                  )?.toLocaleString() || 0}
+                                  {(deploymentGatewayActivity
+                                    ? deploymentGatewayActivity.total_successful_requests +
+                                      deploymentGatewayActivity.total_failed_requests
+                                    : requestMetrics.total
+                                  ).toLocaleString()}
                                 </MetricValue>
                               </CardContent>
                             </ShadcnCard>
@@ -563,7 +571,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                               <CardContent>
                                 <div className="flex items-center gap-2">
                                   <h3 className="text-lg font-medium text-foreground">Successful Requests</h3>
-                                  {gatewayActivity && (
+                                  {deploymentGatewayActivity && (
                                     <Tooltip>
                                       <TooltipTrigger
                                         render={<Info className="size-4 text-muted-foreground hover:text-foreground" />}
@@ -586,9 +594,8 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                                   className="text-2xl font-bold mt-2 text-success"
                                 >
                                   {(
-                                    gatewayActivity?.total_successful_requests ??
-                                    userSpendData.metadata?.total_successful_requests
-                                  )?.toLocaleString() || 0}
+                                    deploymentGatewayActivity?.total_successful_requests ?? requestMetrics.successful
+                                  ).toLocaleString()}
                                 </MetricValue>
                               </CardContent>
                             </ShadcnCard>
@@ -601,22 +608,19 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                                       render={<Info className="size-4 text-muted-foreground hover:text-foreground" />}
                                     />
                                     <TooltipContent>
-                                      {gatewayActivity
+                                      {deploymentGatewayActivity
                                         ? "Counted by the gateway when it answers a request, independent of spend logging. Deployment-wide, so it will not match the per-key or per-model breakdowns below."
                                         : "Includes requests that failed to route to a provider, tool usage failures, and other request errors where the provider cannot be determined."}
                                     </TooltipContent>
                                   </Tooltip>
                                 </div>
-                                {/* Same source as Successful Requests: the two must agree, or the
-                                    tile disagrees with the endpoint breakdown chart below it. */}
                                 <MetricValue
                                   pending={requestCountsPending}
                                   className="text-2xl font-bold mt-2 text-destructive"
                                 >
                                   {(
-                                    gatewayActivity?.total_failed_requests ??
-                                    userSpendData.metadata?.total_failed_requests
-                                  )?.toLocaleString() || 0}
+                                    deploymentGatewayActivity?.total_failed_requests ?? requestMetrics.failed
+                                  ).toLocaleString()}
                                 </MetricValue>
                               </CardContent>
                             </ShadcnCard>
@@ -626,7 +630,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                                 <MetricValue pending={loading} className="text-2xl font-bold mt-2">
                                   $
                                   {formatNumberWithCommas(
-                                    (totalSpend || 0) / (userSpendData.metadata?.total_api_requests || 1),
+                                    totalSpend / (userSpendData.metadata?.total_api_requests || 1),
                                     4,
                                   )}
                                 </MetricValue>
@@ -731,7 +735,7 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations }) => {
                       </ShadcnCard>
                     </div>
                     {/* Gateway Requests by Endpoint (SGR) */}
-                    {gatewayActivity && gatewayActivity.by_route.length > 0 && (
+                    {deploymentGatewayActivity && deploymentGatewayActivity.by_route.length > 0 && (
                       <div className="col-span-2">
                         <ShadcnCard data-testid="gateway-requests-by-endpoint">
                           <CardHeader>
