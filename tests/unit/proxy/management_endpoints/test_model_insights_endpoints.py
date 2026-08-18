@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import litellm
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.db.model_usage_rollup import build_model_usage_transaction, flush_model_usage_transactions
@@ -75,6 +77,26 @@ def test_model_insights_rejects_ranges_over_365_days() -> None:
         response = TestClient(app).get("/model-insights?start_date=2025-09-01&end_date=2026-09-28")
 
     assert response.status_code == 400
+
+
+@pytest.mark.parametrize("path", ("/model-insights", "/model-insights/tasks"))
+def test_model_insights_default_end_date_uses_business_timezone(monkeypatch: pytest.MonkeyPatch, path: str) -> None:
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
+    prisma: Final = MagicMock()
+    prisma.db.litellm_dailymodelusage.group_by = AsyncMock(return_value=[])
+    app: Final = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[user_api_key_auth] = _override_auth
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),
+        patch("litellm.proxy.management_endpoints.model_insights_endpoints.datetime", wraps=datetime) as clock,
+    ):
+        clock.now.side_effect = datetime(2026, 5, 1, 17, tzinfo=timezone.utc).astimezone
+        response: Final = TestClient(app).get(path)
+
+    assert response.status_code == 200
+    assert response.json()["end_date"] == "2026-05-02"
 
 
 def _call(table: MagicMock, query: str, path: str = "/model-insights") -> object:

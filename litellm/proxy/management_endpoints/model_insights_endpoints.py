@@ -1,8 +1,9 @@
 import functools
 import itertools
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Annotated, Final
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import Field, TypeAdapter
@@ -10,6 +11,7 @@ from pydantic import Field, TypeAdapter
 from litellm.constants import MODEL_INSIGHTS_DEFAULT_TASK, MODEL_INSIGHTS_MAX_RANGE_DAYS, MODEL_INSIGHTS_TOP_MODELS
 from litellm.proxy._types import CommonProxyErrors, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.common_utils.timezone_utils import get_budget_reset_timezone
 from litellm.proxy.db.model_insights_tasks import load_model_insight_tasks
 from litellm.repositories.table_repositories import DailyModelUsageRepository
 from litellm.types.llms.base import LiteLLMBaseModel
@@ -170,7 +172,7 @@ def _resolve_window(
     if prisma_client is None:
         raise HTTPException(status_code=500, detail=CommonProxyErrors.db_not_connected_error.value)
 
-    end_day: Final = _parse_date(end_date, datetime.now(timezone.utc).date())
+    end_day: Final = _parse_date(end_date, datetime.now(ZoneInfo(get_budget_reset_timezone())).date())
     start_day: Final = _parse_date(start_date, end_day - timedelta(days=MODEL_INSIGHTS_MAX_RANGE_DAYS - 1))
     if start_day > end_day or (end_day - start_day).days >= MODEL_INSIGHTS_MAX_RANGE_DAYS:
         raise HTTPException(

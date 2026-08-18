@@ -22,6 +22,7 @@ import {
   deleteToolPolicyOverride,
   fetchToolDetail,
   fetchToolPolicyOptions,
+  formatDate,
   getToolUsageLogs,
   keyListCall,
   updateToolPolicy,
@@ -52,8 +53,7 @@ function getDefaultLogsDateRange(): { start: string; end: string } {
   const end = new Date();
   const start = new Date();
   start.setDate(start.getDate() - 90);
-  const fmt = (d: Date) => d.toISOString().slice(0, 19).replace("T", " ");
-  return { start: fmt(start), end: fmt(end) };
+  return { start: formatDate(start), end: formatDate(end) };
 }
 
 export function ToolDetail({ toolName, onBack, accessToken }: ToolDetailProps) {

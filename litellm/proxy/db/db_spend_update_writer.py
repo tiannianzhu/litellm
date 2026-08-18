@@ -53,6 +53,7 @@ from litellm.proxy._types import (
     SpendUpdateQueueItem,
     ToolDiscoveryQueueItem,
 )
+from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
 from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, project_cache_key
 from litellm.proxy.db.daily_spend_bulk_upsert import (
     DAILY_SPEND_TABLES,
@@ -2805,16 +2806,15 @@ class DBSpendUpdateWriter:
     def _record_request_error(*, payload: SpendLogsPayload, prisma_client: PrismaClient | None) -> None:
         if prisma_client is None:
             return
-        start_time: Final = payload["startTime"]
-        date: Final = start_time.isoformat() if isinstance(start_time, datetime) else str(start_time or "")
-        if not date:
+        date: Final = get_daily_spend_date(payload["startTime"])
+        if date is None:
             return
         metadata: Final = _parse_spend_log_metadata(payload)
         internal_origin: Final = bool(metadata.get(INTERNAL_CALL_ORIGIN_METADATA_KEY))  # pyright: ignore[reportUnknownMemberType]  # TypedDict.get overloads carry Any defaults
         request_error_accumulator.record(
             payload=payload,
             request_status=prisma_client.get_request_status(payload),  # pyright: ignore[reportUnknownMemberType]  # legacy payload union; this caller supplies a typed spend payload
-            date=date.split("T")[0],
+            date=date,
             is_internal_call=internal_origin or _is_billed_retry_attempt(metadata),
         )
 
@@ -2862,12 +2862,10 @@ class DBSpendUpdateWriter:
         verbose_proxy_logger.debug("Logged request status: %s", request_status)
         _metadata: Final = _parse_spend_log_metadata(payload)
         usage_obj: Final = _metadata.get("usage_object", {}) or {}
-        if isinstance(payload["startTime"], datetime):
-            start_time: Final = payload["startTime"].isoformat()
-            date = start_time.split("T")[0]
-        elif isinstance(payload["startTime"], str):
-            date = payload["startTime"].split("T")[0]
-        else:
+        raw_start_time: Final = payload["startTime"]
+        start_time: Final = raw_start_time if isinstance(raw_start_time, (datetime, str)) else None
+        date: Final = get_daily_spend_date(start_time)
+        if date is None:
             verbose_proxy_logger.debug(
                 "Invalid start time: %s, skipping from daily_user_spend_transactions", payload["startTime"]
             )
