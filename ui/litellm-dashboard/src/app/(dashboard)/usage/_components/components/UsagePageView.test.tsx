@@ -123,6 +123,7 @@ vi.mock("./UsageViewSelect/UsageViewSelect", async () => {
       "select",
       selectProps,
       React.createElement("option", { value: "global" }, "Global Usage"),
+      React.createElement("option", { value: "my-usage" }, "Your Usage"),
       React.createElement("option", { value: "team" }, "Team Usage"),
       React.createElement("option", { value: "organization" }, "Organization Usage"),
       React.createElement("option", { value: "customer" }, "Customer Usage"),
@@ -368,8 +369,7 @@ describe("UsagePage", () => {
     showSSOBanner: false,
   };
 
-  // Counts deliberately unlike anything in mockSpendData: the gateway tile must be
-  // readable as coming from /gateway/daily/activity and from nothing else.
+  // Keep gateway counts distinct from spend-derived request metrics.
   const mockGatewayActivity = {
     total_successful_requests: 424242,
     total_failed_requests: 909,
@@ -474,7 +474,7 @@ describe("UsagePage", () => {
     } as any);
   });
 
-  it("should render and fetch usage data on mount", async () => {
+  it("should use gateway request cards in the deployment-wide view", async () => {
     renderWithProviders(<UsagePage {...defaultProps} />);
 
     // Wait for data to be fetched
@@ -499,10 +499,9 @@ describe("UsagePage", () => {
   });
 
   it("should stop showing the previous range's totals while a new range is in flight", async () => {
-    // The request tiles read the gateway counts and fall through to the
-    // spend-derived ones. Withholding a superseded gateway result is only worth
-    // something if the fallback is withheld too, otherwise the tile keeps
-    // showing the previous range's number by the other route.
+    // The Total Requests card reads the range-stamped spend aggregate, so a
+    // superseded response must not remain visible while the next range is loading.
+    mockUseAuthorized.mockReturnValue(nonAdminSession);
     let releaseSecondFetch: () => void = () => {};
     mockUserDailyActivityAggregatedCall.mockReset();
     mockUserDailyActivityAggregatedCall.mockResolvedValueOnce(mockSpendData).mockImplementationOnce(
@@ -529,7 +528,7 @@ describe("UsagePage", () => {
     expect(overview().queryByText("75K")).not.toBeInTheDocument();
     expect(overview().queryByText("$0.00")).not.toBeInTheDocument();
     expect(overview().getByText("Total Tokens")).toBeInTheDocument();
-    expect(await overview().findByText("425,151")).toBeInTheDocument();
+    expect(totalRequestsCell()).not.toHaveTextContent(/\d/);
     // The Total Tokens stat (label, value and hint) must hold no number while its range is in flight.
     expect(overview().getByText("Total Tokens").parentElement).not.toHaveTextContent(/\d/);
     expect(overview().queryByText("$0.0000")).not.toBeInTheDocument();
@@ -542,6 +541,7 @@ describe("UsagePage", () => {
     });
     expect(overview().getByText("Total Tokens")).toBeInTheDocument();
     expect(overview().getByText("$0.0838")).toBeInTheDocument();
+    expect(totalRequestsCell()).toHaveTextContent("1,500");
   });
 
   it("loads key pages separately from the aggregate and refreshes them when the range changes", async () => {
@@ -564,7 +564,7 @@ describe("UsagePage", () => {
     expect(mockUserDailyActivityAggregatedCall.mock.lastCall?.[0]).not.toHaveProperty("apiKeyLimit");
   });
 
-  it("should fall back to the spend-derived count when the gateway endpoint is unavailable", async () => {
+  it("should keep spend-derived cards when the gateway endpoint is unavailable", async () => {
     mockGatewayDailyActivityCall.mockRejectedValue(new Error("gateway activity unavailable"));
 
     renderWithProviders(<UsagePage {...defaultProps} />);
@@ -1043,9 +1043,44 @@ describe("UsagePage", () => {
         expect.objectContaining({ accessToken: "test-token", entityIds: null }),
       );
     });
+
+    it("uses selected-user request metrics instead of deployment-wide counts", async () => {
+      renderWithProviders(<UsagePage {...defaultProps} />);
+
+      expect(await screen.findByTestId("gateway-requests-by-endpoint")).toBeInTheDocument();
+      await openUserSelect();
+      await userEvent.setup().click(screen.getByText("Alice (user-001)"));
+
+      await waitFor(() => {
+        expect(mockUserDailyActivityAggregatedCall).toHaveBeenLastCalledWith(
+          expect.objectContaining({ accessToken: "test-token", entityIds: ["user-001"] }),
+        );
+      });
+      expect(totalRequestsCell()).toHaveTextContent("1,500");
+      expect(totalRequestsCell()).toHaveTextContent("1,450 ok");
+      expect(screen.queryByText("424,242")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("gateway-requests-by-endpoint")).not.toBeInTheDocument();
+    });
   });
 
   describe("user usage view", () => {
+    it("uses the admin's own spend metrics in Your Usage", async () => {
+      renderWithProviders(<UsagePage {...defaultProps} />);
+
+      expect(await screen.findByTestId("gateway-requests-by-endpoint")).toBeInTheDocument();
+      fireEvent.change(screen.getByTestId("usage-view-select"), { target: { value: "my-usage" } });
+
+      await waitFor(() => {
+        expect(mockUserDailyActivityAggregatedCall).toHaveBeenLastCalledWith(
+          expect.objectContaining({ accessToken: "test-token", entityIds: ["user-123"] }),
+        );
+      });
+      expect(totalRequestsCell()).toHaveTextContent("1,500");
+      expect(totalRequestsCell()).toHaveTextContent("1,450 ok");
+      expect(screen.queryByText("424,242")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("gateway-requests-by-endpoint")).not.toBeInTheDocument();
+    });
+
     it("should hand EntityUsage no user list so its own filter can search every user", async () => {
       mockUseInfiniteUsers.mockReturnValue({
         data: {
