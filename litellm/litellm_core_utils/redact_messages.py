@@ -269,6 +269,8 @@ def perform_redaction(model_call_details: dict, result, redact_streaming_respons
     model_call_details["prompt"] = ""
     model_call_details["input"] = ""
     model_call_details.pop(SERVED_OUTPUT_TEXTS_KEY, None)
+    if "instructions" in model_call_details:
+        model_call_details["instructions"] = ""
     standard_logging_object: Final = model_call_details.get("standard_logging_object")
     if isinstance(standard_logging_object, Mapping):
         model_call_details["standard_logging_object"] = _redact_standard_logging_object(standard_logging_object)

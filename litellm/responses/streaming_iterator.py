@@ -10,7 +10,17 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Protocol, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    NoReturn,
+    Protocol,
+    cast,  # noqa: TID251  # upstream response unions require validated casts for custom-tool events
+    overload,
+    runtime_checkable,
+)
 
 import httpx
 from openai._streaming import SSEDecoder
@@ -266,6 +276,30 @@ def _mid_stream_fallback_eligible(mapped_exception: Exception) -> bool:
 
 
 PRE_OUTPUT_LIFECYCLE_EVENT_TYPES: Final = frozenset({"response.created", "response.in_progress", "response.queued"})
+
+
+def _exception_for_error_fields(
+    *,
+    error_message: str,
+    error_type: str | None,
+    error_code: str | None,
+    llm_provider: str,
+    model: str,
+) -> litellm.APIError | litellm.ContextWindowExceededError:
+    if error_code == "context_length_exceeded":
+        exception: Final = litellm.ContextWindowExceededError(
+            message=error_message,
+            llm_provider=llm_provider,
+            model=model,
+        )
+        exception.code = error_code
+        return exception
+    return litellm.APIError(
+        status_code=_status_code_for_error_fields(error_type, error_code),
+        message=error_message,
+        llm_provider=llm_provider,
+        model=model,
+    )
 
 
 class BaseResponsesAPIStreamingIterator:
@@ -625,6 +659,17 @@ class BaseResponsesAPIStreamingIterator:
         )
 
     def _map_error_event_exception(self, error_obj: object) -> Exception:
+        error_message, error_type, error_code = _error_event_fields(error_obj)
+        # Keep the typed context-window error: the generic mapper below keys on
+        # provider message text, not the Responses error code.
+        if error_code == "context_length_exceeded":
+            return _exception_for_error_fields(
+                error_message=error_message,
+                error_type=error_type,
+                error_code=error_code,
+                llm_provider=self.custom_llm_provider or "",
+                model=self.model or "",
+            )
         return _map_stream_error_to_exception(error_obj, self.model or "", self.custom_llm_provider or "")
 
     def _maybe_raise_for_error_event(self, result: object) -> None:
@@ -1205,7 +1250,7 @@ class CachedResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         )
         self._completed_response_cache_hit = True
         self._persist_completed_response_before_logging = False
-        self._events: list[ResponsesAPIStreamingResponse] = []
+        self._events: Sequence[ResponsesAPIStreamingResponse] = []
         self._idx = 0
         self._set_events_from_response(transformed=response, logging_obj=logging_obj)
 
@@ -1271,8 +1316,8 @@ def _dump_response_object(obj: object) -> Mapping[str, object]:
 
 def _build_response_status_event(
     event_type: Literal[
-        "response.created",
-        "response.in_progress",
+        ResponsesAPIStreamEvents.RESPONSE_CREATED,
+        ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS,
     ],
     transformed: ResponsesAPIResponse,
 ) -> ResponsesAPIStreamingResponse:
@@ -1528,7 +1573,7 @@ def build_synthetic_response_events(
     transformed: ResponsesAPIResponse,
     logging_obj: LiteLLMLoggingObj | None,
     chunk_size: int,
-) -> list[ResponsesAPIStreamingResponse]:
+) -> tuple[ResponsesAPIStreamingResponse, ...]:
     openai_types: Final = _get_openai_response_types()
     _stamp_responses_usage_cost(transformed, logging_obj)
 
@@ -1548,7 +1593,7 @@ def build_synthetic_response_events(
             openai_types.OutputItemAddedEvent(
                 type=openai_types.ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
                 output_index=output_index,
-                item=openai_types.BaseLiteLLMOpenAIResponseObject(**output_item_payload),
+                item=openai_types.BaseLiteLLMOpenAIResponseObject(**_synthetic_added_item_payload(output_item_payload)),
             )
         )
 
@@ -1600,6 +1645,39 @@ def build_synthetic_response_events(
                     arguments=arguments,
                 )
             )
+        elif item_type == "custom_tool_call":
+            custom_input = str(output_item_payload.get("input") or "")
+            for index in range(0, len(custom_input), chunk_size):
+                sequence_number += 1
+                events.append(
+                    cast(  # cast-ok: upstream union omits valid custom-tool delta events
+                        ResponsesAPIStreamingResponse,
+                        openai_types.BaseLiteLLMOpenAIResponseObject(
+                            **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                                "type": openai_types.ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DELTA,
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": custom_input[index : index + chunk_size],
+                                "sequence_number": sequence_number,
+                            }
+                        ),
+                    )
+                )
+            sequence_number += 1
+            events.append(
+                cast(  # cast-ok: upstream union omits valid custom-tool completion events
+                    ResponsesAPIStreamingResponse,
+                    openai_types.BaseLiteLLMOpenAIResponseObject(
+                        **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                            "type": openai_types.ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "input": custom_input,
+                            "sequence_number": sequence_number,
+                        }
+                    ),
+                )
+            )
         elif item_type == "reasoning":
             summaries: Sequence[object] = _json_array_or_empty(output_item_payload.get("summary"))
             for summary_index, summary in enumerate(summaries):
@@ -1648,13 +1726,27 @@ def build_synthetic_response_events(
             )
         )
 
-    events.append(
-        openai_types.ResponseCompletedEvent(
-            type=openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
-            response=transformed,
-        )
+    events.append(_synthetic_terminal_event(transformed))
+    return tuple(
+        event.model_copy(update=MappingProxyType({"sequence_number": index})) for index, event in enumerate(events)
     )
-    return events
+
+
+def _synthetic_added_item_payload(payload: Mapping[str, object]) -> Mapping[str, object]:
+    if payload.get("type") == "custom_tool_call":
+        return MappingProxyType({**payload, "input": "", "status": "in_progress"})
+    return payload
+
+
+def _synthetic_terminal_event(response: ResponsesAPIResponse) -> ResponsesAPIStreamingResponse:
+    openai_types: Final = _get_openai_response_types()
+    if response.status == "incomplete":
+        return openai_types.ResponseIncompleteEvent(
+            type=ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE, response=response
+        )
+    if response.status in ("failed", "cancelled"):
+        return openai_types.ResponseFailedEvent(type=ResponsesAPIStreamEvents.RESPONSE_FAILED, response=response)
+    return openai_types.ResponseCompletedEvent(type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED, response=response)
 
 
 # ---------------------------------------------------------------------------

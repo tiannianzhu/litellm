@@ -96,8 +96,10 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 )
 from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
+    ResponsesContextErrorFormatter,
     attribute_of,
     error_status_code,
+    is_context_window_error,
     openai_error_param,
     openai_error_type,
 )
@@ -1212,6 +1214,7 @@ async def open_sse_before_first_byte(
     ping_interval_seconds: float | str | None,
     media_type: str = "text/event-stream",
     on_late_failure: Callable[[Exception], Awaitable[HTTPException | None]] | None = None,
+    responses_error: ResponsesContextErrorFormatter | None = None,
 ) -> _LateResponseT | StreamingResponse:
     """Write SSE keepalive comments while the upstream LLM call is still in flight.
 
@@ -1255,7 +1258,12 @@ async def open_sse_before_first_byte(
                 # would never fire and the failure would go unaudited. The hook
                 # also gets to sanitize what reaches the client, by returning or
                 # raising a replacement, so its answer decides the frame.
-                _, error_obj = sse_error_payload(await _sanitized_late_failure(exc, on_late_failure))
+                sanitized: Final = await _sanitized_late_failure(exc, on_late_failure)
+                responses_frame: Final = responses_error.format(sanitized) if responses_error is not None else None
+                if responses_frame is not None:
+                    yield responses_frame.encode()
+                    return
+                _, error_obj = sse_error_payload(sanitized)
                 for frame in _sse_error_frames(error_obj):
                     yield frame.encode()
                 return
@@ -2470,6 +2478,7 @@ class ProxyBaseLLMRequestProcessing:
         is_streaming_request: bool | None = False,
         contents: list[object] | None = None,
         skip_pre_call_logic: bool = False,
+        responses_error: ResponsesContextErrorFormatter | None = None,
     ) -> Any:
         """Run the request, sending SSE keepalives while the upstream is still silent.
 
@@ -2512,6 +2521,7 @@ class ProxyBaseLLMRequestProcessing:
             ),
             ping_interval_seconds=ttft_keepalive_interval(self.data, llm_router),
             on_late_failure=_audit_late_failure,
+            responses_error=responses_error,
         )
 
     async def _process_llm_request(
@@ -3760,7 +3770,7 @@ class ProxyBaseLLMRequestProcessing:
             ),
             type=openai_error_type(e, _code),
             param=openai_error_param(e),
-            openai_code=getattr(e, "code", None),
+            openai_code="context_length_exceeded" if is_context_window_error(e) else getattr(e, "code", None),
             code=_code,
             provider_specific_fields=getattr(e, "provider_specific_fields", None),
             headers=safe_headers,

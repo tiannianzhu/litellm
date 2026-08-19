@@ -132,6 +132,7 @@ from litellm.proxy.common_utils.callback_utils import (
     process_callback,
     strip_callback_config,
 )
+from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
 from litellm.proxy.common_utils.realtime_utils import _realtime_request_body
 from litellm.proxy.management_helpers.auto_router_availability import AutoRouterCatalogEntry, build_auto_router_catalog
 from litellm.router_utils.access_windows import access_windows_config_error
@@ -9501,6 +9502,7 @@ async def async_data_generator(
     request: Request | None = None,
     *,
     responses_stream_errors: bool = False,
+    responses_error: ResponsesContextErrorFormatter | None = None,
 ):
     verbose_proxy_logger.debug("inside generator")
     stream_completed = False
@@ -9619,6 +9621,8 @@ async def async_data_generator(
             if error_state is not None:
                 error_state.observe_chunk(cast(object, chunk))  # cast-ok: the helper validates legacy untyped chunks
             raw_passthrough = False
+            if responses_error is not None:
+                responses_error.observe(chunk)
             if isinstance(chunk, BaseModel):
                 chunk = _serialize_streaming_chunk(chunk)
             elif isinstance(chunk, bytes):
@@ -9697,7 +9701,7 @@ async def async_data_generator(
         raise
     except Exception as e:
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.async_data_generator(): Exception occured - %s", e)
-        await proxy_logging_obj.post_call_failure_hook(
+        transformed_exception: Final = await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
             original_exception=e,
             request_data=request_data,
@@ -9707,29 +9711,47 @@ async def async_data_generator(
             e,
         )
 
+        client_exception: Final = (
+            transformed_exception if responses_error is not None and transformed_exception is not None else e
+        )
+        responses_frame: Final = (
+            responses_error.format(client_exception, stream=response) if responses_error is not None else None
+        )
+        if responses_frame is not None:
+            stream_completed = True
+            yield responses_frame
+            return
         if error_state is not None:
             stream_completed = True
-            error_frame: Final = error_state.format_failure(e)
+            error_frame: Final = error_state.format_failure(client_exception)
             if error_frame is not None:
                 yield error_frame
             if not request_data.get("_litellm_skip_openai_stream_done"):
                 yield _OPENAI_STREAM_DONE_FRAME
             return
-        if isinstance(e, HTTPException):
-            raise e
-        elif isinstance(e, StreamingCallbackError):
-            error_msg = str(e)
+        if isinstance(client_exception, HTTPException):
+            if responses_error is not None:
+                from litellm.proxy.common_request_processing import sse_error_payload
+
+                _, sanitized_error = sse_error_payload(client_exception)
+                stream_completed = True
+                sanitized_error_frame: Final = json.dumps({"error": sanitized_error})
+                yield f"data: {sanitized_error_frame}\n\n"
+                return
+            raise client_exception
+        elif isinstance(client_exception, StreamingCallbackError):
+            error_msg = str(client_exception)
         else:
             # Only include the error message, not the traceback.
             # The traceback is already logged above via verbose_proxy_logger.exception().
             # Including it in the SSE response leaks internal details to clients.
-            error_msg = str(e)
+            error_msg = str(client_exception)
 
         proxy_exception: Final = ProxyException(
-            message=getattr(e, "message", error_msg),
-            type=getattr(e, "type", "None"),
-            param=getattr(e, "param", "None"),
-            code=getattr(e, "status_code", 500),
+            message=getattr(client_exception, "message", error_msg),
+            type=getattr(client_exception, "type", "None"),
+            param=getattr(client_exception, "param", "None"),
+            code=getattr(client_exception, "status_code", 500),
         )
         error_returned: Final = json.dumps({"error": proxy_exception.to_dict()})
         stream_completed = True
@@ -9753,6 +9775,7 @@ def select_data_generator(
     request: Request | None = None,
     *,
     responses_stream_errors: bool = False,
+    responses_error: ResponsesContextErrorFormatter | None = None,
 ):
     return async_data_generator(
         response=response,
@@ -9760,6 +9783,7 @@ def select_data_generator(
         request_data=request_data,
         request=request,
         responses_stream_errors=responses_stream_errors,
+        responses_error=responses_error,
     )
 
 

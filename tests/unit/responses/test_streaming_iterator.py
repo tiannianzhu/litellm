@@ -20,6 +20,7 @@ from litellm.responses.streaming_iterator import (
     ResponsesAPIStreamingIterator,
     SyncResponsesAPIStreamingIterator,
     _estimate_usage_from_text,
+    build_synthetic_response_events,
 )
 from litellm.types.llms.openai import (
     ResponseAPIUsage,
@@ -643,6 +644,7 @@ def _unvalidated_response_with_dict_usage(usage: dict) -> ResponsesAPIResponse:
 
 def test_stamp_responses_usage_cost_keeps_provider_cost_from_dict_usage():
     from litellm.responses.streaming_iterator import _stamp_responses_usage_cost
+
     response = _unvalidated_response_with_dict_usage(
         {
             "input_tokens": 29,
@@ -664,6 +666,7 @@ def test_stamp_responses_usage_cost_keeps_provider_cost_from_dict_usage():
 
 def test_stamp_responses_usage_cost_computes_cost_for_dict_usage_without_cost():
     from litellm.responses.streaming_iterator import _stamp_responses_usage_cost
+
     response = _unvalidated_response_with_dict_usage({"input_tokens": 29, "output_tokens": 120, "total_tokens": 149})
     logging_obj = Mock(spec=LiteLLMLoggingObj)
     logging_obj._response_cost_calculator.return_value = 0.000704
@@ -1108,3 +1111,26 @@ def test_persist_completed_response_to_cache_survives_an_unserializable_response
     iterator._persist_completed_response_to_cache(is_async=False)
 
     cache.add_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["failed", "incomplete"])
+def test_synthetic_stream_preserves_unsuccessful_terminal_status(status):
+    response = ResponsesAPIResponse(
+        id="resp_terminal",
+        created_at=1,
+        model="fixture",
+        object="response",
+        status=status,
+        output=[],
+        usage=ResponseAPIUsage(input_tokens=2, output_tokens=3, total_tokens=5),
+        error={"code": "server_error", "message": "fixture failure"} if status == "failed" else None,
+        incomplete_details={"reason": "max_output_tokens"} if status == "incomplete" else None,
+    )
+    events = build_synthetic_response_events(transformed=response, logging_obj=None, chunk_size=5)
+    assert events[-1].type == f"response.{status}"
+    assert events[-1].response.status == status
+    assert events[-1].response.usage.total_tokens == 5
+    assert events[-1].response.error == response.error
+    assert events[-1].response.incomplete_details == response.incomplete_details
+    assert all(event.type != "response.completed" for event in events)
+    assert [event.sequence_number for event in events] == list(range(len(events)))

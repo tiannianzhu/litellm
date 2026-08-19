@@ -98,15 +98,16 @@ def test_maybe_raise_for_error_event_maps_invalid_request_type_to_400():
     assert not isinstance(exc_info.value, MidStreamFallbackError)
 
 
-def test_maybe_raise_for_error_event_maps_context_length_code_to_400():
-    """Client errors classified via the `code` field alone must still map to 400."""
+def test_maybe_raise_for_error_event_maps_context_length_code_to_context_window_error():
+    """Context-length codes must preserve the router's context fallback signal."""
     iterator = _make_iterator()
     chunk = Mock()
     chunk.type = "error"
     chunk.error = {"code": "context_length_exceeded", "message": "too long"}
-    with pytest.raises(litellm.BadRequestError) as exc_info:
+    with pytest.raises(litellm.ContextWindowExceededError) as exc_info:
         iterator._maybe_raise_for_error_event(chunk)
     assert exc_info.value.status_code == 400
+    assert exc_info.value.code == "context_length_exceeded"
     assert not isinstance(exc_info.value, MidStreamFallbackError)
 
 
@@ -301,6 +302,27 @@ async def test_async_iterator_content_policy_violation_after_first_chunk_carries
 
 
 @pytest.mark.asyncio
+async def test_async_iterator_raises_context_window_error_on_context_length_error_event():
+    iterator = _make_async_iterator_with_events(
+        [
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": "too long",
+                },
+            }
+        ]
+    )
+
+    with pytest.raises(litellm.ContextWindowExceededError) as exc_info:
+        async for _ in iterator:
+            pass
+    assert exc_info.value.code == "context_length_exceeded"
+
+
+@pytest.mark.asyncio
 async def test_async_iterator_error_after_first_chunk_carries_generated_content():
     """An error after streamed output must expose the accumulated text so the router's
     fallback can build a continuation input instead of restarting from scratch."""
@@ -368,6 +390,15 @@ def test_response_failed_unknown_code_keeps_upstream_code_and_message_on_mapped_
     assert isinstance(mapped, litellm.InternalServerError)
     assert mapped.code == "cyber_policy"
     assert mapped.body == {"message": upstream_message, "type": None, "code": "cyber_policy"}
+def test_maybe_raise_for_response_failed_event_maps_context_length_to_context_window_error():
+    iterator = _make_iterator()
+    iterator.completed_response = _make_failed_chunk(
+        {"type": "invalid_request_error", "code": "context_length_exceeded", "message": "too long"}
+    )
+
+    with pytest.raises(litellm.ContextWindowExceededError) as exc_info:
+        iterator._maybe_raise_for_error_event(iterator.completed_response)
+    assert exc_info.value.code == "context_length_exceeded"
 
 
 def test_maybe_raise_for_error_event_null_error_obj():
@@ -443,6 +474,21 @@ def test_handle_logging_failed_response_logs_content_policy_violation():
     assert CONTENT_POLICY_MESSAGE in str(logged_exception)
 
 
+def test_handle_logging_failed_response_maps_context_length_to_context_window_error():
+    iterator = _make_iterator()
+    iterator.completed_response = _make_failed_chunk(
+        {"type": "invalid_request_error", "code": "context_length_exceeded", "message": "too long"}
+    )
+    with (
+        patch.object(import_module("litellm.responses.streaming_iterator"), "run_async_function") as mock_run_async,
+        patch.object(import_module("litellm.responses.streaming_iterator"), "executor"),
+    ):
+        iterator._handle_logging_failed_response()
+    logged_exception = mock_run_async.call_args.kwargs["exception"]
+    assert isinstance(logged_exception, litellm.ContextWindowExceededError)
+    assert logged_exception.code == "context_length_exceeded"
+
+
 def test_handle_logging_failed_response_records_usage_and_cost():
     """Usage on a response.failed event must reach failure spend accounting via combined_usage_object."""
     iterator = _make_iterator()
@@ -515,6 +561,34 @@ def test_sync_iterator_raises_mid_stream_fallback_on_rate_limit_error_event():
             pass
     assert exc_info.value.status_code == 429
     assert isinstance(exc_info.value.original_exception, litellm.RateLimitError)
+
+
+def test_sync_iterator_raises_context_window_error_on_context_length_error_event():
+    error_payload = {
+        "type": "error",
+        "error": {"type": "invalid_request_error", "code": "context_length_exceeded", "message": "too long"},
+    }
+    mock_response = Mock()
+    mock_response.headers = {}
+    mock_response.iter_bytes.return_value = iter([f"data: {json.dumps(error_payload)}\n\n".encode()])
+    mock_logging_obj = Mock(spec=LiteLLMLoggingObj)
+    mock_logging_obj.model_call_details = {"litellm_params": {}}
+    mock_logging_obj.completion_start_time = None
+    mock_config = Mock(spec=BaseResponsesAPIConfig)
+    mock_config.transform_streaming_response.return_value = _make_error_chunk(
+        "invalid_request_error", "context_length_exceeded", "too long"
+    )
+    iterator = SyncResponsesAPIStreamingIterator(
+        response=mock_response,
+        model="",
+        responses_api_provider_config=mock_config,
+        logging_obj=mock_logging_obj,
+        custom_llm_provider="",
+    )
+
+    with pytest.raises(litellm.ContextWindowExceededError) as exc_info:
+        next(iterator)
+    assert exc_info.value.code == "context_length_exceeded"
 
 
 def test_every_openai_sdk_response_error_code_has_explicit_status_mapping():
