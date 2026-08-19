@@ -6,12 +6,22 @@ so this config enables direct routing instead of falling back to
 the chat completions → responses conversion pipeline.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Final
+
+from pydantic import TypeAdapter
 
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
 from litellm.secret_managers.main import get_secret_str
+from litellm.types.llms.openai import ResponseInputParam
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
+
+from ..reasoning import get_reasoning_effort_config
+
+_JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
+_EMPTY_JSON_OBJECT: Final[Mapping[str, object]] = MappingProxyType({})
 
 
 class HostedVLLMResponsesAPIConfig(OpenAIResponsesAPIConfig):
@@ -44,6 +54,66 @@ class HostedVLLMResponsesAPIConfig(OpenAIResponsesAPIConfig):
             }
         )
         return headers
+
+    def transform_responses_api_request(
+        self,
+        model: str,
+        input: str | ResponseInputParam,
+        response_api_optional_request_params: dict[str, object],
+        litellm_params: GenericLiteLLMParams,
+        headers: dict[str, object],  # mutable-ok: inherited HTTP header contract
+    ) -> dict[str, object]:  # mutable-ok: inherited provider request contract
+        raw_request: Final[object] = super().transform_responses_api_request(
+            model=model,
+            input=input,
+            response_api_optional_request_params=response_api_optional_request_params,
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+        request: Final = _JSON_OBJECT_ADAPTER.validate_python(raw_request)
+        raw_model_info: Final[object] = litellm_params.get("model_info")
+        model_info: Final = (
+            _JSON_OBJECT_ADAPTER.validate_python(raw_model_info)
+            if isinstance(raw_model_info, Mapping)
+            else _EMPTY_JSON_OBJECT
+        )
+        reasoning_config: Final = get_reasoning_effort_config(model_info.get("reasoning_effort"))
+        if reasoning_config is None:
+            return request
+
+        raw_reasoning: Final = request.get("reasoning")
+        reasoning: Final = (
+            _JSON_OBJECT_ADAPTER.validate_python(raw_reasoning) if isinstance(raw_reasoning, Mapping) else None
+        )
+        raw_effort: Final = reasoning.get("effort") if reasoning is not None else None
+        effort: Final = reasoning_config.normalize(raw_effort, model=model)
+        if reasoning_config.target == "native":
+            if effort is None:
+                return request
+
+            normalized_effort: Final = "none" if effort == "disabled" else effort
+            request["reasoning"] = {  # mutable-ok: request payload must be a mapping
+                **(reasoning or _EMPTY_JSON_OBJECT),
+                "effort": normalized_effort,
+            }
+            return request
+
+        request.pop("reasoning", None)
+        if effort is None:
+            return request
+
+        configured_kwargs: Final = reasoning_config.get_chat_template_kwargs(effort, model=model)
+        raw_existing_kwargs: Final = request.get("chat_template_kwargs")
+        existing_kwargs: Final = (
+            _JSON_OBJECT_ADAPTER.validate_python(raw_existing_kwargs)
+            if isinstance(raw_existing_kwargs, Mapping)
+            else _EMPTY_JSON_OBJECT
+        )
+        request["chat_template_kwargs"] = {  # mutable-ok: vLLM consumes template kwargs as a JSON object
+            **configured_kwargs,
+            **existing_kwargs,
+        }
+        return request
 
     def get_complete_url(
         self,
