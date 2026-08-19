@@ -305,6 +305,35 @@ def test_usage_anthropic_cache_creation_maps_to_cache_write_tokens():
     assert usage.prompt_tokens_details.cached_tokens == 120
 
 
+@pytest.mark.parametrize(
+    ("alias", "standard_fields", "expected"),
+    [
+        (800, {}, 800),
+        (0, {}, 0),
+        (800, {"cache_write_tokens": 0}, 0),
+        (800, {"cache_creation_tokens": 0}, 0),
+        (800, {"cache_creation_input_tokens": 0}, 0),
+        (-1, {}, None),
+        (True, {}, None),
+        ("800", {}, None),
+        ({"tokens": 800}, {}, None),
+    ],
+)
+def test_usage_vllm_created_cache_tokens_maps_to_cache_write_tokens(
+    alias: object, standard_fields: Mapping[str, int], expected: int | None
+) -> None:
+    usage: Final = Usage(
+        prompt_tokens=1000,
+        completion_tokens=10,
+        total_tokens=1010,
+        prompt_tokens_details={"cached_tokens": 0, "created_cache_tokens": alias, **standard_fields},
+    )
+    details: Final = usage.model_dump(warnings=False)["prompt_tokens_details"]
+    assert details.get("cache_write_tokens") == expected
+    assert details.get("cache_creation_tokens") == expected
+    assert details["created_cache_tokens"] == alias
+
+
 def test_prompt_tokens_details_no_cache_write_tokens_when_absent():
     """A read-only cache hit (no cache write) must not surface cache-write fields."""
     details = PromptTokensDetailsWrapper(cached_tokens=800)

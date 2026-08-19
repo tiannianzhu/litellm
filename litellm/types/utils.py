@@ -1978,6 +1978,12 @@ class PromptTokensDetailsWrapper(
         nested_cache_creation_input_tokens: Final = (
             extra_fields.get("cache_creation_input_tokens") if extra_fields is not None else None
         )
+        raw_created_tokens: Final[object] = (
+            extra_fields.get("created_cache_tokens") if extra_fields is not None else None
+        )
+        created_cache_tokens: Final = (
+            raw_created_tokens if type(raw_created_tokens) is int and raw_created_tokens >= 0 else None
+        )
         self.cache_write_tokens = (
             self.cache_write_tokens
             if self.cache_write_tokens is not None
@@ -1985,7 +1991,9 @@ class PromptTokensDetailsWrapper(
                 self.cache_creation_tokens
                 if self.cache_creation_tokens is not None
                 else (
-                    nested_cache_creation_input_tokens if isinstance(nested_cache_creation_input_tokens, int) else None
+                    nested_cache_creation_input_tokens
+                    if isinstance(nested_cache_creation_input_tokens, int)
+                    else created_cache_tokens
                 )
             )
         )

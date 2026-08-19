@@ -21,13 +21,16 @@ import pytest_asyncio
 import pytest
 from prisma import Prisma
 from prisma.errors import RawQueryError
+from pydantic import TypeAdapter
 from typing_extensions import ReadOnly
 
+from litellm.proxy._types import SpendLogsPayload
 from litellm.proxy.db.autorouter_session_rollup import (
     AUTOROUTER_BENCHMARKS_SQL,
     UPSERT_AUTOROUTER_SESSION_SQL,
     UPSERT_AUTOROUTER_USER_SESSION_SQL,
     AutoRouterTurnTransaction,
+    build_autorouter_turn_transaction,
     flush_autorouter_turn_transactions,
     write_autorouter_turn,
 )
@@ -124,6 +127,7 @@ async def _turn(
         saved if estimated else 0.0,
         user_id,
         int(token_counts_recorded),
+        0,
     )
 
 
@@ -209,6 +213,74 @@ async def test_a_return_miss_with_no_recorded_ttl_stays_unattributed(db):
     assert row["return_turns"] == 1
     assert row["return_expired_misses"] == 0
     assert row["return_within_ttl_misses"] == 0
+
+
+@pytest.mark.parametrize(
+    ("late_known_at", "legacy_event", "legacy_clock"),
+    (
+        (None, False, None),
+        (10, False, None),
+        (20, False, None),
+        (10, True, None),
+        (None, False, "known"),
+        (10, False, "unknown"),
+    ),
+    ids=("in-order", "late-known-write", "same-timestamp", "legacy-event", "legacy-known-clock", "legacy-unknown-clock"),
+)
+async def test_unknown_ttl_write_leaves_later_return_miss_unattributed(
+    db: Prisma, late_known_at: int | None, legacy_event: bool, legacy_clock: str | None
+) -> None:
+    key: Final = f"k-{_new_identity()}"
+    await _turn(db, key, "A", T0, ttl=300)
+    if legacy_clock is not None:
+        await _turn(db, key, "A", T0 + timedelta(seconds=25), hit=1)
+        await db.execute_raw(
+            """UPDATE "LiteLLM_AutoRouterSession"
+               SET models = jsonb_set(models #- '{A,ttl_at}', '{A,ttl}', COALESCE(to_jsonb($2::int), 'null'::jsonb))
+               WHERE api_key = $1""",
+            key,
+            None if legacy_clock == "unknown" else 300,
+        )
+    if legacy_clock == "unknown":
+        await _turn(db, key, "A", T0 + timedelta(seconds=26), hit=1)
+    unknown_write: Final = build_autorouter_turn_transaction(
+        payload=cast(
+            SpendLogsPayload,
+            {
+                "status": "success",
+                "api_key": key,
+                "session_id": "s1",
+                "model": "A",
+                "startTime": T0 + timedelta(seconds=20),
+                "custom_llm_provider": "hosted_vllm",
+                "prompt_tokens": 90,
+                "completion_tokens": 10,
+            },
+        ),
+        metadata={
+            "routing_decision": {"router_model_name": "auto-1", "router_type": "complexity"},
+            "usage_object": {
+                "prompt_tokens": 90,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_tokens": 12},
+            },
+        },
+        saved_spend=0.0,
+    )
+    assert unknown_write is not None
+    adapter: Final = TypeAdapter(AutoRouterTurnTransaction)
+    legacy_payload: Final = adapter.dump_json(unknown_write, exclude={"cache_write_ttl_unknown"})
+    if legacy_clock != "unknown":
+        await write_autorouter_turn(db, adapter.validate_json(legacy_payload) if legacy_event else unknown_write)
+    if late_known_at is not None:
+        await _turn(db, key, "A", T0 + timedelta(seconds=late_known_at), ttl=300)
+    await _turn(db, key, "B", T0 + timedelta(seconds=30))
+    await _turn(db, key, "A", T0 + timedelta(seconds=400))
+
+    row: Final = await _row(db, key)
+    assert (
+        row["return_turns"], row["return_hits"], row["return_expired_misses"], row["return_within_ttl_misses"]
+    ) == (1, 0, 0, 0)
 
 
 async def test_a_hit_refreshes_the_models_cache_clock(db):

@@ -180,6 +180,7 @@ class AutoRouterTurnTransaction:
     savings_estimated_saved_spend: float = 0.0
     user_id: str = ""
     token_counts_recorded: bool = False
+    cache_write_ttl_unknown: bool | None = None
 
 
 class TurnCacheFacts(NamedTuple):
@@ -194,19 +195,22 @@ class TurnCacheFacts(NamedTuple):
     read_tokens: int
     write_ttl_seconds: int | None
     touched: bool
+    write_ttl_unknown: bool
 
 
-def turn_cache_facts(usage_object: Mapping[str, object] | None) -> TurnCacheFacts:
-    from litellm.proxy.spend_tracking.savings import extract_cache_read_tokens
+def turn_cache_facts(usage_object: Mapping[str, object] | None, custom_llm_provider: str | None) -> TurnCacheFacts:
+    from litellm.proxy.spend_tracking.savings import extract_cache_creation_tokens, extract_cache_read_tokens
 
     covered: Final = bool(usage_object)
     read_tokens: Final = extract_cache_read_tokens(usage_object)
-    write_ttl_seconds: Final = _write_ttl_seconds(usage_object)
+    write_tokens: Final = extract_cache_creation_tokens(usage_object)
+    write_ttl_seconds: Final = _write_ttl_seconds(usage_object, custom_llm_provider, write_tokens)
     return TurnCacheFacts(
         covered=covered,
         read_tokens=read_tokens,
         write_ttl_seconds=write_ttl_seconds,
-        touched=not covered or read_tokens > 0 or write_ttl_seconds is not None,
+        touched=not covered or read_tokens > 0 or write_tokens > 0 or write_ttl_seconds is not None,
+        write_ttl_unknown=write_tokens > 0 and write_ttl_seconds is None,
     )
 
 
@@ -220,14 +224,17 @@ def _turn_time_utc(start_time_iso: str) -> datetime | None:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _write_ttl_seconds(usage_object: Mapping[str, object] | None) -> int | None:
-    """The TTL this turn's cache write used, or None when nothing was written.
+def _write_ttl_seconds(
+    usage_object: Mapping[str, object] | None,
+    custom_llm_provider: str | None,
+    write_tokens: int,
+) -> int | None:
+    """The TTL this turn's cache write used, if known.
 
     Providers that report a TTL split do so under prompt_tokens_details; a write with no
-    split is the provider's default five-minute cache.
+    split uses the provider's default five-minute cache, except hosted_vllm whose
+    expiration is not known from its token count alone.
     """
-    from litellm.proxy.spend_tracking.savings import extract_cache_creation_tokens
-
     if not usage_object:
         return None
     details: Final = usage_object.get("prompt_tokens_details")
@@ -237,7 +244,7 @@ def _write_ttl_seconds(usage_object: Mapping[str, object] | None) -> int | None:
             return CACHE_TTL_1H_SECONDS
         if creation.get("ephemeral_5m_input_tokens"):
             return CACHE_TTL_5M_SECONDS
-    if extract_cache_creation_tokens(usage_object) > 0:
+    if write_tokens > 0 and custom_llm_provider != "hosted_vllm":
         return CACHE_TTL_5M_SECONDS
     return None
 
@@ -304,7 +311,10 @@ def build_autorouter_turn_transaction(
         if isinstance(usage_object_raw, Mapping)
         else ()
     )
-    cache: Final = turn_cache_facts(usage_object_raw if isinstance(usage_object_raw, Mapping) else None)
+    cache: Final = turn_cache_facts(
+        usage_object_raw if isinstance(usage_object_raw, Mapping) else None,
+        payload.get("custom_llm_provider"),
+    )
     tier_raw: Final = routing_decision.get("tier")
     baseline_raw: Final = routing_decision.get("savings_baseline_model")
     classifier_cost: Final = classifier_cost_from_decision(routing_decision)
@@ -330,6 +340,7 @@ def build_autorouter_turn_transaction(
         cache_hit=cache.read_tokens > 0,
         cache_ttl_seconds=cache.write_ttl_seconds,
         cache_touched=cache.touched,
+        cache_write_ttl_unknown=cache.write_ttl_unknown,
         savings_estimated_turns=int(estimated_savings is not None),
         savings_estimated_actual_spend=actual_spend if estimated_savings is not None else 0.0,
         savings_estimated_saved_spend=estimated_savings if estimated_savings is not None else 0.0,
@@ -366,11 +377,29 @@ _IN_ORDER: Final = f"{_TURN_AT}::timestamp >= t.last_turn_at"
 _SAME: Final = f"{_IN_ORDER} AND t.last_model = {_MODEL}"
 _FIRST: Final = f"{_IN_ORDER} AND NOT t.models ? {_MODEL}"
 _RETURN: Final = f"{_IN_ORDER} AND t.models ? {_MODEL} AND t.last_model <> {_MODEL}"
-_RETURN_MISS: Final = (
-    f"{_RETURN} AND {_COVERED}::int = 1 AND {_CACHE_HIT}::int = 0 AND (t.models -> {_MODEL} ->> 'ttl') IS NOT NULL"
-)
-_IDLE_SECONDS: Final = f"EXTRACT(EPOCH FROM {_TURN_AT}::timestamp) - (t.models -> {_MODEL} ->> 'at')::float8"
+_TURN_EPOCH: Final = f"EXTRACT(EPOCH FROM {_TURN_AT}::timestamp)"
+_STORED_CACHE: Final = f"(t.models -> {_MODEL})"
+_STORED_TTL: Final = f"({_STORED_CACHE} ->> 'ttl')::int"
+_LAST_CACHE_TOUCH: Final = f"({_STORED_CACHE} ->> 'at')::float8"
+_LAST_CACHE_WRITE: Final = f"({_STORED_CACHE} ->> 'ttl_at')::float8"
+_LEGACY_CACHE_CLOCK: Final = f"(CASE WHEN NOT ({_STORED_CACHE} ? 'ttl_at') THEN {_LAST_CACHE_TOUCH} END)"
+_RETURN_MISS: Final = f"{_RETURN} AND {_COVERED}::int = 1 AND {_CACHE_HIT}::int = 0 AND {_STORED_TTL} IS NOT NULL"
+_IDLE_SECONDS: Final = f"{_TURN_EPOCH} - {_LAST_CACHE_TOUCH}"
 _CACHE_TOUCHED: Final = f"{_TOUCHED}::int = 1"
+# A covered miss that touched the cache with no TTL was an unknown write in legacy events.
+_UNKNOWN_CACHE_WRITE: Final = (
+    f"({_CACHE_TTL}::int IS NULL AND COALESCE({_p('cache_write_ttl_unknown')}::int = 1, "
+    f"{_COVERED}::int = 1 AND {_CACHE_HIT}::int = 0 AND {_CACHE_TOUCHED}))"
+)
+_CACHE_WRITE: Final = f"({_CACHE_TTL}::int IS NOT NULL OR {_UNKNOWN_CACHE_WRITE})"
+_UPDATE_TTL: Final = f"""{_CACHE_WRITE} AND (
+    CASE WHEN {_UNKNOWN_CACHE_WRITE}
+         THEN {_TURN_EPOCH} >= COALESCE({_LAST_CACHE_WRITE}, '-infinity'::float8)
+         WHEN {_STORED_TTL} IS NULL
+         THEN {_TURN_EPOCH} > COALESCE({_LAST_CACHE_WRITE}, {_LEGACY_CACHE_CLOCK}, '-infinity'::float8)
+         ELSE {_TURN_EPOCH} >= COALESCE({_LAST_CACHE_WRITE}, {_LAST_CACHE_TOUCH})
+    END
+)"""
 
 
 def _session_upsert_sql(*, user_scoped: bool) -> str:
@@ -384,7 +413,11 @@ INSERT INTO "{table_name}" AS t (
 )
 SELECT
     {user_value}{_p("api_key")}, {_p("session_id")}, {_p("router_name")}, {_p("router_type")}, {_TURN_AT}::timestamp, {_TURN_AT}::timestamp,
-    {_MODEL}, jsonb_build_object({_MODEL}, jsonb_build_object('at', EXTRACT(EPOCH FROM {_TURN_AT}::timestamp), 'ttl', {_CACHE_TTL}::int)),
+    {_MODEL}, jsonb_build_object({_MODEL}, jsonb_build_object(
+        'at', {_TURN_EPOCH},
+        'ttl', {_CACHE_TTL}::int,
+        'ttl_at', (CASE WHEN {_CACHE_WRITE} THEN {_TURN_EPOCH} END)
+    )),
     1, 0, {_COVERED}::int, {_CACHE_HIT}::int,
     0, 0, 1, {_CACHE_HIT}::int,
     0, 0, 0, 0,
@@ -417,17 +450,17 @@ ON CONFLICT ({user_column}api_key, session_id, router_name) DO UPDATE SET
     return_turns = t.return_turns + (CASE WHEN {_RETURN} THEN 1 ELSE 0 END),
     return_hits = t.return_hits + (CASE WHEN {_RETURN} AND {_CACHE_HIT}::int = 1 THEN 1 ELSE 0 END),
     return_expired_misses = t.return_expired_misses
-        + (CASE WHEN {_RETURN_MISS} AND {_IDLE_SECONDS} > (t.models -> {_MODEL} ->> 'ttl')::float8 THEN 1 ELSE 0 END),
+        + (CASE WHEN {_RETURN_MISS} AND {_IDLE_SECONDS} > {_STORED_TTL} THEN 1 ELSE 0 END),
     return_within_ttl_misses = t.return_within_ttl_misses
-        + (CASE WHEN {_RETURN_MISS} AND {_IDLE_SECONDS} <= (t.models -> {_MODEL} ->> 'ttl')::float8 THEN 1 ELSE 0 END),
-    models = t.models || jsonb_build_object({_MODEL}, jsonb_build_object(
-        'at', (CASE WHEN {_CACHE_TOUCHED}
-               THEN GREATEST(COALESCE((t.models -> {_MODEL} ->> 'at')::float8, 0), EXTRACT(EPOCH FROM {_TURN_AT}::timestamp))
-               ELSE COALESCE((t.models -> {_MODEL} ->> 'at')::float8, EXTRACT(EPOCH FROM {_TURN_AT}::timestamp)) END),
-        'ttl', (CASE WHEN {_IN_ORDER}
-                THEN COALESCE({_CACHE_TTL}::int, (t.models -> {_MODEL} ->> 'ttl')::int)
-                ELSE COALESCE((t.models -> {_MODEL} ->> 'ttl')::int, {_CACHE_TTL}::int) END)
-    )),
+        + (CASE WHEN {_RETURN_MISS} AND {_IDLE_SECONDS} <= {_STORED_TTL} THEN 1 ELSE 0 END),
+    models = t.models || jsonb_build_object({_MODEL},
+        COALESCE({_STORED_CACHE}, '{{"ttl_at": null}}'::jsonb) || jsonb_build_object(
+            'at', (CASE WHEN {_CACHE_TOUCHED}
+                   THEN GREATEST(COALESCE({_LAST_CACHE_TOUCH}, 0), {_TURN_EPOCH})
+                   ELSE COALESCE({_LAST_CACHE_TOUCH}, {_TURN_EPOCH}) END),
+            'ttl', (CASE WHEN {_UPDATE_TTL} THEN {_CACHE_TTL}::int ELSE {_STORED_TTL} END)
+        ) || (CASE WHEN {_UPDATE_TTL} THEN jsonb_build_object('ttl_at', {_TURN_EPOCH}) ELSE '{{}}'::jsonb END)
+    ),
     last_model = (CASE WHEN {_IN_ORDER} THEN {_MODEL} ELSE t.last_model END),
     tier_turns = (CASE WHEN {_TIER} IS NOT NULL AND t.router_type = {_p("router_type")}
         THEN t.tier_turns || jsonb_build_object({_TIER}, COALESCE((t.tier_turns ->> {_TIER})::int, 0) + 1)
