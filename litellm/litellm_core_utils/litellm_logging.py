@@ -613,10 +613,12 @@ class Logging(LiteLLMLoggingBaseClass):
         # Passthrough endpoint guardrails config for field targeting
         self.passthrough_guardrails_config: dict[str, Any] | None = None
 
+        instructions: Final = kwargs.get("instructions") if kwargs else None
         self.model_call_details: dict[str, Any] = {
             "litellm_trace_id": self.litellm_trace_id,
             "litellm_call_id": litellm_call_id,
             "input": _input,
+            "instructions": instructions if isinstance(instructions, str) else None,
             "litellm_params": litellm_params,
             "applied_guardrails": applied_guardrails,
             "model": model,
@@ -5356,19 +5358,22 @@ class StandardLoggingPayloadSetup:
         Append system prompt messages to the messages
         """
         if kwargs is not None:
-            if kwargs.get("system") is not None and isinstance(kwargs.get("system"), str):
+            system_prompt: Final = (
+                kwargs.get("system") if isinstance(kwargs.get("system"), str) else kwargs.get("instructions")
+            )
+            if isinstance(system_prompt, str):
                 if messages is None:
-                    return [{"role": "system", "content": kwargs.get("system")}]
+                    return [{"role": "system", "content": system_prompt}]
                 elif isinstance(messages, list):
                     if len(messages) == 0:
-                        return [{"role": "system", "content": kwargs.get("system")}]
+                        return [{"role": "system", "content": system_prompt}]
                     # check for duplicates
-                    if messages[0].get("role") == "system" and messages[0].get("content") == kwargs.get("system"):
+                    if messages[0].get("role") == "system" and messages[0].get("content") == system_prompt:
                         return messages
-                    messages = [{"role": "system", "content": kwargs.get("system")}] + messages
+                    messages = [{"role": "system", "content": system_prompt}] + messages
                 elif isinstance(messages, str):
                     messages = [
-                        {"role": "system", "content": kwargs.get("system")},
+                        {"role": "system", "content": system_prompt},
                         {"role": "user", "content": messages},
                     ]
                 return messages

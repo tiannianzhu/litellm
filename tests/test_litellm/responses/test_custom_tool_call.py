@@ -10,7 +10,7 @@ LiteLLM bridge correctly:
 
 import json
 import pytest
-from typing import Dict, Any, List
+from typing import Dict, Any, Final, List
 
 from openai.types.responses import ResponseFunctionToolCall
 
@@ -32,6 +32,25 @@ from litellm.types.responses.main import CustomToolCallOutputItem
 
 class TestCustomToolUtilities:
     """Test the custom_tools utility functions."""
+
+    def test_hosted_vllm_bridges_custom_tools(self):
+        from litellm.responses.main import _hosted_vllm_request_requires_chat_completions
+
+        assert _hosted_vllm_request_requires_chat_completions(
+            "hosted_vllm", [{"type": "custom", "name": "exec"}], "hello"
+        )
+        for item_type in ("custom_tool_call", "custom_tool_call_output"):
+            assert _hosted_vllm_request_requires_chat_completions(
+                "hosted_vllm", None, [{"type": item_type}]
+            )
+        assert not _hosted_vllm_request_requires_chat_completions(
+            "hosted_vllm", [{"type": "web_search"}], "hello"
+        )
+        assert not _hosted_vllm_request_requires_chat_completions(
+            "openai",
+            [{"type": "custom", "name": "exec"}],
+            [{"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "true"}],
+        )
 
     def test_extract_custom_tool_names(self):
         """Test extraction of custom tool names from tools list."""
@@ -176,22 +195,27 @@ class TestCustomToolUtilities:
         assert unwrap_custom_tool_arguments("") == ""
 
     def test_convert_custom_tool_to_function_tool_with_format(self):
-        """The grammar definition is embedded in the description so the model can
-        produce correctly-formatted output."""
-        tool = {
+        raw_description: Final = "Apply a patch. Provide raw patch text, not JSON."
+        tool: Final = {
             "type": "custom",
             "name": "apply_patch",
-            "description": "Apply a patch",
+            "description": raw_description,
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
                 "definition": "start: begin_patch",
             },
         }
-        result = convert_custom_tool_to_function_tool(tool)
+        result: Final = convert_custom_tool_to_function_tool(tool)
         assert result is not None
         assert result["type"] == "function"
-        assert "begin_patch" in result["function"]["description"]
+        assert "JSON object" in result["function"]["description"]
+        assert raw_description not in result["function"]["description"]
+        assert "begin_patch" not in result["function"]["description"]
+        assert result["function"]["parameters"]["properties"]["content"] == {
+            "type": "string",
+            "description": raw_description + "\n\nFormat:\n```lark\nstart: begin_patch\n```",
+        }
         assert result["function"]["parameters"]["required"] == ["content"]
 
     def test_convert_custom_tool_to_function_tool_non_custom_returns_none(self):

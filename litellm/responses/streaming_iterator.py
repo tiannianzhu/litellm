@@ -9,7 +9,16 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    Protocol,
+    cast,  # noqa: TID251  # upstream response unions require validated casts for custom-tool events
+    overload,
+    runtime_checkable,
+)
 
 import httpx
 from openai._streaming import SSEDecoder
@@ -1156,8 +1165,8 @@ def _dump_response_object(obj: object) -> Mapping[str, object]:
 
 def _build_response_status_event(
     event_type: Literal[
-        "response.created",
-        "response.in_progress",
+        ResponsesAPIStreamEvents.RESPONSE_CREATED,
+        ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS,
     ],
     transformed: ResponsesAPIResponse,
 ) -> ResponsesAPIStreamingResponse:
@@ -1408,6 +1417,39 @@ def build_synthetic_response_events(
                     item_id=item_id,
                     output_index=output_index,
                     arguments=arguments,
+                )
+            )
+        elif item_type == "custom_tool_call":
+            custom_input = str(output_item_payload.get("input") or "")
+            for index in range(0, len(custom_input), chunk_size):
+                sequence_number += 1
+                events.append(
+                    cast(  # cast-ok: upstream union omits valid custom-tool delta events
+                        ResponsesAPIStreamingResponse,
+                        openai_types.BaseLiteLLMOpenAIResponseObject(
+                            **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                                "type": openai_types.ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DELTA,
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": custom_input[index : index + chunk_size],
+                                "sequence_number": sequence_number,
+                            }
+                        ),
+                    )
+                )
+            sequence_number += 1
+            events.append(
+                cast(  # cast-ok: upstream union omits valid custom-tool completion events
+                    ResponsesAPIStreamingResponse,
+                    openai_types.BaseLiteLLMOpenAIResponseObject(
+                        **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                            "type": openai_types.ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "input": custom_input,
+                            "sequence_number": sequence_number,
+                        }
+                    ),
                 )
             )
         elif item_type == "reasoning":

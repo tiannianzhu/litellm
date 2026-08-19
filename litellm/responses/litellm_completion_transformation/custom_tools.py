@@ -157,27 +157,32 @@ def convert_custom_tool_to_function_tool(tool: Mapping[str, object]) -> ChatComp
     """Convert a Responses API ``custom`` tool to a Chat Completions ``function``
     tool.
 
-    The grammar definition is embedded in the description so the model can
-    produce correctly-formatted output. Returns ``None`` if the tool is not a
-    custom tool. Raises ``ValueError`` if ``allowed_callers`` is not a list of
-    strings.
+    The original description and grammar apply to the content string parameter.
+    Returns ``None`` if the tool is not a custom tool. Raises ``ValueError`` if
+    ``allowed_callers`` is not a list of strings.
     """
     if tool.get("type") != "custom":
         return None
     raw_name: Final = tool.get("name")
     name: Final = raw_name if isinstance(raw_name, str) else ""
     raw_description: Final = tool.get("description")
-    description = (raw_description if isinstance(raw_description, str) else "") + _grammar_suffix(tool.get("format"))
+    content_description: Final = (raw_description if isinstance(raw_description, str) else "") + _grammar_suffix(
+        tool.get("format")
+    )
     allowed_callers: Final = validated_allowed_callers(tool.get("allowed_callers"))
     function_chunk: Final = ChatCompletionToolParamFunctionChunk(
         name=name,
-        description=description,
+        description=(
+            f"Call {name} with a JSON object containing the required content string. "
+            "The content field holds the complete tool input. Its description and grammar apply only "
+            "inside that string, not to the outer JSON arguments."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": f"The {name} content following the specified format",
+                    "description": content_description or f"The complete input for {name}.",
                 }
             },
             "required": ["content"],

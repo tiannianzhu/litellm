@@ -192,6 +192,17 @@ class TestLiteLLMCompletionResponsesConfig:
         assert result["image_url"]["url"] == image_url
         assert result["image_url"]["detail"] == "high"
 
+    def test_transform_input_image_item_to_image_item_with_original_detail(self):
+        result = LiteLLMCompletionResponsesConfig._transform_input_image_item_to_image_item(
+            {
+                "type": "input_image",
+                "image_url": "https://example.com/image.png",
+                "detail": "original",
+            }
+        )
+
+        assert result["image_url"]["detail"] == "auto"
+
     def test_transform_input_image_item_to_image_item_with_image_data(self):
         """Test transformation of input_image item with image_url to Chat Completion image format"""
         # Setup
@@ -1678,7 +1689,9 @@ class TestToolTransformation:
         assert result_tools[0]["function"]["name"] == "apply_patch"
         assert "content" in result_tools[0]["function"]["parameters"]["properties"]
         assert result_tools[0]["function"]["parameters"]["required"] == ["content"]
-        assert "begin_patch" in result_tools[0]["function"]["description"]
+        assert "JSON object" in result_tools[0]["function"]["description"]
+        assert "begin_patch" not in result_tools[0]["function"]["description"]
+        assert "begin_patch" in result_tools[0]["function"]["parameters"]["properties"]["content"]["description"]
         assert web_search_options is None
 
     def test_transform_custom_tools_without_format(self):
@@ -1703,7 +1716,8 @@ class TestToolTransformation:
         assert len(result_tools) == 1
         assert result_tools[0]["type"] == "function"
         assert result_tools[0]["function"]["name"] == "exec"
-        assert result_tools[0]["function"]["description"] == "Execute code"
+        assert "JSON object" in result_tools[0]["function"]["description"]
+        assert result_tools[0]["function"]["parameters"]["properties"]["content"]["description"] == "Execute code"
 
     def test_transform_custom_tools_preserves_allowed_callers(self):
         """allowed_callers on a custom tool gates direct model invocation in the

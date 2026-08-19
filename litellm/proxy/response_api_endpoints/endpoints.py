@@ -16,6 +16,9 @@ from typing_extensions import ReadOnly, TypedDict
 
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_guardrail import ModifyResponseException
+from litellm.litellm_core_utils.exception_mapping_utils import (
+    extract_error_message_from_string,
+)
 from litellm.llms.base_llm.guardrail_translation.utils import (
     blocked_responses_api_usage as _blocked_responses_api_usage,
 )
@@ -53,6 +56,22 @@ _TOOL_PAYLOAD_KEYS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     }
 )
 _EMPTY_TOOL_PAYLOAD: Final[Mapping[str, object]] = MappingProxyType({})
+
+
+def _extract_responses_error_message(raw_message: str) -> str:
+    return extract_error_message_from_string(raw_message) or raw_message
+
+
+def _normalize_responses_api_exception(exception: ProxyException) -> ProxyException:
+    return ProxyException(
+        message=_extract_responses_error_message(exception.message),
+        type=exception.type,
+        param=exception.param,
+        code=exception.code,
+        headers=exception.headers,
+        openai_code=str(exception.openai_code) if exception.openai_code is not None else None,
+        provider_specific_fields=exception.provider_specific_fields,
+    )
 
 
 def _convert_tool_payload_value(key: str, value: object, *, to_chat: bool) -> object:
@@ -292,12 +311,15 @@ async def responses_api(
                 llm_router=llm_router,
             )
         except Exception as e:
-            raise await processor._handle_llm_api_exception(
-                e=e,
-                user_api_key_dict=user_api_key_dict,
-                proxy_logging_obj=proxy_logging_obj,
-                version=version,
-            )
+            try:
+                raise await processor._handle_llm_api_exception(
+                    e=e,
+                    user_api_key_dict=user_api_key_dict,
+                    proxy_logging_obj=proxy_logging_obj,
+                    version=version,
+                )
+            except ProxyException as exception:
+                raise _normalize_responses_api_exception(exception) from exception
 
         # Initialize polling handler with configured TTL (from global config)
         polling_handler: Final = ResponsePollingHandler(
@@ -431,12 +453,15 @@ async def responses_api(
         )
         return response_obj
     except Exception as e:
-        raise await processor._handle_llm_api_exception(
-            e=e,
-            user_api_key_dict=user_api_key_dict,
-            proxy_logging_obj=proxy_logging_obj,
-            version=version,
-        )
+        try:
+            raise await processor._handle_llm_api_exception(
+                e=e,
+                user_api_key_dict=user_api_key_dict,
+                proxy_logging_obj=proxy_logging_obj,
+                version=version,
+            )
+        except ProxyException as exception:
+            raise _normalize_responses_api_exception(exception) from exception
 
 
 @router.get(
