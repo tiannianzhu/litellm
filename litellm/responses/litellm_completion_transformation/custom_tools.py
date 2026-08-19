@@ -15,27 +15,61 @@ extending this module without touching the streaming iterator or transformation
 logic.
 """
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from itertools import chain
 from types import MappingProxyType
 from typing import Final, Literal, TypeAlias
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from litellm.exceptions import BadRequestError
-from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.openai import (
     ChatCompletionToolParam,
     ChatCompletionToolParamFunctionChunk,
+    OpenAIMcpServerTool,
 )
 
 _MAX_ARGUMENTS_LEN: Final = 1_000_000
-_DECODED_JSON: Final = TypeAdapter(object)
+_CUSTOM_TOOL_WIRE_NAME_PREFIX: Final = "litellm_custom__"
 
 TOOL_CALL_ITEM_ID_PREFIX_BY_TYPE: Final = MappingProxyType(
     {"function_call": "fc", "custom_tool_call": "ctc", "tool_search_call": "tsc", "tool_search_output": "tso"}
 )
+NativeResponsesCustomToolNameMap: TypeAlias = Mapping[str, tuple[str, str | None]]
+_JSON_OBJECT_ADAPTER: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(Mapping[str, object])
+_JSON_OBJECT_SEQUENCE_ADAPTER: Final[TypeAdapter[Sequence[Mapping[str, object]]]] = TypeAdapter(
+    Sequence[Mapping[str, object]]
+)
+_JSON_VALUE_ADAPTER: Final[TypeAdapter[object]] = TypeAdapter(object)
+_JSON_REQUEST_ADAPTER: Final = TypeAdapter(dict[str, JsonValue])
+
+
+def _readonly_mapping(entries: tuple[tuple[str, object], ...]) -> Mapping[str, object]:
+    return MappingProxyType(dict(entries))
+
+
+def _json_request_payload(request: Mapping[str, object]) -> Mapping[str, object]:
+    encoded: Final = json.dumps(request, default=_JSON_OBJECT_ADAPTER.validate_python)
+    return _JSON_REQUEST_ADAPTER.validate_json(encoded)
+
+
+def _json_object(value: object) -> Mapping[str, object] | None:
+    try:
+        return _JSON_OBJECT_ADAPTER.validate_python(value, strict=True)
+    except ValidationError:
+        return None
+
+
+def _json_object_sequence(value: object) -> tuple[Mapping[str, object], ...] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    try:
+        return tuple(_JSON_OBJECT_SEQUENCE_ADAPTER.validate_python(value, strict=True))
+    except ValidationError:
+        return None
 
 
 def openai_shaped_tool_call_item_id(item_type: str, tool_id: str) -> str:
@@ -113,12 +147,498 @@ def unwrap_custom_tool_arguments(arguments: str) -> str:
     if len(arguments) > _MAX_ARGUMENTS_LEN:
         return arguments
     try:
-        parsed: Final = as_str_mapping(_DECODED_JSON.validate_python(json.loads(arguments)))
-        if parsed is not None and "content" in parsed:
-            return str(parsed["content"])
+        parsed: Final = _JSON_VALUE_ADAPTER.validate_json(arguments)
+        parsed_object: Final = _json_object(parsed)
+        if parsed_object is not None and "content" in parsed_object:
+            return str(parsed_object["content"])
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
     return arguments
+
+
+def unwrap_custom_tool_arguments_strict(arguments: object) -> str:
+    """Return validated content from a function-wrapped custom call."""
+    if not isinstance(arguments, str):
+        raise TypeError("custom tool arguments must be a JSON string")
+    if len(arguments) > _MAX_ARGUMENTS_LEN:
+        raise ValueError("custom tool arguments exceed the maximum supported size")
+    try:
+        parsed: Final = _JSON_VALUE_ADAPTER.validate_json(arguments)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise ValueError("custom tool arguments must contain valid JSON") from exc
+    parsed_object: Final = _json_object(parsed)
+    if parsed_object is None:
+        raise ValueError("custom tool arguments must be a JSON object with a string content field")
+    if "content" not in parsed_object:
+        raise ValueError("custom tool arguments must include a content field")
+    content: Final[object] = parsed_object["content"]
+    if not isinstance(content, str):
+        raise TypeError("custom tool arguments content must be a string")
+    return content
+
+
+_NONEMPTY_SOURCE_LARK_RULES: Final = (
+    "start: pragma_source | plain_source",
+    "pragma_source: PRAGMA_LINE NEWLINE SOURCE",
+    "plain_source: SOURCE",
+    r"PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/",
+    r"NEWLINE: /\r?\n/",
+    r"SOURCE: /[\s\S]+/",
+)
+
+
+def _custom_tool_minimum_length(tool: Mapping[str, object]) -> int:
+    parsed: Final = _json_object(tool.get("format"))
+    definition: Final = parsed.get("definition") if parsed is not None else None
+    return int(
+        tool.get("name") == "exec"
+        and parsed is not None
+        and parsed.get("type") == "grammar"
+        and parsed.get("syntax") == "lark"
+        and isinstance(definition, str)
+        and tuple(line.strip() for line in definition.splitlines() if line.strip()) == _NONEMPTY_SOURCE_LARK_RULES
+    )
+
+
+def custom_tool_minimum_lengths(request: Mapping[str, object]) -> Mapping[tuple[str, str | None], int]:
+    tools: Final = _tools_from_request(request) or ()
+    definitions: Final = tuple((None, tool) for tool in tools if tool.get("type") == "custom") + tuple(
+        chain.from_iterable(
+            (
+                (namespace, nested)
+                for nested in _json_object_sequence(tool.get("tools")) or ()
+                if nested.get("type") == "custom"
+            )
+            for tool in tools
+            if tool.get("type") == "namespace" and isinstance(namespace := tool.get("name"), str)
+        )
+    )
+    return MappingProxyType(
+        {
+            (name, namespace): _custom_tool_minimum_length(tool)
+            for namespace, tool in definitions
+            if isinstance(name := tool.get("name"), str)
+        }
+    )
+
+
+def unwrap_custom_tool_arguments_with_min_length(arguments: object, minimum_length: int) -> str:
+    content: Final = unwrap_custom_tool_arguments_strict(arguments)
+    if len(content) < minimum_length:
+        raise ValueError("custom tool input violates its grammar: content must be nonempty")
+    return content
+
+
+def _with_custom_tool_constraint(tool: Mapping[str, object], minimum_length: int) -> Mapping[str, object]:
+    parameters: Final = _JSON_OBJECT_ADAPTER.validate_python(tool["parameters"])
+    properties: Final = _JSON_OBJECT_ADAPTER.validate_python(parameters["properties"])
+    content: Final = _JSON_OBJECT_ADAPTER.validate_python(properties["content"])
+    return MappingProxyType(
+        {
+            **tool,
+            "strict": True,
+            "parameters": MappingProxyType(
+                {
+                    **parameters,
+                    "additionalProperties": False,
+                    "properties": MappingProxyType(
+                        {
+                            **properties,
+                            "content": MappingProxyType({**content, "minLength": minimum_length}),
+                        }
+                    ),
+                }
+            ),
+        }
+    )
+
+
+def _tools_from_request(request: Mapping[str, object]) -> tuple[Mapping[str, object], ...] | None:
+    return _json_object_sequence(request.get("tools"))
+
+
+def _custom_tool_identities(tools: Sequence[Mapping[str, object]]) -> tuple[tuple[str, str | None], ...]:
+    top_level: Final = tuple(
+        (top_name, None)
+        for tool in tools
+        if tool.get("type") == "custom" and isinstance(top_name := tool.get("name"), str)
+    )
+    namespaced: Final = tuple(
+        chain.from_iterable(
+            (
+                (nested_name, namespace)
+                for nested_tool in _json_object_sequence(tool.get("tools")) or ()
+                if nested_tool.get("type") == "custom" and isinstance(nested_name := nested_tool.get("name"), str)
+            )
+            for tool in tools
+            if tool.get("type") == "namespace" and isinstance(namespace := tool.get("name"), str)
+        )
+    )
+    return top_level + namespaced
+
+
+def _ordinary_function_wire_names(tools: Sequence[Mapping[str, object]]) -> frozenset[str]:
+    top_level_names: Final = frozenset(
+        top_name for tool in tools if tool.get("type") == "function" and isinstance(top_name := tool.get("name"), str)
+    )
+    namespaced_names: Final = frozenset(
+        chain.from_iterable(
+            (
+                f"{namespace}__{nested_name}"
+                for nested_tool in _json_object_sequence(tool.get("tools")) or ()
+                if nested_tool.get("type") == "function" and isinstance(nested_name := nested_tool.get("name"), str)
+            )
+            for tool in tools
+            if tool.get("type") == "namespace" and isinstance(namespace := tool.get("name"), str)
+        )
+    )
+    return top_level_names | namespaced_names
+
+
+def _native_responses_custom_tool_name_map(
+    tools: Sequence[Mapping[str, object]],
+) -> NativeResponsesCustomToolNameMap:
+    identities: Final = _custom_tool_identities(tools)
+    if len(identities) != len(frozenset(identities)):
+        raise ValueError("custom tool names must be unique within each namespace")
+    ordinary_names: Final = _ordinary_function_wire_names(tools)
+    candidates: Final = tuple(f"{namespace}__{name}" if namespace else name for name, namespace in identities)
+    entries: Final = tuple(
+        (
+            candidate
+            if candidate not in ordinary_names and candidates.count(candidate) == 1
+            else _collision_safe_custom_tool_wire_name(name, namespace),
+            (name, namespace),
+        )
+        for (name, namespace), candidate in zip(identities, candidates, strict=True)
+    )
+    wire_names: Final = frozenset(wire_name for wire_name, _ in entries)
+    if len(wire_names) != len(entries) or wire_names & ordinary_names:
+        raise ValueError("custom tool wire names conflict with function tools")
+    return MappingProxyType(dict(entries))
+
+
+def _collision_safe_custom_tool_wire_name(name: str, namespace: str | None) -> str:
+    identity: Final = f"{namespace or ''}\x00{name}"
+    digest: Final = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    return f"{_CUSTOM_TOOL_WIRE_NAME_PREFIX}{digest}"
+
+
+def native_responses_custom_tool_name_map(request: Mapping[str, object]) -> NativeResponsesCustomToolNameMap:
+    """Map native Responses wire names to their original custom tool identities."""
+    return _native_responses_custom_tool_name_map(_tools_from_request(request) or ())
+
+
+def native_responses_namespace_tool_name_map(request: Mapping[str, object]) -> Mapping[str, tuple[str, str]]:
+    """Return wire names for namespace members and deferred top-level functions."""
+    from .transformation import LiteLLMCompletionResponsesConfig
+
+    names: Final = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(_tools_from_request(request))
+    return MappingProxyType(
+        {
+            wire_name: identity
+            for wire_name, identity in names.items()
+            if wire_name == f"{identity[0]}__{identity[1]}" or wire_name == identity[0] == identity[1]
+        }
+    )
+
+
+def _wire_name_for_custom_tool(
+    name: object,
+    namespace: object,
+    custom_tool_names: NativeResponsesCustomToolNameMap,
+) -> str | None:
+    if not isinstance(name, str) or (namespace is not None and not isinstance(namespace, str)):
+        return None
+    identity: Final = (name, namespace)
+    mapped_wire_name: Final = next(
+        (wire_name for wire_name, candidate in custom_tool_names.items() if candidate == identity), None
+    )
+    if mapped_wire_name is not None:
+        return mapped_wire_name
+    return _wire_name_without_definition(name, namespace)
+
+
+def _flat_custom_function_tool(tool: Mapping[str, object], wire_name: str) -> Mapping[str, object]:
+    converted: Final = convert_custom_tool_to_function_tool(MappingProxyType({**tool, "name": wire_name}))
+    if converted is None:
+        raise ValueError("expected a custom tool")
+    function: Final = _json_object(converted.get("function"))
+    if function is None:
+        raise ValueError("custom tool conversion did not produce a function")
+    allowed_callers: Final[object] = converted.get("allowed_callers")
+    flat_tool: Final = _readonly_mapping(
+        (("type", "function"), *function.items())
+        + (("allowed_callers", allowed_callers),) * (allowed_callers is not None)
+    )
+    minimum_length: Final = _custom_tool_minimum_length(tool)
+    return _with_custom_tool_constraint(flat_tool, minimum_length) if minimum_length else flat_tool
+
+
+def _normalize_native_responses_tools(
+    tools: Sequence[Mapping[str, object]],
+    custom_tool_names: NativeResponsesCustomToolNameMap,
+) -> tuple[Mapping[str, object], ...]:
+    return tuple(chain.from_iterable(_normalize_native_responses_tool(tool, custom_tool_names) for tool in tools))
+
+
+def _normalize_native_responses_tool(
+    tool: Mapping[str, object],
+    custom_tool_names: NativeResponsesCustomToolNameMap,
+) -> tuple[Mapping[str, object], ...]:
+    tool_type: Final[object] = tool.get("type")
+    if tool_type == "custom":
+        wire_name: Final = _wire_name_for_custom_tool(tool.get("name"), None, custom_tool_names)
+        if wire_name is None:
+            raise ValueError("custom tools must include a string name")
+        return (_flat_custom_function_tool(tool, wire_name),)
+    if tool_type != "namespace":
+        return (_readonly_mapping(tuple(tool.items())),)
+    namespace: Final[object] = tool.get("name")
+    nested_tools: Final = _json_object_sequence(tool.get("tools"))
+    if not isinstance(namespace, str) or nested_tools is None:
+        return (_readonly_mapping(tuple(tool.items())),)
+    custom_nested_tools: Final = tuple(
+        nested_tool for nested_tool in nested_tools if nested_tool.get("type") == "custom"
+    )
+    converted_custom_tools: Final = tuple(
+        converted
+        for nested_tool in custom_nested_tools
+        if (converted := _converted_nested_custom_tool(nested_tool, namespace, custom_tool_names)) is not None
+    )
+    if len(converted_custom_tools) != len(custom_nested_tools):
+        raise ValueError("custom tools must include a string name")
+    ordinary_nested_tools: Final = tuple(
+        nested_tool for nested_tool in nested_tools if nested_tool.get("type") == "function"
+    )
+    flattened_ordinary_tools: Final = tuple(
+        MappingProxyType({**nested_tool, "name": f"{namespace}__{nested_tool.get('name') or ''!s}"})
+        for nested_tool in ordinary_nested_tools
+    )
+    retained_nested_tools: Final = tuple(
+        MappingProxyType(dict(nested_tool))
+        for nested_tool in nested_tools
+        if nested_tool.get("type") not in ("custom", "function")
+    )
+    retained_namespace: Final = (
+        (MappingProxyType({**tool, "tools": retained_nested_tools}),) if retained_nested_tools else ()
+    )
+    return converted_custom_tools + flattened_ordinary_tools + retained_namespace
+
+
+def _converted_nested_custom_tool(
+    tool: Mapping[str, object], namespace: str, custom_tool_names: NativeResponsesCustomToolNameMap
+) -> Mapping[str, object] | None:
+    wire_name: Final = _wire_name_for_custom_tool(tool.get("name"), namespace, custom_tool_names)
+    return _flat_custom_function_tool(tool, wire_name) if wire_name is not None else None
+
+
+def _normalize_native_responses_input_item(
+    item: Mapping[str, object],
+    custom_tool_names: NativeResponsesCustomToolNameMap,
+    namespace_tool_names: Mapping[str, tuple[str, str]],
+) -> Mapping[str, object]:
+    item_type: Final[object] = item.get("type")
+    if item_type == "custom_tool_call":
+        custom_wire_name: Final = _wire_name_for_custom_tool(item.get("name"), item.get("namespace"), custom_tool_names)
+        raw_input: Final[object] = item.get("input")
+        if not isinstance(raw_input, str):
+            raise ValueError("custom tool call input must be a string")
+        return MappingProxyType(
+            {
+                **MappingProxyType(
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key != "input" and (key != "namespace" or custom_wire_name is None)
+                    }
+                ),
+                "type": "function_call",
+                **(_readonly_mapping((("name", custom_wire_name),) if custom_wire_name is not None else ())),
+                "arguments": json.dumps(
+                    MappingProxyType({"content": raw_input}), default=_JSON_OBJECT_ADAPTER.validate_python
+                ),
+            }
+        )
+    if item_type == "custom_tool_call_output":
+        return MappingProxyType({**item, "type": "function_call_output"})
+    if item_type == "function_call":
+        function_wire_name: Final = _wire_name_for_namespace_function(
+            item.get("name"), item.get("namespace"), namespace_tool_names
+        )
+        return MappingProxyType(
+            {
+                **MappingProxyType(
+                    {key: value for key, value in item.items() if key != "namespace" or function_wire_name is None}
+                ),
+                **(_readonly_mapping((("name", function_wire_name),) if function_wire_name is not None else ())),
+            }
+        )
+    return MappingProxyType(dict(item))
+
+
+def _normalize_native_responses_tool_choice(
+    tool_choice: object,
+    custom_tool_names: NativeResponsesCustomToolNameMap,
+    namespace_tool_names: Mapping[str, tuple[str, str]],
+) -> object:
+    normalized_tool_choice: Final = _json_object(tool_choice)
+    if normalized_tool_choice is None:
+        return tool_choice
+    tool_choice_type: Final[object] = normalized_tool_choice.get("type")
+    if tool_choice_type == "custom":
+        custom_wire_name: Final = _wire_name_for_custom_tool(
+            normalized_tool_choice.get("name"), normalized_tool_choice.get("namespace"), custom_tool_names
+        )
+        return MappingProxyType(
+            {
+                **MappingProxyType(
+                    {
+                        key: value
+                        for key, value in normalized_tool_choice.items()
+                        if key != "namespace" or custom_wire_name is None
+                    }
+                ),
+                "type": "function",
+                **(_readonly_mapping((("name", custom_wire_name),) if custom_wire_name is not None else ())),
+            }
+        )
+    if tool_choice_type == "function":
+        function_wire_name: Final = _wire_name_for_namespace_function(
+            normalized_tool_choice.get("name"), normalized_tool_choice.get("namespace"), namespace_tool_names
+        )
+        return MappingProxyType(
+            {
+                **MappingProxyType(
+                    {
+                        key: value
+                        for key, value in normalized_tool_choice.items()
+                        if key != "namespace" or function_wire_name is None
+                    }
+                ),
+                **(_readonly_mapping((("name", function_wire_name),) if function_wire_name is not None else ())),
+            }
+        )
+    if tool_choice_type != "allowed_tools":
+        return normalized_tool_choice
+    allowed_tools: Final = _json_object_sequence(normalized_tool_choice.get("tools"))
+    if allowed_tools is None:
+        return normalized_tool_choice
+    normalized_allowed_tools: Final = tuple(
+        _normalize_native_responses_tool_choice(allowed_tool, custom_tool_names, namespace_tool_names)
+        for allowed_tool in allowed_tools
+    )
+    return _readonly_mapping((*normalized_tool_choice.items(), ("tools", normalized_allowed_tools)))
+
+
+def _native_namespace_description(
+    tool: Mapping[str, object], custom_tool_names: NativeResponsesCustomToolNameMap
+) -> str | None:
+    namespace: Final = tool.get("name")
+    description: Final = tool.get("description")
+    nested_tools: Final = _json_object_sequence(tool.get("tools"))
+    if (
+        tool.get("type") != "namespace"
+        or not isinstance(namespace, str)
+        or not isinstance(description, str)
+        or not description
+        or nested_tools is None
+    ):
+        return None
+    wire_names: Final = tuple(
+        wire_name for wire_name, identity in custom_tool_names.items() if identity[1] == namespace
+    ) + tuple(
+        f"{namespace}__{name}"
+        for nested_tool in nested_tools
+        if nested_tool.get("type") == "function" and isinstance(name := nested_tool.get("name"), str)
+    )
+    if not wire_names:
+        return None
+    return f"Tool namespace {json.dumps(namespace, ensure_ascii=False)} ({', '.join(wire_names)}):\n{description}"
+
+
+def normalize_native_responses_custom_tools(request: Mapping[str, object]) -> Mapping[str, object]:
+    """Adapt custom Responses tools and history for native function-only providers."""
+    custom_tool_names: Final = native_responses_custom_tool_name_map(request)
+    namespace_tool_names: Final = native_responses_namespace_tool_name_map(request)
+    request_tools: Final = _tools_from_request(request)
+    if request_tools is not None:
+        from .transformation import LiteLLMCompletionResponsesConfig
+
+        LiteLLMCompletionResponsesConfig.validate_namespace_name_collisions(request_tools)
+        for tool in request_tools:
+            if tool.get("type") == "tool_search":
+                validated_tool_search_execution(tool.get("execution"))
+    namespace_descriptions: Final = tuple(
+        description
+        for tool in request_tools or ()
+        if (description := _native_namespace_description(tool, custom_tool_names)) is not None
+    )
+    instructions: Final = request.get("instructions")
+    if namespace_descriptions and instructions is not None and not isinstance(instructions, str):
+        raise ValueError("Responses instructions must be a string")
+    normalized_tools: Final = (
+        _normalize_native_responses_tools(request_tools, custom_tool_names)
+        if request_tools is not None
+        else request.get("tools")
+    )
+    raw_input: Final = _json_object_sequence(request.get("input"))
+    normalized_input: Final = (
+        tuple(
+            _normalize_native_responses_input_item(item, custom_tool_names, namespace_tool_names) for item in raw_input
+        )
+        if raw_input is not None
+        else request.get("input")
+    )
+    normalized_request: Final = _readonly_mapping(
+        tuple(request.items())
+        + (
+            (
+                (
+                    "instructions",
+                    "\n\n".join(
+                        ((instructions,) if isinstance(instructions, str) and instructions else ())
+                        + namespace_descriptions
+                    ),
+                ),
+            )
+            if namespace_descriptions
+            else ()
+        )
+        + (("tools", normalized_tools),) * ("tools" in request)
+        + (("input", normalized_input),) * ("input" in request)
+        + (
+            (
+                (
+                    "tool_choice",
+                    _normalize_native_responses_tool_choice(
+                        request["tool_choice"], custom_tool_names, namespace_tool_names
+                    ),
+                ),
+            )
+            if "tool_choice" in request
+            else ()
+        )
+    )
+    return _json_request_payload(normalized_request)
+
+
+def _wire_name_for_namespace_function(
+    name: object,
+    namespace: object,
+    namespace_tool_names: Mapping[str, tuple[str, str]],
+) -> str | None:
+    if not isinstance(name, str) or not isinstance(namespace, str):
+        return None
+    mapped_wire_name: Final = next(
+        (wire_name for wire_name, identity in namespace_tool_names.items() if identity == (namespace, name)),
+        None,
+    )
+    return mapped_wire_name or (name if name == namespace else _wire_name_without_definition(name, namespace))
+
+
+def _wire_name_without_definition(name: str, namespace: str | None) -> str:
+    return f"{namespace}__{name}" if namespace else name
 
 
 def build_tool_call_item_kwargs(
@@ -162,7 +682,7 @@ class _CustomToolFormat(LiteLLMBaseModel):
     definition: str = ""
 
 
-_ALLOWED_CALLERS_ADAPTER: Final = TypeAdapter[list[str] | None](list[str] | None)
+_ALLOWED_CALLERS_ADAPTER: Final[TypeAdapter[list[str] | None]] = TypeAdapter(list[str] | None)
 
 
 def validated_allowed_callers(value: object) -> list[str] | None:
@@ -255,6 +775,55 @@ def function_chat_tool(
     )
 
 
+def _chat_function_name(tool: ChatCompletionToolParam | OpenAIMcpServerTool) -> str | None:
+    tool_object: Final = _json_object(tool)
+    if tool_object is None or tool_object.get("type") != "function":
+        return None
+    function_object: Final = _json_object(tool_object.get("function"))
+    name: Final = function_object.get("name") if function_object is not None else None
+    return name if isinstance(name, str) and name else None
+
+
+def restrict_chat_tools_for_allowed_choice(
+    tools: Sequence[ChatCompletionToolParam | OpenAIMcpServerTool], choice: object
+) -> tuple[tuple[ChatCompletionToolParam | OpenAIMcpServerTool, ...], str | None]:
+    original_tools: Final = tuple(tools)
+    choice_object: Final = _json_object(choice)
+    if choice_object is None or choice_object.get("type") != "allowed_tools":
+        return original_tools, None
+
+    mode: Final[object] = choice_object.get("mode")
+    if mode not in ("auto", "required"):
+        raise ValueError("allowed_tools mode must be 'auto' or 'required'")
+
+    entries: Final = _json_object_sequence(choice_object.get("tools"))
+    if not entries:
+        raise ValueError("allowed_tools must contain at least one function")
+
+    allowed_names: Final = tuple(
+        allowed_name
+        for entry in entries
+        if entry.get("type") == "function" and isinstance(allowed_name := entry.get("name"), str) and allowed_name
+    )
+    if len(allowed_names) != len(entries):
+        raise ValueError("allowed_tools entries must be named functions")
+    if len(frozenset(allowed_names)) != len(allowed_names):
+        raise ValueError("allowed_tools entries must be unique")
+
+    declared_names: Final = tuple(
+        declared_name for tool in original_tools if (declared_name := _chat_function_name(tool)) is not None
+    )
+    if len(frozenset(declared_names)) != len(declared_names):
+        raise ValueError("chat function tool names must be unique")
+    unknown_names: Final = frozenset(allowed_names) - frozenset(declared_names)
+    if unknown_names:
+        raise ValueError("allowed_tools entries must reference declared functions")
+
+    allowed_name_set: Final = frozenset(allowed_names)
+    restricted_tools: Final = tuple(tool for tool in original_tools if _chat_function_name(tool) in allowed_name_set)
+    return restricted_tools, mode
+
+
 def custom_tool_grammar_suffix(fmt: object) -> str:
     try:
         parsed: Final = _CustomToolFormat.model_validate(fmt)
@@ -269,30 +838,33 @@ def convert_custom_tool_to_function_tool(tool: Mapping[str, object]) -> ChatComp
     """Convert a Responses API ``custom`` tool to a Chat Completions ``function``
     tool.
 
-    The grammar definition is embedded in the description so the model can
-    produce correctly-formatted output. Returns ``None`` if the tool is not a
-    custom tool. Raises ``BadRequestError`` if ``allowed_callers`` is not a list
-    of strings or ``defer_loading`` is not a boolean.
+    The original description and grammar apply to the content string parameter.
+    Returns ``None`` if the tool is not a custom tool. Raises ``BadRequestError``
+    if ``allowed_callers`` is not a list of strings or ``defer_loading`` is not a boolean.
     """
     if tool.get("type") != "custom":
         return None
     raw_name: Final = tool.get("name")
     name: Final = raw_name if isinstance(raw_name, str) else ""
     raw_description: Final = tool.get("description")
-    description: Final = (raw_description if isinstance(raw_description, str) else "") + custom_tool_grammar_suffix(
-        tool.get("format")
-    )
+    content_description: Final = (
+        raw_description if isinstance(raw_description, str) else ""
+    ) + custom_tool_grammar_suffix(tool.get("format"))
     allowed_callers: Final = validated_allowed_callers(tool.get("allowed_callers"))
     deferred: Final = validated_defer_loading(tool.get("defer_loading"))
     function_chunk: Final = ChatCompletionToolParamFunctionChunk(
         name=name,
-        description=description,
+        description=(
+            f"Call {name} with a JSON object containing the required content string. "
+            "The content field holds the complete tool input. Its description and grammar apply only "
+            "inside that string, not to the outer JSON arguments."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": f"The {name} content following the specified format",
+                    "description": content_description or f"The complete input for {name}.",
                 }
             },
             "required": ["content"],

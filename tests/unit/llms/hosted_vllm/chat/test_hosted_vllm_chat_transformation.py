@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 import json
 from contextlib import nullcontext
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+import respx
 
 import litellm
 from litellm.constants import (
@@ -17,7 +19,6 @@ from litellm.constants import (
 )
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.types.utils import ModelResponse
 
 NATIVE_REASONING_CONFIG = {
@@ -79,6 +80,66 @@ async def test_hosted_vllm_omits_empty_tools_at_http_edge(
         **({"tool_choice": "required"} if dependent_options and tools_state == "nonempty" else {}),
         **({"parallel_tool_calls": False} if dependent_options and tools_state != "empty" else {}),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.respx(assert_all_called=False)
+async def test_hosted_vllm_prefetches_pdf_urls_without_downloading_video_files(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "user_url_validation", False)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    video_url: Final = "https://media.example.test/video.mp4"
+    formatted_video_url: Final = "https://media.example.test/watch"
+    pdf_url: Final = "https://media.example.test/report.pdf"
+    pdf_bytes: Final = b"%PDF-1.7\nreport"
+    video_download: Final = respx_mock.get(video_url).respond(
+        200, headers={"content-type": "video/mp4"}, content=b"video"
+    )
+    formatted_video_download: Final = respx_mock.get(formatted_video_url).respond(
+        200, headers={"content-type": "video/mp4"}, content=b"video"
+    )
+
+    async def serve_pdf(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/pdf"}, content=pdf_bytes)
+
+    pdf_download: Final = respx_mock.get(pdf_url).mock(side_effect=serve_pdf)
+    request: Final = await HostedVLLMChatConfig().async_transform_request(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "file", "file": {"file_id": video_url}},
+                    {"type": "file", "file": {"file_id": formatted_video_url, "format": "video/mp4"}},
+                    {"type": "file", "file": {"file_id": pdf_url}},
+                ],
+            }
+        ],
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    assert video_download.call_count == 0
+    assert formatted_video_download.call_count == 0
+    assert pdf_download.call_count == 1
+    assert request["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": video_url}},
+                {"type": "video_url", "video_url": {"url": formatted_video_url}},
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode()}",
+                        "filename": "my_file.pdf",
+                    },
+                },
+            ],
+        }
+    ]
 
 
 def test_hosted_vllm_chat_transformation_file_url():

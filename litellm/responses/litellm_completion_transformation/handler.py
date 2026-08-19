@@ -51,6 +51,29 @@ def _chat_verbosity(responses_api_request: Mapping[str, object]) -> Mapping[str,
             return {}
 
 
+def _transform_nonstream_chat_response(
+    response: ModelResponse,
+    *,
+    request_input: str | ResponseInputParam,
+    responses_api_request: ResponsesAPIOptionalRequestParams,
+    custom_llm_provider: str | None,
+    logging_obj: object,
+) -> ResponsesAPIResponse:
+    try:
+        return LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            chat_completion_response=response,
+            request_input=request_input,
+            responses_api_request=responses_api_request,
+            custom_llm_provider=custom_llm_provider,
+        )
+    except litellm.BadGatewayError:
+        from litellm.litellm_core_utils.litellm_logging import Logging
+
+        if isinstance(logging_obj, Logging):
+            logging_obj.record_assembled_response_for_failure(response)
+        raise
+
+
 @dataclass(frozen=True, slots=True)
 class _BridgedRequest:
     input: str | ResponseInputParam
@@ -82,7 +105,7 @@ def _with_the_tool_choice_sent(
     tool_choice: Final[object] = responses_api_request.get(  # pyright: ignore[reportUnknownMemberType]  # ToolChoice has an untyped member
         "tool_choice"
     )
-    if not unenforced_allowed_tools_tool_choice(
+    if custom_llm_provider == "hosted_vllm" or not unenforced_allowed_tools_tool_choice(
         tool_choice, custom_llm_provider, api_version if isinstance(api_version, str) else None
     ):
         return responses_api_request
@@ -162,12 +185,12 @@ class LiteLLMCompletionTransformationHandler:
         )
 
         if isinstance(litellm_completion_response, ModelResponse):
-            responses_api_response: Final[ResponsesAPIResponse] = (
-                LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-                    chat_completion_response=litellm_completion_response,
-                    request_input=bridged_input,
-                    responses_api_request=echoed_request,
-                )
+            responses_api_response: Final[ResponsesAPIResponse] = _transform_nonstream_chat_response(
+                response=litellm_completion_response,
+                request_input=bridged_input,
+                responses_api_request=echoed_request,
+                custom_llm_provider=custom_llm_provider,
+                logging_obj=_REQUEST_KWARGS_ADAPTER.validate_python(kwargs).get("litellm_logging_obj"),
             )
 
             return responses_api_response
@@ -262,12 +285,12 @@ class LiteLLMCompletionTransformationHandler:
             **{**kwargs, **litellm_completion_request, "_skip_responses_api_bridge": True},
         )
         if isinstance(litellm_completion_response, ModelResponse):
-            responses_api_response: Final[ResponsesAPIResponse] = (
-                LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-                    chat_completion_response=litellm_completion_response,
-                    request_input=request_input,
-                    responses_api_request=responses_api_request,
-                )
+            responses_api_response: Final[ResponsesAPIResponse] = _transform_nonstream_chat_response(
+                response=litellm_completion_response,
+                request_input=request_input,
+                responses_api_request=responses_api_request,
+                custom_llm_provider=litellm_completion_request.get("custom_llm_provider"),
+                logging_obj=_REQUEST_KWARGS_ADAPTER.validate_python(kwargs).get("litellm_logging_obj"),
             )
 
             return responses_api_response

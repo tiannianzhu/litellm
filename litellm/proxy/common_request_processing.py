@@ -147,8 +147,10 @@ from litellm.proxy.common_utils.http_parsing_utils import (
 from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
     OverloadedProxyException,
+    ResponsesContextErrorFormatter,
     attribute_of,
     error_status_code,
+    is_context_window_error,
     openai_error_param,
     openai_error_type,
     relayed_provider_specific_fields,
@@ -1864,6 +1866,7 @@ async def open_sse_before_first_byte(
     on_late_failure: Callable[[Exception], Awaitable[HTTPException | None]] | None = None,
     late_framing: LateSseFraming = OPENAI_LATE_SSE_FRAMING,
     on_passthrough_block: Callable[[ModifyResponseException], Awaitable[Response]] | None = None,
+    responses_error: ResponsesContextErrorFormatter | None = None,
 ) -> _LateResponseT | StreamingResponse:
     """Write SSE keepalive comments while the upstream LLM call is still in flight.
 
@@ -1916,7 +1919,12 @@ async def open_sse_before_first_byte(
                 # would never fire and the failure would go unaudited. The hook
                 # also gets to sanitize what reaches the client, by returning or
                 # raising a replacement, so its answer decides the frame.
-                for frame in late_framing.failure(await _sanitized_late_failure(late, on_late_failure)):
+                sanitized: Final = await _sanitized_late_failure(late, on_late_failure)
+                responses_frame: Final = responses_error.format(sanitized) if responses_error is not None else None
+                if responses_frame is not None:
+                    yield responses_frame.encode()
+                    return
+                for frame in late_framing.failure(sanitized):
                     yield frame.encode()
                 return
             async for chunk in _relay_late_response(produced, late_framing):
@@ -3722,6 +3730,7 @@ class ProxyBaseLLMRequestProcessing:
         skip_pre_call_logic: bool = False,
         sse_framing: SseFraming = OPENAI_SSE_FRAMING,
         on_passthrough_block: Callable[[ModifyResponseException], Awaitable[Response]] | None = None,
+        responses_error: ResponsesContextErrorFormatter | None = None,
     ) -> object:
         """Run the request, sending SSE keepalives while the upstream is still silent.
 
@@ -3774,6 +3783,7 @@ class ProxyBaseLLMRequestProcessing:
             on_late_failure=_audit_late_failure,
             late_framing=ANTHROPIC_LATE_SSE_FRAMING if answers_as_anthropic else sse_framing.late,
             on_passthrough_block=on_passthrough_block,
+            responses_error=responses_error,
         )
 
     def total_timeout_for(
@@ -4007,7 +4017,7 @@ class ProxyBaseLLMRequestProcessing:
                     self.data["_litellm_client_requested_model"] = requested_model_from_client
 
                 if _post_call_guardrails_active or (
-                    route_type == "anthropic_messages" and logging_obj.requires_success_await is True
+                    route_type in ("aresponses", "anthropic_messages") and logging_obj.requires_success_await is True
                 ):
                     self._arm_deferred_stream_dispatch(
                         response=response,
@@ -5386,7 +5396,9 @@ class ProxyBaseLLMRequestProcessing:
             message=redacted_client_message,
             type=openai_error_type(failure, _code),
             param=openai_error_param(failure),
-            openai_code=getattr(failure, "code", None),
+            openai_code="context_length_exceeded"
+            if is_context_window_error(failure)
+            else getattr(failure, "code", None),
             code=_code,
             provider_specific_fields=provider_specific_fields,
             headers=safe_headers,

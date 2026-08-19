@@ -14,6 +14,7 @@ kwargs lack the flag and these tests fail.
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import patch
@@ -23,12 +24,88 @@ import pytest
 
 import litellm
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.responses.litellm_completion_transformation.handler import (
     LiteLLMCompletionTransformationHandler,
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import ADDRESSED_RESPONSE_ID_FIELD
+from litellm.types.utils import Usage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", (False, True))
+async def test_rejected_nonstream_custom_output_preserves_consumed_usage(is_async: bool) -> None:
+    def provider(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-rejected",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "synthetic-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_rejected",
+                                    "type": "function",
+                                    "function": {"name": "edit", "arguments": '{"content":false}'},
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35},
+            },
+        )
+
+    logging_obj: Final = Logging(
+        model="synthetic-model",
+        messages=[{"role": "user", "content": "synthetic input"}],
+        stream=False,
+        call_type="aresponses" if is_async else "responses",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="nonstream-rejection",
+        function_id="nonstream-rejection",
+    )
+    logging_obj.update_environment_variables(
+        model="synthetic-model", user="", optional_params={}, litellm_params={}, custom_llm_provider="hosted_vllm"
+    )
+    async_client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(provider))
+    try:
+        with httpx.Client(transport=httpx.MockTransport(provider)) as sync_client:
+            client: Final = async_client if is_async else HTTPHandler(client=sync_client)
+
+            async def invoke() -> object:
+                result: Final = LiteLLMCompletionTransformationHandler().response_api_handler(
+                    model="synthetic-model",
+                    input="synthetic input",
+                    responses_api_request={"tools": [{"type": "custom", "name": "edit"}]},
+                    custom_llm_provider="hosted_vllm",
+                    _is_async=is_async,
+                    api_key="synthetic-key",
+                    api_base="https://synthetic.invalid/v1",
+                    client=client,
+                    litellm_logging_obj=logging_obj,
+                    num_retries=0,
+                )
+                return await result if is_async else result
+
+            with pytest.raises(litellm.BadGatewayError, match="content must be a string"):
+                await invoke()
+    finally:
+        await async_client.close()
+
+    usage: Final = logging_obj.model_call_details.get("combined_usage_object")
+    assert isinstance(usage, Usage)
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (30, 5, 35)
 
 
 class _StopForwarding(Exception):
@@ -364,6 +441,70 @@ async def test_bridged_follow_up_after_a_client_tool_search_reports_auto_for_an_
     assert "tool_choice" not in provider.request_body
     assert isinstance(response, ResponsesAPIResponse)
     assert response.tool_choice == "auto"
+
+
+def test_hosted_bridge_enforces_allowed_custom_tools_and_preserves_choice() -> None:
+    choice: Final = {
+        "type": "allowed_tools",
+        "mode": "required",
+        "tools": [{"type": "custom", "name": "edit", "namespace": "workspace"}],
+    }
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        sent: Final = json.loads(request.content)
+        assert [tool["function"]["name"] for tool in sent["tools"]] == ["workspace__edit"]
+        assert sent["tool_choice"] == "required"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-allowed",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_edit",
+                                    "type": "function",
+                                    "function": {"name": "workspace__edit", "arguments": '{"content":"patch"}'},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        response: Final = litellm.responses(
+            model="hosted_vllm/test-model",
+            input="Edit the file",
+            tools=[
+                {"type": "namespace", "name": "workspace", "tools": [{"type": "custom", "name": "edit"}]},
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            ],
+            tool_choice=choice,
+            use_chat_completions_api=True,
+            api_base="https://hosted.example.test/v1",
+            api_key="test-key",
+            client=HTTPHandler(client=client),
+        )
+
+    assert response.model_dump(mode="json")["tool_choice"] == choice
+    assert response.output[0].model_dump(exclude_none=True) == {
+        "type": "custom_tool_call",
+        "id": "ctc_call_edit",
+        "call_id": "call_edit",
+        "name": "edit",
+        "namespace": "workspace",
+        "input": "patch",
+        "status": "completed",
+    }
 
 
 @pytest.mark.asyncio
