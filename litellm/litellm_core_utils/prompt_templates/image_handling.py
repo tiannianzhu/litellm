@@ -646,10 +646,24 @@ def has_file_id_urls(messages: Iterable[AllMessageValues], url_starts: tuple[str
 
 
 def file_id_urls_before_an_unreadable_part(
-    messages: Iterable[AllMessageValues], url_starts: tuple[str, ...]
+    messages: Iterable[AllMessageValues],
+    url_starts: tuple[str, ...],
+    should_download: Callable[[str, object], bool] | None = None,
 ) -> tuple[str, ...]:
-    readable_parts: Final = takewhile(_is_readable_file_part_or_other_part, _message_parts(messages))
-    return tuple(dict.fromkeys(url for part in readable_parts if (url := _file_id_url(part, url_starts)) is not None))
+    parts_by_role: Final = (
+        ((message.get("role", ""), part) for part in _content_parts(message)) for message in messages
+    )
+    readable_parts: Final = takewhile(
+        lambda item: _is_readable_file_part_or_other_part(item[1]), chain.from_iterable(parts_by_role)
+    )
+    return tuple(
+        dict.fromkeys(
+            url
+            for role, part in readable_parts
+            if (url := _file_id_url(part, url_starts)) is not None
+            and (should_download is None or should_download(role, part))
+        )
+    )
 
 
 def inline_remote_media(

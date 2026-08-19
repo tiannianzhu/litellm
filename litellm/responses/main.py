@@ -1060,7 +1060,9 @@ async def aresponses(
     """
     Async: Handles responses API requests by reusing the synchronous function
     """
+    normalized_tools: Final = list(tools) if tools is not None and not isinstance(tools, list) else tools
     local_vars: Final = locals()
+    local_vars["tools"] = normalized_tools
     try:
         loop: Final = asyncio.get_event_loop()
         kwargs["aresponses"] = True
@@ -1120,7 +1122,7 @@ async def aresponses(
                     hook_api_base,
                 ),
             ):
-                _stamp_injection_points_for_the_hook(kwargs, model, custom_llm_provider, input, tools)
+                _stamp_injection_points_for_the_hook(kwargs, model, custom_llm_provider, input, normalized_tools)
                 params_the_hook_saw: Final[Mapping[str, object]] = MappingProxyType({**kwargs})
                 (
                     model,
@@ -1187,7 +1189,7 @@ async def aresponses(
             temperature=temperature,
             text=text,
             tool_choice=tool_choice,
-            tools=tools,
+            tools=normalized_tools,
             top_p=top_p,
             truncation=truncation,
             user=user,
@@ -1445,11 +1447,11 @@ def _resolve_model_provider_for_responses(
 def _apply_managed_file_id_mapping(
     input: str | ResponseInputParam,
     tools: Iterable[ToolParam] | None,
-    kwargs: dict[str, Any],
-    local_vars: dict[str, object],
+    kwargs: Mapping[str, object],
 ) -> tuple[str | ResponseInputParam, Iterable[ToolParam] | None]:
     model_file_id_mapping: Final = kwargs.get("model_file_id_mapping")
-    model_info_id = kwargs.get("model_info", {}).get("id") if isinstance(kwargs.get("model_info"), dict) else None
+    model_info_kwarg: Final = kwargs.get("model_info")
+    model_info_id: Final = model_info_kwarg.get("id") if isinstance(model_info_kwarg, dict) else None
 
     input = cast(
         str | ResponseInputParam,
@@ -1459,8 +1461,6 @@ def _apply_managed_file_id_mapping(
             model_file_id_mapping=model_file_id_mapping,
         ),
     )
-    local_vars["input"] = input
-
     if tools:
         tools = cast(
             Iterable[ToolParam] | None,
@@ -1470,8 +1470,6 @@ def _apply_managed_file_id_mapping(
                 model_file_id_mapping=model_file_id_mapping,
             ),
         )
-        local_vars["tools"] = tools
-
     return input, tools
 
 
@@ -1685,7 +1683,9 @@ def responses(
     Synchronous version of the Responses API.
     Uses the synchronous HTTP handler to make requests.
     """
+    normalized_tools: Final = list(tools) if tools is not None and not isinstance(tools, list) else tools
     local_vars: Final = locals()
+    local_vars["tools"] = normalized_tools
 
     try:
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
@@ -1741,7 +1741,7 @@ def responses(
         input, model, custom_llm_provider, deployment_model_info, chat_bridge_prompt_kwargs = (
             _apply_prompt_management_to_responses_call(
                 input=input,
-                tools=tools,
+                tools=normalized_tools,
                 model=model,
                 custom_llm_provider=custom_llm_provider,
                 litellm_logging_obj=litellm_logging_obj,
@@ -1807,7 +1807,9 @@ def responses(
         #########################################################
         # Update input and tools with provider-specific file IDs if managed files are used
         #########################################################
-        input, tools = _apply_managed_file_id_mapping(input=input, tools=tools, kwargs=kwargs, local_vars=local_vars)
+        input, tools = _apply_managed_file_id_mapping(input=input, tools=normalized_tools, kwargs=kwargs)
+        local_vars["input"] = input
+        local_vars["tools"] = tools
 
         #########################################################
         # Native MCP Responses API

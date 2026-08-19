@@ -453,6 +453,9 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
             content_item = content_item_typed
         return content_item
 
+    def supports_tool_result_images(self) -> bool:
+        return False
+
     # fmt: off
 
     @overload
@@ -477,7 +480,11 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
     ) -> list[AllMessageValues] | Coroutine[object, object, list[AllMessageValues]]:
         """OpenAI no longer supports image_url as a string, so we need to convert it to a dict"""
         stripped_messages: Final = drop_tool_reference_parts_from_tool_messages(messages)
-        hoisted_messages: Final = hoist_images_from_tool_messages(stripped_messages)
+        hoisted_messages: Final = (
+            stripped_messages
+            if self.supports_tool_result_images()
+            else hoist_images_from_tool_messages(stripped_messages)
+        )
 
         async def _async_transform():
             return [await self._async_user_message_for_openai(message) for message in hoisted_messages]
@@ -721,6 +728,9 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
     def _flattens_content_lists(self) -> bool:
         return False
 
+    def _downloads_file_part(self, role: str, part: object) -> bool:
+        return True
+
     def _with_provider_roles(self, messages: Sequence[AllMessageValues], model: str) -> Sequence[AllMessageValues]:
         return messages
 
@@ -740,6 +750,7 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
         pdf_urls: Final = file_id_urls_before_an_unreadable_part(
             (message for message in sent_messages if message.get("role") in _ROLES_WHOSE_FILES_ARE_DOWNLOADED),
             _PDF_URL_STARTS,
+            self._downloads_file_part,
         )
         prefetched: Final = (
             _NOTHING_PREFETCHED if self._flattens_content_lists() else await async_fetch_urls_to_base64(pdf_urls)

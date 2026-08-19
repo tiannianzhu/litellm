@@ -3,10 +3,10 @@ Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
 import json
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Sequence
 from typing import Final, Literal, cast, overload
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from litellm.litellm_core_utils.prompt_templates.factory import parse_mime_type
 from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
@@ -28,10 +28,23 @@ from litellm.types.llms.openai import (
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 
 _JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
+_FILE_PART_ADAPTER: Final = TypeAdapter(ChatCompletionFileObject)
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
-    def _convert_custom_tools_to_function_tools(self, tools: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _downloads_file_part(self, role: str, part: object) -> bool:
+        if role != "user":
+            return True
+        try:
+            file_part: Final = _FILE_PART_ADAPTER.validate_python(part)
+        except ValidationError:
+            return True
+        return not self._is_video_file(file_part)
+
+    def supports_tool_result_images(self) -> bool:
+        return True
+
+    def _convert_custom_tools_to_function_tools(self, tools: Sequence[dict[str, object]]) -> list[dict[str, object]]:
         """
         vLLM chat completions currently accepts only OpenAI function tools.
         Convert custom tools into function tools so request validation does not fail.
@@ -78,9 +91,7 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         return converted_tools
 
     def get_supported_openai_params(self, model: str) -> list[str]:
-        params: Final = super().get_supported_openai_params(model)
-        params.extend(("reasoning_effort", "thinking"))
-        return params
+        return [*super().get_supported_openai_params(model), "reasoning_effort", "thinking"]
 
     def map_openai_params(
         self,
