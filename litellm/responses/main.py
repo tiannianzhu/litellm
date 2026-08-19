@@ -65,6 +65,7 @@ from litellm.litellm_core_utils.reasoning_effort_capability import (
 from litellm.llms.azure_ai.common_utils import is_foundry_v1_model_router
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+from litellm.llms.hosted_vllm.reasoning import reasoning_policy_drop_paths, resolve_hosted_vllm_reasoning_effort
 from litellm.llms.openai.common_utils import get_openai_credentials
 from litellm.llms.openai_like.responses.transformation import OpenAILikeResponsesConfig
 from litellm.responses.litellm_completion_transformation.compaction_items import (
@@ -1858,21 +1859,51 @@ def responses(
             if current_reasoning is None and reasoning_effort is not None
             else current_reasoning
         )
-        deployment_reasoning: Final = cast(  # cast-ok: the resolver hands a Reasoning back in the shape it was given
+        reasoning_model_group: Final = model_group_from_metadata(request_kwargs.get("litellm_metadata"))
+        drop_unsupported_reasoning: Final = (
+            litellm.drop_params is True or normalize_drop_params(request_kwargs.get("drop_params")) is True
+        )
+        hosted_reasoning: Final = resolve_hosted_vllm_reasoning_effort(
+            request_reasoning if request_reasoning is not None else {},
+            model=model,
+            custom_llm_provider=custom_llm_provider,
+            deployment_model_info=deployment_model_info,
+            model_group=reasoning_model_group,
+            drop_params=drop_unsupported_reasoning,
+            extra_body=extra_body,
+        )
+        deployment_reasoning: Final = cast(  # cast-ok: the resolver returns the Responses reasoning shape
             Reasoning | None,
-            resolve_deployment_reasoning_effort(
-                request_reasoning,
-                model=model,
-                custom_llm_provider=custom_llm_provider,
-                deployment_model_info=deployment_model_info,
-                model_group=model_group_from_metadata(request_kwargs.get("litellm_metadata")),
-                drop_params=litellm.drop_params is True
-                or normalize_drop_params(request_kwargs.get("drop_params")) is True,
+            (
+                hosted_reasoning
+                if hosted_reasoning is not None
+                else resolve_deployment_reasoning_effort(
+                    request_reasoning,
+                    model=model,
+                    custom_llm_provider=custom_llm_provider,
+                    deployment_model_info=deployment_model_info,
+                    model_group=reasoning_model_group,
+                    drop_params=drop_unsupported_reasoning,
+                )
             ).value,
         )
         response_api_optional_params: Final[ResponsesAPIOptionalRequestParams] = (
             ResponsesAPIRequestUtils.get_requested_response_api_optional_param(
-                {k: v for k, v in {**local_vars, "reasoning": deployment_reasoning}.items() if k != "reasoning_effort"}
+                {
+                    key: value
+                    for key, value in {
+                        **local_vars,
+                        "reasoning": deployment_reasoning,
+                        "additional_drop_params": (
+                            reasoning_policy_drop_paths(
+                                kwargs.get("additional_drop_params"), "reasoning", "reasoning.effort"
+                            )
+                            if hosted_reasoning is not None
+                            else kwargs.get("additional_drop_params")
+                        ),
+                    }.items()
+                    if key != "reasoning_effort"
+                }
             )
         )
 

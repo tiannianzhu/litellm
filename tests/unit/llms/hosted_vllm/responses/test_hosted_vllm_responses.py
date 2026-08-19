@@ -18,6 +18,7 @@ import respx
 
 
 import litellm
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.hosted_vllm.responses.transformation import (
     HostedVLLMResponsesAPIConfig,
 )
@@ -227,7 +228,9 @@ def test_hosted_vllm_responses_folds_a_later_developer_item_into_instructions_fo
 
 
 @respx.mock
-def test_hosted_vllm_responses_folds_for_a_deployment_declared_system_first_and_sends_a_closing_developer_as_user() -> None:
+def test_hosted_vllm_responses_folds_for_a_deployment_declared_system_first_and_sends_a_closing_developer_as_user() -> (
+    None
+):
     assistant_turn: Final = {"type": "message", "role": "assistant", "content": "Paris"}
     route: Final = _vllm_responses_route("PONG")
     litellm.responses(
@@ -262,7 +265,9 @@ def test_hosted_vllm_responses_forwards_a_later_developer_item_in_place_for_an_u
 
 
 @respx.mock
-def test_hosted_vllm_responses_forwards_a_developer_item_without_content_on_a_deployment_declared_system_first() -> None:
+def test_hosted_vllm_responses_forwards_a_developer_item_without_content_on_a_deployment_declared_system_first() -> (
+    None
+):
     route: Final = _vllm_responses_route("Paris")
     input_items: Final = (
         {"role": "user", "content": "What is the capital of France?"},
@@ -276,3 +281,53 @@ def test_hosted_vllm_responses_forwards_a_developer_item_without_content_on_a_de
         api_base="https://test-vllm.example.com/v1",
     )
     assert tuple(_sent_body(route)["input"]) == input_items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [False, True])
+@pytest.mark.parametrize("effort", [None, "xhigh", "none"])
+async def test_hosted_vllm_responses_applies_deployment_reasoning_policy(bridge: bool, effort: str | None) -> None:
+    sent: Final[list[object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == ("/v1/chat/completions" if bridge else "/v1/responses")
+        body: Final = json.loads(request.content)
+        assert "temperature" not in body
+        sent.append(body["reasoning_effort"] if bridge else body["reasoning"])
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+            if bridge
+            else _make_mock_responses_api_response("ok"),
+        )
+
+    handler: Final = AsyncHTTPHandler(transport=httpx.MockTransport(respond))
+    request: Final = {
+        "model": "hosted_vllm/fixture-model",
+        "input": "hello",
+        "api_key": "fixture",
+        "api_base": "https://fixture.invalid/v1",
+        "use_chat_completions_api": bridge,
+        "drop_params": True,
+        "temperature": 0.4,
+        "additional_drop_params": ["reasoning.effort", "temperature"],
+        "model_info": {"reasoning_effort": {"disabled": "reject"}, "reasoning_effort_levels": ["low", "high", "max"]},
+        "reasoning": {"effort": effort, "summary": "auto"} if effort is not None else None,
+        "client": handler,
+    }
+    async with handler.client:
+        if effort == "none":
+            with pytest.raises(litellm.UnsupportedParamsError, match="always has reasoning enabled"):
+                await litellm.aresponses(**request)
+            return
+        await litellm.aresponses(**request)
+
+    expected: Final = "high" if effort is None else "max"
+    assert sent == [expected if bridge else {"effort": expected, **({"summary": "auto"} if effort else {})}]

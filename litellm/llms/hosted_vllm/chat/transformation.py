@@ -7,6 +7,8 @@ import json
 from collections.abc import Coroutine
 from typing import Final, Literal, cast, overload
 
+from pydantic import TypeAdapter
+
 from litellm.litellm_core_utils.prompt_templates.factory import parse_mime_type
 from litellm.litellm_core_utils.prompt_templates.file_id_utils import (
     get_image_mime_type_from_url,
@@ -26,6 +28,8 @@ from litellm.types.llms.openai import (
 
 from ....utils import remove_additional_properties, remove_strict_from_schema
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+
+_JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
@@ -77,16 +81,16 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
 
     def get_supported_openai_params(self, model: str) -> list[str]:
         params: Final = super().get_supported_openai_params(model)
-        params.extend(["reasoning_effort", "thinking"])
+        params.extend(("reasoning_effort", "thinking"))
         return params
 
     def map_openai_params(
         self,
-        non_default_params: dict,
-        optional_params: dict,
+        non_default_params: dict[str, object],
+        optional_params: dict[str, object],
         model: str,
         drop_params: bool,
-    ) -> dict:
+    ) -> dict[str, object]:
         params: Final = dict[str, object](non_default_params)
         mapped_params: Final = {
             key: value
@@ -110,8 +114,8 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         )
         if thinking_effort is not None:
             mapped_params["reasoning_effort"] = thinking_effort
-
-        return super().map_openai_params(mapped_params, optional_params, model, drop_params)
+        mapped_result: Final[object] = super().map_openai_params(mapped_params, optional_params, model, drop_params)
+        return _JSON_OBJECT_ADAPTER.validate_python(mapped_result)
 
     def _get_openai_compatible_provider_info(
         self, api_base: str | None, api_key: str | None
