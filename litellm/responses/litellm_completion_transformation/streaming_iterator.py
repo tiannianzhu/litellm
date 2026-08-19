@@ -1,14 +1,16 @@
 import time
 import uuid
 from collections.abc import Sequence
-from typing import Any, Final, cast
+from typing import Any, Final, cast  # noqa: TID251  # upstream event unions require Any and validated casts
 
 import litellm
 from litellm.main import stream_chunk_builder
 from litellm.responses.litellm_completion_transformation.custom_tools import (
     build_tool_call_item_kwargs,
     extract_custom_tool_names,
+    is_custom_tool_call,
     serialize_tool_call_arguments,
+    unwrap_custom_tool_arguments,
 )
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
@@ -172,7 +174,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
         return delta.content or delta.function_call or delta.tool_calls or chunk.choices[0].finish_reason is not None
 
-    def _queue_tool_call_delta_events(self, tool_calls: object) -> None:
+    def _queue_tool_call_delta_events(  # noqa: C901  # protocol event state machine mirrors tool-call variants
+        self, tool_calls: object
+    ) -> None:
         """
         Convert chat-completions streaming `tool_calls` deltas into Responses API streaming events.
 
@@ -241,6 +245,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
             if fn_args_delta:
                 self._tool_args_by_call_id[call_id] += fn_args_delta
+
+                if is_custom_tool_call(tool_name, self._custom_tool_names):
+                    continue
 
                 # Split large argument deltas into smaller chunks to match OpenAI's streaming behavior
                 # This is especially important for providers like Bedrock that send complete arguments at once
@@ -314,6 +321,16 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 self._pending_tool_events.append(event)
 
             final_args = fn_args or self._tool_args_by_call_id.get(call_id, "")
+
+            if is_custom_tool_call(tool_name, self._custom_tool_names):
+                self._queue_custom_tool_call_done_events(
+                    call_id=call_id,
+                    output_index=output_index,
+                    tool_name=tool_name,
+                    tool_namespace=tool_namespace,
+                    arguments=final_args,
+                )
+                continue
 
             # Emit delta events for arguments that weren't streamed yet
             # This handles cases where Bedrock sends the complete tool call at the end
@@ -410,6 +427,60 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             responses_api_response=response,
             custom_llm_provider=self.custom_llm_provider,
             litellm_metadata=self.litellm_metadata,
+        )
+
+    def _queue_custom_tool_call_done_events(
+        self,
+        call_id: str,
+        output_index: int,
+        tool_name: str,
+        tool_namespace: str | None,
+        arguments: str,
+    ) -> None:
+        custom_input: Final = unwrap_custom_tool_arguments(arguments)
+        for index in range(0, len(custom_input), 10):
+            self._sequence_number += 1
+            self._pending_tool_events.append(
+                BaseLiteLLMOpenAIResponseObject(
+                    **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                        "type": ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DELTA,
+                        "item_id": call_id,
+                        "output_index": output_index,
+                        "delta": custom_input[index : index + 10],
+                        "sequence_number": self._sequence_number,
+                    }
+                )
+            )
+        self._sequence_number += 1
+        self._pending_tool_events.append(
+            BaseLiteLLMOpenAIResponseObject(
+                **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                    "type": ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+                    "item_id": call_id,
+                    "output_index": output_index,
+                    "input": custom_input,
+                    "sequence_number": self._sequence_number,
+                }
+            )
+        )
+
+        self._sequence_number += 1
+        item_kwargs: Final = build_tool_call_item_kwargs(
+            call_id,
+            tool_name,
+            arguments,
+            "completed",
+            self._custom_tool_names,
+        )
+        if tool_namespace:
+            item_kwargs["namespace"] = tool_namespace
+        self._pending_tool_events.append(
+            OutputItemDoneEvent(
+                type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                output_index=output_index,
+                sequence_number=self._sequence_number,
+                item=BaseLiteLLMOpenAIResponseObject(**item_kwargs),
+            )
         )
 
     def _default_response_created_event_data(self) -> dict:

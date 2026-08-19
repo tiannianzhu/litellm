@@ -811,6 +811,21 @@ def _strip_responses_routing_prefix(model: str) -> str:
     return model[len(_RESPONSES_ROUTING_PREFIX) :]
 
 
+def _hosted_vllm_request_requires_chat_completions(
+    custom_llm_provider: str | None,
+    tools: Iterable[ToolParam] | None,
+    input: str | ResponseInputParam,
+) -> bool:
+    """See `litellm/llms/hosted_vllm/README.md#responses-custom-tools`."""
+    return custom_llm_provider == "hosted_vllm" and (
+        (tools is not None and any(tool.get("type") == "custom" for tool in tools))
+        or (
+            not isinstance(input, str)
+            and any(item.get("type") in ("custom_tool_call", "custom_tool_call_output") for item in input)
+        )
+    )
+
+
 def _resolve_model_provider_for_responses(
     model: str,
     custom_llm_provider: str | None,
@@ -839,8 +854,7 @@ def _resolve_model_provider_for_responses(
 def _apply_managed_file_id_mapping(
     input: str | ResponseInputParam,
     tools: Iterable[ToolParam] | None,
-    kwargs: dict[str, Any],
-    local_vars: dict[str, object],
+    kwargs: Mapping[str, object],
 ) -> tuple[str | ResponseInputParam, Iterable[ToolParam] | None]:
     model_file_id_mapping: Final = kwargs.get("model_file_id_mapping")
     model_info_id = kwargs.get("model_info", {}).get("id") if isinstance(kwargs.get("model_info"), dict) else None
@@ -853,8 +867,6 @@ def _apply_managed_file_id_mapping(
             model_file_id_mapping=model_file_id_mapping,
         ),
     )
-    local_vars["input"] = input
-
     if tools:
         tools = cast(
             Iterable[ToolParam] | None,
@@ -864,8 +876,6 @@ def _apply_managed_file_id_mapping(
                 model_file_id_mapping=model_file_id_mapping,
             ),
         )
-        local_vars["tools"] = tools
-
     return input, tools
 
 
@@ -1068,7 +1078,13 @@ def responses(
     Synchronous version of the Responses API.
     Uses the synchronous HTTP handler to make requests.
     """
+    normalized_tools: Final = (
+        list(tools)  # mutable-ok: downstream Responses transformations require a list
+        if tools is not None and not isinstance(tools, list)
+        else tools
+    )
     local_vars: Final = locals()
+    local_vars["tools"] = normalized_tools
 
     try:
         litellm_logging_obj: Final[LiteLLMLoggingObj] = kwargs.get("litellm_logging_obj")
@@ -1098,13 +1114,21 @@ def responses(
         _stripped_model, _from_chat_completions_prefix = _normalize_openai_chat_completions_responses_model(model)
         model = _stripped_model
         local_vars["model"] = model
-        use_chat_completions_api = use_chat_completions_api or _from_chat_completions_prefix
-
         if custom_llm_provider is None:
             _, custom_llm_provider, _, _ = litellm.get_llm_provider(
                 model=model, api_base=local_vars.get("base_url", None)
             )
             local_vars["custom_llm_provider"] = custom_llm_provider
+
+        use_chat_completions_api = (
+            use_chat_completions_api
+            or _from_chat_completions_prefix
+            or _hosted_vllm_request_requires_chat_completions(
+                custom_llm_provider=custom_llm_provider,
+                tools=normalized_tools,
+                input=input,
+            )
+        )
 
         input, model, custom_llm_provider, deployment_model_info = _apply_prompt_management_to_responses_call(
             input=input,
@@ -1131,11 +1155,22 @@ def responses(
             litellm_params=litellm_params,
             local_vars=local_vars,
         )
+        use_chat_completions_api = (
+            use_chat_completions_api
+            or _from_chat_completions_prefix
+            or _hosted_vllm_request_requires_chat_completions(
+                custom_llm_provider=custom_llm_provider,
+                tools=normalized_tools,
+                input=input,
+            )
+        )
 
         #########################################################
         # Update input and tools with provider-specific file IDs if managed files are used
         #########################################################
-        input, tools = _apply_managed_file_id_mapping(input=input, tools=tools, kwargs=kwargs, local_vars=local_vars)
+        input, tools = _apply_managed_file_id_mapping(input=input, tools=normalized_tools, kwargs=kwargs)
+        local_vars["input"] = input
+        local_vars["tools"] = tools
 
         #########################################################
         # Native MCP Responses API

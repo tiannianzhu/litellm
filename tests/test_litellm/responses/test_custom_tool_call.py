@@ -33,6 +33,25 @@ from litellm.types.responses.main import CustomToolCallOutputItem
 class TestCustomToolUtilities:
     """Test the custom_tools utility functions."""
 
+    def test_hosted_vllm_bridges_custom_tools(self):
+        from litellm.responses.main import _hosted_vllm_request_requires_chat_completions
+
+        assert _hosted_vllm_request_requires_chat_completions(
+            "hosted_vllm", [{"type": "custom", "name": "exec"}], "hello"
+        )
+        for item_type in ("custom_tool_call", "custom_tool_call_output"):
+            assert _hosted_vllm_request_requires_chat_completions(
+                "hosted_vllm", None, [{"type": item_type}]
+            )
+        assert not _hosted_vllm_request_requires_chat_completions(
+            "hosted_vllm", [{"type": "web_search"}], "hello"
+        )
+        assert not _hosted_vllm_request_requires_chat_completions(
+            "openai",
+            [{"type": "custom", "name": "exec"}],
+            [{"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "true"}],
+        )
+
     def test_extract_custom_tool_names(self):
         """Test extraction of custom tool names from tools list."""
         tools = [

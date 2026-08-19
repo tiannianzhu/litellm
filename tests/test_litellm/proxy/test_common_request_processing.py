@@ -8014,3 +8014,44 @@ class TestDetachedStreamFailureHook:
         await logging_obj._on_detached_stream_failure(failure)
 
         assert [call["original_exception"] for call in recorder.calls] == [failure]
+
+
+@pytest.mark.asyncio
+async def test_proxy_logging_streams_completed_responses(monkeypatch):
+    from litellm.types.llms.openai import ResponsesAPIResponse
+
+    monkeypatch.setattr(litellm, "callbacks", [])
+    ProxyLogging._callback_capabilities_cache.clear()
+    proxy_logging = ProxyLogging(user_api_key_cache=MagicMock())
+    response = ResponsesAPIResponse(
+        id="resp-1",
+        created_at=0,
+        model="hosted-vllm/test",
+        object="response",
+        output=[
+            {
+                "type": "custom_tool_call",
+                "id": "call-1",
+                "call_id": "call-1",
+                "name": "exec",
+                "input": "patch payload",
+                "status": "completed",
+            }
+        ],
+        status="completed",
+    )
+
+    events = [
+        event
+        async for event in proxy_logging.async_post_call_streaming_iterator_hook(
+            response=response,
+            user_api_key_dict=ProxyUserAPIKeyAuth(),
+            request_data={},
+        )
+    ]
+
+    assert events[0].type == "response.created"
+    assert events[-1].type == "response.completed"
+    event_types = [event.type for event in events]
+    assert "response.custom_tool_call_input.done" in event_types
+    assert "response.function_call_arguments.done" not in event_types

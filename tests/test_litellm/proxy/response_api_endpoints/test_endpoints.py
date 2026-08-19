@@ -14,6 +14,65 @@ import litellm
 from litellm.proxy.proxy_server import app
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_message", "expected_message"),
+    (
+        (
+            'litellm.BadRequestError: Hosted_vllmException - {"error":{"message":'
+            '"deepseek-v4-flash is not a multimodal model","type":"BadRequestError"}}. '
+            "Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+            "deepseek-v4-flash is not a multimodal model",
+        ),
+        (
+            'litellm.ContextWindowExceededError: {"object":"error","message":'
+            '"This model maximum context length is 131072 tokens","type":"BadRequestError","code":400}. '
+            "Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+            "This model maximum context length is 131072 tokens",
+        ),
+    ),
+)
+async def test_responses_api_returns_inner_provider_error_message(raw_message, expected_message):
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+    from litellm.proxy.response_api_endpoints import endpoints
+
+    routed_error = ProxyException(
+        message=raw_message,
+        type="BadRequestError",
+        param=None,
+        code=400,
+    )
+
+    with (
+        patch.object(  # test-quality-ok: request-body helper has no injection seam
+            proxy_server, "_read_request_body", new=AsyncMock(return_value={"model": "test-model"})
+        ),
+        patch(  # test-quality-ok: polling decision has no injection seam
+            "litellm.proxy.response_polling.polling_handler.should_use_polling_for_request",
+            return_value=False,
+        ),
+        patch.object(  # test-quality-ok: deterministic routed failure needs the processing seam
+            endpoints.ProxyBaseLLMRequestProcessing,
+            "base_process_llm_request",
+            new=AsyncMock(side_effect=Exception("upstream error")),
+        ),
+        patch.object(  # test-quality-ok: error normalization requires the internal exception seam
+            endpoints.ProxyBaseLLMRequestProcessing,
+            "_handle_llm_api_exception",
+            new=AsyncMock(side_effect=routed_error),
+        ),
+        pytest.raises(ProxyException) as exc_info,
+    ):
+        await endpoints.responses_api(
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(api_key="sk-test"),
+        )
+
+    assert exc_info.value.message == expected_message
+
+
 class TestResponsesAPIEndpoints(unittest.TestCase):
     @pytest.mark.asyncio
     @patch("litellm.proxy.proxy_server.llm_router")

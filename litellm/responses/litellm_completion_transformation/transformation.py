@@ -1656,8 +1656,9 @@ class LiteLLMCompletionResponsesConfig:
         """
         Transform a Responses API input_image item to a Chat Completion image item
         """
+        detail: Final = item.get("detail") or "auto"
         image_url_obj: Final = ChatCompletionImageUrlObject(
-            url=item.get("image_url") or "", detail=item.get("detail") or "auto"
+            url=item.get("image_url") or "", detail="auto" if detail == "original" else detail
         )
 
         return ChatCompletionImageObject(type="image_url", image_url=image_url_obj)

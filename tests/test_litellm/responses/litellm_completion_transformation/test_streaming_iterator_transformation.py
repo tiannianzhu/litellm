@@ -628,3 +628,60 @@ def test_streamed_anthropic_tool_call_events_correlate_on_normalized_item_id():
     assert item_dones[0].item.call_id == "toolu_01AbCdEf"
     for evt in deltas + dones:
         assert evt.item_id == added[0].item.id
+
+
+def test_custom_tool_stream_uses_custom_input_events():
+    iterator = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=AsyncMock(),
+        request_input="Test input",
+        responses_api_request={"tools": [{"type": "custom", "name": "exec"}]},
+    )
+    custom_input = "patch payload"
+    arguments = json.dumps({"content": custom_input})
+
+    iterator._queue_tool_call_delta_events(
+        [
+            {
+                "id": "call_exec",
+                "type": "function",
+                "function": {"name": "exec", "arguments": arguments},
+            }
+        ]
+    )
+    iterator._queue_final_tool_call_done_events(
+        ModelResponse(
+            id="resp-1",
+            created=123,
+            model="test-model",
+            object="chat.completion",
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_exec",
+                                "type": "function",
+                                "function": {"name": "exec", "arguments": arguments},
+                            }
+                        ],
+                    },
+                }
+            ],
+        )
+    )
+
+    event_types = [event.type for event in iterator._pending_tool_events]
+    assert event_types[0] == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
+    assert ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA not in event_types
+    assert ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE not in event_types
+    assert event_types[-2:] == [
+        ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+    ]
+    assert iterator._pending_tool_events[-2].input == custom_input
+    assert iterator._pending_tool_events[-1].item.input == custom_input

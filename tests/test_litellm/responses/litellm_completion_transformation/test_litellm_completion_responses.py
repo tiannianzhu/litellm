@@ -191,6 +191,17 @@ class TestLiteLLMCompletionResponsesConfig:
         assert result["image_url"]["url"] == image_url
         assert result["image_url"]["detail"] == "high"
 
+    def test_transform_input_image_item_to_image_item_with_original_detail(self):
+        result = LiteLLMCompletionResponsesConfig._transform_input_image_item_to_image_item(
+            {
+                "type": "input_image",
+                "image_url": "https://example.com/image.png",
+                "detail": "original",
+            }
+        )
+
+        assert result["image_url"]["detail"] == "auto"
+
     def test_transform_input_image_item_to_image_item_with_image_data(self):
         """Test transformation of input_image item with image_url to Chat Completion image format"""
         # Setup
