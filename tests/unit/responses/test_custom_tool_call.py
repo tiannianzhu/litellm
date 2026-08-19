@@ -9,24 +9,27 @@ LiteLLM bridge correctly:
 """
 
 import json
-import pytest
-from typing import Dict, Any, List
+from typing import Final
 
+import pytest
 from openai.types.responses import ResponseFunctionToolCall
 
+from litellm.responses.litellm_completion_transformation.custom_tools import (
+    _MAX_ARGUMENTS_LEN,
+    build_tool_call_item_kwargs,
+    convert_custom_tool_to_function_tool,
+    extract_custom_tool_names,
+    is_custom_tool_call,
+    native_responses_custom_tool_name_map,
+    native_responses_namespace_tool_name_map,
+    normalize_native_responses_custom_tools,
+    openai_shaped_tool_call_item_id,
+    unwrap_custom_tool_arguments,
+    unwrap_custom_tool_arguments_strict,
+)
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
 )
-from litellm.responses.litellm_completion_transformation.custom_tools import (
-    extract_custom_tool_names,
-    is_custom_tool_call,
-    openai_shaped_tool_call_item_id,
-    unwrap_custom_tool_arguments,
-    build_tool_call_item_kwargs,
-    convert_custom_tool_to_function_tool,
-    _MAX_ARGUMENTS_LEN,
-)
-
 from litellm.types.responses.main import CustomToolCallOutputItem
 
 
@@ -193,23 +196,320 @@ class TestCustomToolUtilities:
         """Empty arguments unwrap to an empty string, not the raw input."""
         assert unwrap_custom_tool_arguments("") == ""
 
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [
+            ("not json", "must contain valid JSON"),
+            (json.dumps({"content": {}}), "content must be a string"),
+            (json.dumps({"other": "value"}), "must include a content field"),
+            (None, "must be a JSON string"),
+        ],
+    )
+    def test_unwrap_custom_tool_arguments_strict_rejects_invalid_envelopes(self, arguments, message):
+        with pytest.raises((TypeError, ValueError), match=message):
+            unwrap_custom_tool_arguments_strict(arguments)
+
+    def test_unwrap_custom_tool_arguments_strict_returns_only_content(self):
+        assert unwrap_custom_tool_arguments_strict(json.dumps({"content": "raw patch"})) == "raw patch"
+
+    @pytest.mark.parametrize("input_value", (None, {"patch": "body"}))
+    def test_normalize_native_responses_custom_tools_rejects_non_string_history_input(self, input_value):
+        request: Final = {
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+            "input": [{"type": "custom_tool_call", "name": "apply_patch", "input": input_value}],
+        }
+
+        with pytest.raises(ValueError, match="custom tool call input must be a string"):
+            normalize_native_responses_custom_tools(request)
+
+    def test_normalize_native_responses_custom_tools_preserves_absent_tool_list(self):
+        request: Final = {"tools": None, "input": "continue"}
+        assert normalize_native_responses_custom_tools(request) == request
+
+    def test_normalize_native_responses_custom_tools_wraps_request_and_history(self):
+        request: Final = {
+            "model": "hosted_vllm/model",
+            "tools": [
+                {"type": "custom", "name": "exec", "description": "Run raw shell input"},
+                {
+                    "type": "function",
+                    "name": "exec",
+                    "description": "Run structured shell input",
+                    "parameters": {"type": "object"},
+                },
+            ],
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_1",
+                    "name": "exec",
+                    "input": "echo hello",
+                    "content": "preserved",
+                    "status": "completed",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": "hello\n",
+                },
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "custom", "name": "exec"}, {"type": "function", "name": "exec"}],
+            },
+            "metadata": {"request": "unchanged"},
+        }
+
+        custom_tool_names: Final = native_responses_custom_tool_name_map(request)
+        wire_name: Final = next(iter(custom_tool_names))
+        normalized: Final = normalize_native_responses_custom_tools(request)
+
+        assert custom_tool_names[wire_name] == ("exec", None)
+        assert wire_name != "exec"
+        assert normalized["metadata"] == request["metadata"]
+        assert normalized["tools"] == [
+            {
+                "type": "function",
+                "name": wire_name,
+                "description": (
+                    f"Call {wire_name} with a JSON object containing the required content string. "
+                    "The content field holds the complete tool input. Its description and grammar apply only "
+                    "inside that string, not to the outer JSON arguments."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string", "description": "Run raw shell input"}},
+                    "required": ["content"],
+                },
+            },
+            request["tools"][1],
+        ]
+        assert normalized["input"] == [
+            {
+                "type": "function_call",
+                "id": "ctc_1",
+                "call_id": "call_1",
+                "name": wire_name,
+                "content": "preserved",
+                "status": "completed",
+                "arguments": json.dumps({"content": "echo hello"}),
+            },
+            {"type": "function_call_output", "call_id": "call_1", "output": "hello\n"},
+        ]
+        assert normalized["tool_choice"] == {
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [{"type": "function", "name": wire_name}, {"type": "function", "name": "exec"}],
+        }
+
+    def test_normalize_native_responses_custom_tools_flattens_nested_custom_tool(self):
+        request: Final = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "workspace",
+                    "tools": [
+                        {"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
+                        {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                    ],
+                }
+            ],
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "namespace": "workspace",
+                    "input": "*** Begin Patch",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "read_file",
+                    "namespace": "workspace",
+                    "arguments": json.dumps({"path": "README.md"}),
+                },
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [
+                    {"type": "custom", "name": "apply_patch", "namespace": "workspace"},
+                    {"type": "function", "name": "read_file", "namespace": "workspace"},
+                ],
+            },
+        }
+
+        normalized: Final = normalize_native_responses_custom_tools(request)
+        custom_tool_names: Final = native_responses_custom_tool_name_map(request)
+        namespace_tool_names: Final = native_responses_namespace_tool_name_map(request)
+        wire_name: Final = next(iter(custom_tool_names))
+
+        assert custom_tool_names == {"workspace__apply_patch": ("apply_patch", "workspace")}
+        assert namespace_tool_names == {"workspace__read_file": ("workspace", "read_file")}
+        assert normalized["tools"][0]["name"] == wire_name
+        assert normalized["tools"][1]["name"] == "workspace__read_file"
+        assert normalized["input"][0]["name"] == wire_name
+        assert normalized["input"][0]["arguments"] == json.dumps({"content": "*** Begin Patch"})
+        assert normalized["input"][1] == {
+            "type": "function_call",
+            "call_id": "call_read",
+            "name": "workspace__read_file",
+            "arguments": json.dumps({"path": "README.md"}),
+        }
+        assert normalized["tool_choice"] == {
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [
+                {"type": "function", "name": wire_name},
+                {"type": "function", "name": "workspace__read_file"},
+            ],
+        }
+
+    def test_normalize_native_responses_custom_tools_flattens_plain_namespace_functions(self):
+        request: Final = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "workspace",
+                    "tools": [{"type": "function", "name": "read_file", "parameters": {"type": "object"}}],
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "read_file",
+                    "namespace": "workspace",
+                    "arguments": json.dumps({"path": "README.md"}),
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "read_file", "namespace": "workspace"},
+        }
+
+        normalized: Final = normalize_native_responses_custom_tools(request)
+
+        assert normalized["tools"][0]["name"] == "workspace__read_file"
+        assert normalized["input"][0]["name"] == "workspace__read_file"
+        assert "namespace" not in normalized["input"][0]
+        assert normalized["tool_choice"] == {"type": "function", "name": "workspace__read_file"}
+
+    def test_normalize_native_responses_custom_tools_rejects_namespace_name_collision(self):
+        request: Final = {
+            "tools": [
+                {"type": "function", "name": "workspace__read_file", "parameters": {"type": "object"}},
+                {
+                    "type": "namespace",
+                    "name": "workspace",
+                    "tools": [{"type": "function", "name": "read_file", "parameters": {"type": "object"}}],
+                },
+            ]
+        }
+
+        with pytest.raises(ValueError, match="Top-level function names conflict with flattened namespace tools"):
+            normalize_native_responses_custom_tools(request)
+
+    @pytest.mark.parametrize("instructions", [None, "", "Keep the user's existing instructions."])
+    def test_native_namespace_description_is_scoped_once_without_changing_tool_contracts(self, instructions):
+        shared: Final = "Use these tools only for the temporary workspace. 保留完整说明"
+        request: Final = {
+            "instructions": instructions,
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "workspace",
+                    "description": shared,
+                    "tools": [
+                        {"type": "function", "name": "read", "description": "Read a file."},
+                        {"type": "function", "name": "list", "description": "List files."},
+                        {"type": "custom", "name": "edit", "description": "Apply a patch."},
+                    ],
+                },
+                {"type": "function", "name": "workspace__edit", "description": "Unrelated function."},
+                {
+                    "type": "namespace",
+                    "name": "archive",
+                    "description": "Archived files are read-only.",
+                    "tools": [{"type": "function", "name": "read", "description": "Read an archived file."}],
+                },
+            ],
+            "input": "Inspect the workspace.",
+        }
+        before: Final = json.dumps(request)
+        normalized: Final = normalize_native_responses_custom_tools(request)
+        custom_name: Final = next(iter(native_responses_custom_tool_name_map(request)))
+
+        assert normalized["instructions"] == (
+            (instructions + "\n\n" if instructions else "")
+            + f'Tool namespace "workspace" ({custom_name}, workspace__read, workspace__list):\n{shared}'
+            + '\n\nTool namespace "archive" (archive__read):\nArchived files are read-only.'
+        )
+        assert json.dumps(normalized, ensure_ascii=False).count(shared) == 1
+        assert [tool["description"] for tool in normalized["tools"][1:]] == [
+            "Read a file.",
+            "List files.",
+            "Unrelated function.",
+            "Read an archived file.",
+        ]
+        assert normalized["tools"][-1]["name"] == "archive__read"
+        assert normalized["tools"][0]["parameters"]["properties"]["content"]["description"] == "Apply a patch."
+        assert normalized["input"] == request["input"]
+        assert normalize_native_responses_custom_tools(normalized) == normalized
+        assert json.dumps(request) == before
+
+    def test_normalize_native_responses_custom_tools_qualifies_history_without_tools(self):
+        request: Final = {
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "namespace": "workspace",
+                    "input": "*** Begin Patch",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "read_file",
+                    "namespace": "workspace",
+                    "arguments": json.dumps({"path": "README.md"}),
+                },
+            ],
+            "tool_choice": {"type": "function", "name": "read_file", "namespace": "workspace"},
+        }
+
+        normalized: Final = normalize_native_responses_custom_tools(request)
+
+        assert normalized["input"][0]["name"] == "workspace__apply_patch"
+        assert "namespace" not in normalized["input"][0]
+        assert normalized["input"][1]["name"] == "workspace__read_file"
+        assert "namespace" not in normalized["input"][1]
+        assert normalized["tool_choice"] == {"type": "function", "name": "workspace__read_file"}
+
     def test_convert_custom_tool_to_function_tool_with_format(self):
-        """The grammar definition is embedded in the description so the model can
-        produce correctly-formatted output."""
-        tool = {
+        raw_description: Final = "Apply a patch. Provide raw patch text, not JSON."
+        tool: Final = {
             "type": "custom",
             "name": "apply_patch",
-            "description": "Apply a patch",
+            "description": raw_description,
             "format": {
                 "type": "grammar",
                 "syntax": "lark",
                 "definition": "start: begin_patch",
             },
         }
-        result = convert_custom_tool_to_function_tool(tool)
+        result: Final = convert_custom_tool_to_function_tool(tool)
         assert result is not None
         assert result["type"] == "function"
-        assert "begin_patch" in result["function"]["description"]
+        assert "JSON object" in result["function"]["description"]
+        assert raw_description not in result["function"]["description"]
+        assert "begin_patch" not in result["function"]["description"]
+        assert result["function"]["parameters"]["properties"]["content"] == {
+            "type": "string",
+            "description": raw_description + "\n\nFormat:\n```lark\nstart: begin_patch\n```",
+        }
         assert result["function"]["parameters"]["required"] == ["content"]
 
     def test_convert_custom_tool_to_function_tool_non_custom_returns_none(self):
@@ -223,7 +523,7 @@ class TestTransformationCustomTools:
     def test_transform_apply_patch_function_call_to_custom_tool_call(self):
         """Test that apply_patch function_call is converted to custom_tool_call."""
         # Simulate a Chat Completion response with apply_patch function call
-        from litellm.types.utils import ModelResponse, Choices, Message, ChatCompletionMessageToolCall, Function
+        from litellm.types.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
 
         tool_call = ChatCompletionMessageToolCall(
             id="call_abc123",
@@ -314,7 +614,7 @@ class TestTransformationCustomTools:
 
     def test_transform_regular_function_call_unchanged(self):
         """Test that regular function calls remain as ResponseFunctionToolCall."""
-        from litellm.types.utils import ModelResponse, Choices, Message, ChatCompletionMessageToolCall, Function
+        from litellm.types.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
 
         tool_call = ChatCompletionMessageToolCall(
             id="call_xyz789",
@@ -351,7 +651,7 @@ class TestTransformationCustomTools:
         """Anthropic tool ids (toolu_/srvtoolu_) surfacing through the bridge
         must be emitted with fc/ctc-prefixed item ids so a Responses client can
         replay them to OpenAI verbatim, while call_id stays raw for pairing."""
-        from litellm.types.utils import ModelResponse, Choices, Message, ChatCompletionMessageToolCall, Function
+        from litellm.types.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
 
         client_call = ChatCompletionMessageToolCall(
             id="toolu_01ClientCall",
@@ -397,7 +697,7 @@ class TestTransformationCustomTools:
 
     def test_transform_mixed_tool_calls(self):
         """Test transformation with both custom and regular tool calls."""
-        from litellm.types.utils import ModelResponse, Choices, Message, ChatCompletionMessageToolCall, Function
+        from litellm.types.utils import ChatCompletionMessageToolCall, Choices, Function, Message, ModelResponse
 
         custom_call = ChatCompletionMessageToolCall(
             id="call_001",

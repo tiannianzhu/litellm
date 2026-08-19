@@ -6,17 +6,23 @@ tool calls returned by /v1/responses, executes the search server-side, and
 builds a Responses-format follow-up request.
 """
 
+import json
 from types import SimpleNamespace
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
+import litellm
 from litellm.integrations.websearch_interception.handler import (
     WebSearchInterceptionLogger,
 )
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.integrations.custom_logger import (
     RESPONSES_AGENTIC_SURFACE,
 )
+from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import CallTypes, LlmProviders
 
 
@@ -316,3 +322,111 @@ async def test_deployment_hook_responses_converts_stream_to_non_stream():
     assert result is not None
     assert result["stream"] is False
     assert result["_websearch_interception_converted_stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_stream(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tool_input: Final = "const result = await tools.exec_command({ cmd: 'true' });"
+    function_call: Final = {
+        "type": "function_call",
+        "id": "fc_fixture_exec",
+        "call_id": "call_fixture_exec",
+        "name": "exec",
+        "arguments": json.dumps({"content": tool_input}),
+        "status": "completed",
+    }
+    response_body: Final = {
+        "id": "resp_fixture",
+        "object": "response",
+        "created_at": 1,
+        "model": "fixture",
+        "status": "completed",
+        "output": [function_call],
+        "error": None,
+        "incomplete_details": None,
+        "instructions": None,
+        "metadata": {},
+        "parallel_tool_calls": True,
+        "temperature": None,
+        "tool_choice": "none",
+        "tools": [],
+        "top_p": None,
+        "max_output_tokens": None,
+        "previous_response_id": None,
+        "reasoning": None,
+        "text": {},
+        "truncation": None,
+        "user": None,
+        "store": False,
+        "usage": {
+            "input_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 3,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 5,
+        },
+    }
+    sent: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/responses"
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json=response_body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    interceptor: Final = WebSearchInterceptionLogger(enabled_providers=[LlmProviders.HOSTED_VLLM])
+    monkeypatch.setattr(litellm, "callbacks", [interceptor])
+    try:
+        stream: Final = await litellm.aresponses(
+            model="hosted_vllm/fixture",
+            input="Return the synthetic tool call.",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            tool_choice="none",
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /[\\s\\S]+/"},
+                },
+                {"type": "web_search"},
+            ],
+            client=handler,
+        )
+        events: Final = [event async for event in stream]
+    finally:
+        await handler.client.aclose()
+
+    assert len(sent) == 1
+    upstream: Final = sent[0]
+    assert upstream["stream"] is False
+    assert [tool["name"] for tool in upstream["tools"]] == ["exec", "litellm_web_search"]
+    event_types: Final = [
+        getattr(getattr(event, "type", None), "value", getattr(event, "type", None)) for event in events
+    ]
+    assert (
+        event_types.index("response.custom_tool_call_input.delta")
+        < event_types.index("response.custom_tool_call_input.done")
+        < event_types.index("response.output_item.done")
+        < event_types.index("response.completed")
+    )
+    assert [event.sequence_number for event in events] == list(range(len(events)))
+    added: Final = next(
+        event for event in events if getattr(event.type, "value", event.type) == "response.output_item.added"
+    )
+    assert added.item.type == "custom_tool_call"
+    assert added.item.input == ""
+    assert added.item.status == "in_progress"
+    completed: Final = next(
+        event.response for event in events if getattr(event.type, "value", event.type) == "response.completed"
+    )
+    assert isinstance(completed, ResponsesAPIResponse)
+    assert completed.output[0].type == "custom_tool_call"
+    assert completed.output[0].call_id == "call_fixture_exec"
+    assert completed.output[0].input == tool_input
+    assert completed.usage.total_tokens == 5
