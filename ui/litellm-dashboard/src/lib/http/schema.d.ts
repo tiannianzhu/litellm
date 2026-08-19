@@ -31633,6 +31633,8 @@ export interface components {
             input: string;
             /** Name */
             name: string;
+            /** Namespace */
+            namespace?: string | null;
             /** Status */
             status?: ("in_progress" | "completed" | "incomplete") | null;
             /**

@@ -1907,6 +1907,36 @@ class ProxyLogging:
     - support the max parallel request integration
     """
 
+    @staticmethod
+    def _as_async_response_stream(response: object, request_data: Mapping[str, object]) -> AsyncIterable[object]:
+        if isinstance(response, AsyncIterable):
+
+            async def passthrough_stream() -> AsyncGenerator[object, None]:
+                async for chunk in response:
+                    yield chunk
+
+            return passthrough_stream()
+
+        from litellm.responses.streaming_iterator import build_synthetic_response_events
+        from litellm.types.llms.openai import ResponsesAPIResponse
+
+        if not isinstance(response, ResponsesAPIResponse):
+            raise TypeError(f"Expected an async response stream, got {type(response).__name__}")
+
+        logging_obj_value: Final = request_data.get("litellm_logging_obj")
+        logging_obj: Final = logging_obj_value if isinstance(logging_obj_value, Logging) else None
+        events: Final = build_synthetic_response_events(
+            transformed=response,
+            logging_obj=logging_obj,
+            chunk_size=5,
+        )
+
+        async def event_stream() -> AsyncGenerator[object, None]:
+            for event in events:
+                yield event
+
+        return event_stream()
+
     def __init__(
         self,
         user_api_key_cache: UserApiKeyCache,
@@ -4074,6 +4104,15 @@ class ProxyLogging:
                 original_exception=original_exception,
                 error_type=error_type,
             )
+        elif (
+            isinstance(logging_obj, Logging)
+            and logging_obj.call_type in ("responses", "aresponses")
+            and isinstance(original_exception, litellm.BadGatewayError)
+            and isinstance(logging_obj.model_call_details.get("combined_usage_object"), Usage)
+        ):
+            await logging_obj.dispatch_failure_handlers(
+                original_exception, traceback_str or "", prefer_async_handlers=True
+            )
 
         request_data.update(
             await offload_token_count(_failure_fields_to_lift)(
@@ -4768,6 +4807,7 @@ class ProxyLogging:
         Covers:
         1. /chat/completions
         """
+        streaming_response: Final = self._as_async_response_stream(response=response, request_data=request_data)
         caps: Final = ProxyLogging.callback_capabilities()
         post_call_pipelines: Final = _streamable_post_call_pipelines(request_data, user_api_key_dict)
         # Fast path: no real overrides. Internal proxy CustomLogger callbacks
@@ -4777,7 +4817,7 @@ class ProxyLogging:
         # zero behavior change. Skip the chain entirely and stream through.
         if not caps.iterator_overrides and not post_call_pipelines:
             try:
-                async for chunk in response:
+                async for chunk in streaming_response:
                     yield chunk
             except (GeneratorExit, asyncio.CancelledError):
                 raise
@@ -4793,7 +4833,7 @@ class ProxyLogging:
         # Merge model-level guardrails before checking which guardrails to run
         request_data = check_and_merge_model_level_guardrails(data=request_data, llm_router=llm_router)
 
-        current_response = response
+        current_response = streaming_response
         stream_needs_translation: Final = ProxyLogging._stream_requires_guardrail_translation(user_api_key_dict)
 
         pipeline_gated_names: Final = _pipeline_step_guardrail_names(post_call_pipelines)
@@ -5188,7 +5228,10 @@ class ProxyLogging:
         if not isinstance(logging_obj, Logging):
             return False
         _args: Final[tuple[object, ...] | None] = getattr(logging_obj, "_deferred_stream_complete_args", None)
-        if not isinstance(error, _PROXY_ONLY_LLM_API_ERRORS):
+        responses_bridge_failure: Final = logging_obj.call_type in ("responses", "aresponses") and isinstance(
+            error, litellm.BadGatewayError
+        )
+        if not (isinstance(error, _PROXY_ONLY_LLM_API_ERRORS) or responses_bridge_failure):
             return False
         match _args:
             case (ModelResponse(), *_) if (held := held_round_spend(logging_obj)) is not None:

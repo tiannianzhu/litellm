@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import Final, Literal, cast
 
 import pytest
-from openai.types.responses import ResponseFunctionToolCall
+from openai.types.responses import ResponseCompactionItem, ResponseFunctionToolCall
 from openai.types.responses.response_create_params import ResponseInputParam
 from openai.types.responses.response_function_web_search import (
     ActionFind,
@@ -190,6 +190,17 @@ class TestLiteLLMCompletionResponsesConfig:
         assert result["image_url"]["url"] == image_url
         assert result["image_url"]["detail"] == "high"
 
+    def test_transform_input_image_item_to_image_item_with_original_detail(self):
+        result = LiteLLMCompletionResponsesConfig._transform_input_image_item_to_image_item(
+            {
+                "type": "input_image",
+                "image_url": "https://example.com/image.png",
+                "detail": "original",
+            }
+        )
+
+        assert result["image_url"]["detail"] == "auto"
+
     def test_transform_input_image_item_to_image_item_with_image_data(self):
         """Test transformation of input_image item with image_url to Chat Completion image format"""
         # Setup
@@ -314,7 +325,7 @@ class TestLiteLLMCompletionResponsesConfig:
         assert reasoning_item.status == "completed"
         assert reasoning_item.role == "assistant"
         assert len(reasoning_item.content) == 1
-        assert reasoning_item.content[0].type == "output_text"
+        assert reasoning_item.content[0].type == "reasoning_text"
         assert "step by step" in reasoning_item.content[0].text
         assert "42" in reasoning_item.content[0].text
 
@@ -2288,7 +2299,9 @@ class TestToolTransformation:
         assert result_tools[0]["function"]["name"] == "apply_patch"
         assert "content" in result_tools[0]["function"]["parameters"]["properties"]
         assert result_tools[0]["function"]["parameters"]["required"] == ["content"]
-        assert "begin_patch" in result_tools[0]["function"]["description"]
+        assert "JSON object" in result_tools[0]["function"]["description"]
+        assert "begin_patch" not in result_tools[0]["function"]["description"]
+        assert "begin_patch" in result_tools[0]["function"]["parameters"]["properties"]["content"]["description"]
         assert web_search_options is None
 
     def test_transform_custom_tools_without_format(self):
@@ -2311,7 +2324,8 @@ class TestToolTransformation:
         assert len(result_tools) == 1
         assert result_tools[0]["type"] == "function"
         assert result_tools[0]["function"]["name"] == "exec"
-        assert result_tools[0]["function"]["description"] == "Execute code"
+        assert "JSON object" in result_tools[0]["function"]["description"]
+        assert result_tools[0]["function"]["parameters"]["properties"]["content"]["description"] == "Execute code"
 
     def test_transform_custom_tools_preserves_allowed_callers(self):
         """allowed_callers on a custom tool gates direct model invocation in the
@@ -3141,9 +3155,10 @@ class TestToolTransformation:
         assert len(result_tools) == 1
         function = result_tools[0]["function"]
         assert function["name"] == "exec"
-        assert function["description"].startswith("Codex shell tools.")
-        assert "Runs a shell command." in function["description"]
-        assert "start: /.+/" in function["description"]
+        description = function["parameters"]["properties"]["content"]["description"]
+        assert description.startswith("Codex shell tools.")
+        assert "Runs a shell command." in description
+        assert "start: /.+/" in description
         assert function["parameters"]["required"] == ["content"]
         assert function["parameters"]["properties"]["content"]["type"] == "string"
 
@@ -4359,6 +4374,9 @@ class TestEnsureOutputItemContentPartAdded:
         iterator._reasoning_output_index = None
         iterator._final_tool_events_queued = False
         iterator._custom_tool_names = set()
+        iterator.custom_llm_provider = None
+        iterator._custom_tool_wire_names = {}
+        iterator._namespace_tool_wire_names = {}
         iterator.responses_api_request = {}
         iterator._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(None)
         iterator._web_search_calls = {}
@@ -5754,7 +5772,7 @@ def test_transform_chat_completion_response_echoes_request_params():
     )
     assert result_unset.temperature is None
     assert result_unset.metadata == {}
-    assert result_unset.parallel_tool_calls is False
+    assert result_unset.parallel_tool_calls is True
     assert result_unset.tools == []
     assert result_unset.text == {}
 
@@ -5766,7 +5784,7 @@ def test_transform_chat_completion_response_echoes_request_params():
         ("instructions", 5, None),
         ("text", "plain", {}),
         ("truncation", "bogus", None),
-        ("parallel_tool_calls", "maybe", False),
+        ("parallel_tool_calls", "maybe", True),
     ],
 )
 def test_transform_drops_request_params_the_response_cannot_echo(
@@ -6775,16 +6793,31 @@ def test_stored_compacted_answer_replays_its_block_only_when_anthropic_compacts(
     assert _replayed_compacted_answer(model, context_management) == replayed
 
 
-def test_summary_replay_drops_the_history_its_compaction_item_replaces() -> None:
+@pytest.mark.parametrize(
+    ("model", "custom_llm_provider", "sdk_item"),
+    [
+        ("gemini/gemini-3.8-flash", "gemini", False),
+        ("hosted_vllm/fixture", "hosted_vllm", False),
+        ("hosted_vllm/fixture", "hosted_vllm", True),
+    ],
+)
+def test_summary_replay_drops_the_history_its_compaction_item_replaces(
+    model: str, custom_llm_provider: str, sdk_item: bool
+) -> None:
+    compaction: Final = {
+        "type": "compaction", "id": "cmp_litellm", "encrypted_content": json.dumps(_COMPACTION_BLOCK)
+    }
     result: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
-        model="gemini/gemini-3.8-flash",
+        model=model,
+        custom_llm_provider=custom_llm_provider,
         input=cast(
             ResponseInputParam,
             [
                 {"role": "system", "content": "Answer briefly."},
                 {"role": "user", "content": "Plan a Tokyo trip."},
+                {"type": "reasoning", "id": "rs_old", "summary": [], "encrypted_content": "superseded reasoning"},
                 {"role": "assistant", "content": "Day one, Asakusa."},
-                {"type": "compaction", "id": "cmp_litellm", "encrypted_content": json.dumps(_COMPACTION_BLOCK)},
+                ResponseCompactionItem.model_validate(compaction) if sdk_item else compaction,
                 {"role": "user", "content": "And Osaka?"},
             ],
         ),
@@ -7283,6 +7316,28 @@ def test_a_tool_output_with_an_int_call_id_converts_like_its_string_form() -> No
     assert converted(7) == converted("7")
 
 
+def test_hosted_tool_output_error_keeps_its_input_index_after_normalization() -> None:
+    tools_item: Final = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}],
+    }
+    history: Final = [
+        tools_item,
+        _WEATHER_ASK,
+        _weather_call(call_id="call_weather"),
+        {"type": "function_call_output", "call_id": {"id": "call_weather"}, "output": "sunny"},
+    ]
+
+    with pytest.raises(litellm.BadRequestError) as raised:
+        litellm.responses(
+            model="hosted_vllm/test-model", api_key="test-key", api_base="http://test.invalid",
+            use_chat_completions_api=True, input=cast(ResponseInputParam, history),
+        )
+
+    assert "'input[3].call_id'" in raised.value.message
+
+
 def test_a_non_string_role_still_converts_for_a_target_that_judges_it_itself() -> None:
     history: Final = [{"role": "user", "content": "Hi"}, {"role": ["user"], "content": "Go on"}]
 
@@ -7394,3 +7449,52 @@ def test_a_malformed_item_after_a_codex_additional_tools_item_is_named_by_its_in
         )
 
     assert f"'{field_path}'" in raised.value.message
+
+
+@pytest.mark.parametrize("namespaced", [False, True])
+@pytest.mark.parametrize("flag", ["allowed_callers", "defer_loading"])
+def test_hosted_custom_tool_drops_malformed_flags_before_normalizing(
+    monkeypatch: pytest.MonkeyPatch, namespaced: bool, flag: str
+) -> None:
+    monkeypatch.setattr(litellm, "drop_params", False)
+    tool: Final = {"type": "custom", "name": "apply_patch", flag: "invalid"}
+    request: Final = ResponsesAPIOptionalRequestParams(
+        tools=[{"type": "namespace", "name": "workspace", "tools": [tool]}] if namespaced else [tool]
+    )
+    transform: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
+    with pytest.raises(litellm.BadRequestError, match=flag):
+        transform(model="test-model", input="edit", responses_api_request=request, custom_llm_provider="hosted_vllm")
+
+    result: Final = transform(
+        model="test-model", input="edit", responses_api_request=request, custom_llm_provider="hosted_vllm",
+        drop_params=True,
+    )
+
+    assert len(result["tools"]) == 1
+    assert result["tools"][0]["type"] == "function"
+    assert result["tools"][0]["function"]["parameters"]["required"] == ["content"]
+    assert result["tools"][0].get("allowed_callers") is None
+    assert result["tools"][0].get("defer_loading", False) is False
+
+
+def test_allowed_tools_makes_the_selected_tool_eager_when_search_is_removed() -> None:
+    result: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model="anthropic/claude-sonnet-5-5",
+        input="weather",
+        responses_api_request={
+            "tools": [
+                {"type": "tool_search", "execution": "server"},
+                {"type": "function", "name": "weather", "parameters": {"type": "object"}, "defer_loading": True},
+            ],
+            "tool_choice": {
+                "type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "weather"}],
+            },
+        },
+        custom_llm_provider="anthropic",
+    )
+
+    assert len(result["tools"]) == 1
+    assert result["tools"][0]["type"] == "function"
+    assert result["tools"][0]["function"]["name"] == "weather"
+    assert result["tools"][0].get("defer_loading", False) is False
+    assert result["tool_choice"] == "auto"

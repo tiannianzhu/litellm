@@ -147,6 +147,7 @@ class LiteLLMCompletionTransformationHandler:
                     chat_completion_response=litellm_completion_response,
                     request_input=bridged_input,
                     responses_api_request=bridged_request,
+                    custom_llm_provider=custom_llm_provider,
                 )
             )
 
@@ -245,6 +246,7 @@ class LiteLLMCompletionTransformationHandler:
                     chat_completion_response=litellm_completion_response,
                     request_input=request_input,
                     responses_api_request=responses_api_request,
+                    custom_llm_provider=litellm_completion_request.get("custom_llm_provider"),
                 )
             )
 
