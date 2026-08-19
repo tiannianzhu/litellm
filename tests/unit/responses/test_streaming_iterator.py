@@ -36,6 +36,7 @@ from litellm.responses.streaming_iterator import (
     ResponsesAPIStreamingIterator,
     SyncResponsesAPIStreamingIterator,
     _estimate_usage_from_text,
+    build_synthetic_response_events,
 )
 from litellm.types.llms.openai import (
     ResponseAPIUsage,
@@ -3608,3 +3609,26 @@ def test_streamed_delta_on_an_event_that_is_not_tool_input_is_left_as_sent():
     )
 
     assert fields["delta"] == {"q": 1}
+
+
+@pytest.mark.parametrize("status", ["failed", "incomplete"])
+def test_synthetic_stream_preserves_unsuccessful_terminal_status(status):
+    response: Final = ResponsesAPIResponse(
+        id="resp_terminal",
+        created_at=1,
+        model="fixture",
+        object="response",
+        status=status,
+        output=[],
+        usage=ResponseAPIUsage(input_tokens=2, output_tokens=3, total_tokens=5),
+        error={"code": "server_error", "message": "fixture failure"} if status == "failed" else None,
+        incomplete_details={"reason": "max_output_tokens"} if status == "incomplete" else None,
+    )
+    events: Final = build_synthetic_response_events(transformed=response, logging_obj=None, chunk_size=5)
+    assert events[-1].type == f"response.{status}"
+    assert events[-1].response.status == status
+    assert events[-1].response.usage.total_tokens == 5
+    assert events[-1].response.error == response.error
+    assert events[-1].response.incomplete_details == response.incomplete_details
+    assert all(event.type != "response.completed" for event in events)
+    assert [event.sequence_number for event in events] == list(range(len(events)))

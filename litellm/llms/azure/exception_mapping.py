@@ -16,7 +16,7 @@ class AzureOpenAIExceptionMapping:
         message: str,
         model: str,
         extra_information: str,
-        original_exception: Exception,
+        original_exception: object,
         response: httpx.Response | None,
     ) -> ContentPolicyViolationError:
         """
@@ -58,7 +58,7 @@ class AzureOpenAIExceptionMapping:
 
     @staticmethod
     def _extract_azure_error(
-        original_exception: Exception,
+        original_exception: object,
     ) -> tuple[Mapping[str, object], object]:
         """Extract Azure OpenAI error payload and inner error details.
 

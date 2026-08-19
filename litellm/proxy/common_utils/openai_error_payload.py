@@ -5,9 +5,11 @@ string ``"None"`` satisfies."""
 import json
 import re
 import sys
+import time
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final, Literal
+from uuid import uuid4
 
 from fastapi import HTTPException, status
 from pydantic import TypeAdapter
@@ -17,11 +19,15 @@ from litellm._logging import (
     redact_internal_details_from_client_message,
 )
 from litellm.constants import PROVIDER_ERROR_BODY_ATTRIBUTE, STRINGIFIED_NONE
+from litellm.exceptions import ContextWindowExceededError
+from litellm.litellm_core_utils.add_retry_fallback_headers import HiddenParamsAsyncIteratorWrapper
 from litellm.litellm_core_utils.core_helpers import error_status_code, http_error_status
+from litellm.litellm_core_utils.exception_mapping_utils import extract_error_message_from_string
 from litellm.llms.openai.common_utils import create_may_already_exist
 from litellm.proxy._types import ProxyErrorTypes, ProxyException, proxy_exception_status_code
 from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler, exception_chain
+from litellm.types.llms.openai import ResponsesAPIResponse
 
 LITELLM_CALL_ID_HEADER: Final = "x-litellm-call-id"
 SHOULD_RETRY_HEADER: Final = "x-should-retry"
@@ -334,3 +340,72 @@ def headers_with_litellm_call_id(headers: Mapping[str, str] | None, litellm_call
     if headers is None:
         return MappingProxyType({LITELLM_CALL_ID_HEADER: litellm_call_id})
     return MappingProxyType({LITELLM_CALL_ID_HEADER: litellm_call_id, **headers})
+
+
+def is_context_window_error(exc: object) -> bool:
+    return isinstance(exc, ContextWindowExceededError) or any(
+        attribute_of(exc, field) == "context_length_exceeded" for field in ("code", "openai_code")
+    )
+
+
+class ResponsesContextErrorFormatter:
+    def __init__(self, model: object) -> None:
+        self._model = model if isinstance(model, str) else None
+        self._response: ResponsesAPIResponse | None = None
+        self._sequence_number = -1
+
+    def observe(self, chunk: object) -> None:
+        sequence: Final = attribute_of(chunk, "sequence_number")
+        self._sequence_number = (
+            max(self._sequence_number + 1, sequence) if isinstance(sequence, int) else self._sequence_number + 1
+        )
+        response: Final = attribute_of(chunk, "response")
+        if isinstance(response, ResponsesAPIResponse):
+            self._response = response
+
+    def format(self, exc: Exception, *, stream: object = None) -> str | None:
+        if not is_context_window_error(exc):
+            return None
+        raw_message: Final = attribute_of(exc, "message", str(exc))
+        message: Final = raw_message if isinstance(raw_message, str) else str(exc)
+        safe_message: Final = redact_internal_details_from_client_message(
+            extract_error_message_from_string(message) or message
+        )
+        source: Final = (
+            attribute_of(stream, "_inner") if isinstance(stream, HiddenParamsAsyncIteratorWrapper) else stream
+        )
+        terminal: Final = attribute_of(source, "completed_response")
+        terminal_response: Final = attribute_of(terminal, "response")
+        response: Final = (
+            terminal_response if isinstance(terminal_response, ResponsesAPIResponse) else self._response
+        ) or ResponsesAPIResponse.model_validate(
+            MappingProxyType(
+                {
+                    "id": f"resp_{uuid4().hex}",
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "model": self._model,
+                    "output": (),
+                }
+            )
+        )
+        failed: Final = ResponsesAPIResponse.model_validate(
+            MappingProxyType(
+                {
+                    **response.model_dump(),
+                    "status": "failed",
+                    "error": MappingProxyType({"code": "context_length_exceeded", "message": safe_message}),
+                }
+            )
+        )
+        from litellm.types.llms.openai import ResponseFailedEvent, ResponsesAPIStreamEvents
+
+        event: Final = ResponseFailedEvent(type=ResponsesAPIStreamEvents.RESPONSE_FAILED, response=failed)
+        terminal_sequence: Final = attribute_of(terminal, "sequence_number")
+        sequence: Final = (
+            max(self._sequence_number + 1, terminal_sequence)
+            if isinstance(terminal_sequence, int)
+            else self._sequence_number + 1
+        )
+        payload: Final = event.model_copy(update=MappingProxyType({"sequence_number": sequence})).model_dump_json()
+        return f"event: response.failed\ndata: {payload}\n\n"

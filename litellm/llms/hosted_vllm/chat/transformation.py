@@ -6,7 +6,7 @@ import json
 from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator, Mapping, Sequence
 from typing import Final, Literal, cast, overload
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from litellm.constants import VLLM_STREAM_PROMPT_FIELDS
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
@@ -36,6 +36,7 @@ from ...openai.chat.gpt_transformation import (
 )
 
 _JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
+_FILE_PART_ADAPTER: Final = TypeAdapter(ChatCompletionFileObject)
 _THINKING_KEYS: Final = frozenset({"thinking_blocks"})
 _THINKING_AND_REASONING_KEYS: Final = frozenset({"thinking_blocks", "reasoning_content"})
 
@@ -109,7 +110,19 @@ def _vllm_assistant_message(message: ChatCompletionAssistantMessage) -> AllMessa
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
-    def _convert_custom_tools_to_function_tools(self, tools: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _downloads_file_part(self, role: str, part: object) -> bool:
+        if role != "user":
+            return True
+        try:
+            file_part: Final = _FILE_PART_ADAPTER.validate_python(part)
+        except ValidationError:
+            return True
+        return not self._is_video_file(file_part)
+
+    def supports_tool_result_images(self) -> bool:
+        return True
+
+    def _convert_custom_tools_to_function_tools(self, tools: Sequence[dict[str, object]]) -> list[dict[str, object]]:
         """
         vLLM chat completions currently accepts only OpenAI function tools.
         Convert custom tools into function tools so request validation does not fail.
@@ -169,9 +182,7 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         )
 
     def get_supported_openai_params(self, model: str) -> list[str]:
-        params: Final = super().get_supported_openai_params(model)
-        params.extend(("reasoning_effort", "thinking"))
-        return params
+        return [*super().get_supported_openai_params(model), "reasoning_effort", "thinking"]
 
     def map_openai_params(
         self,

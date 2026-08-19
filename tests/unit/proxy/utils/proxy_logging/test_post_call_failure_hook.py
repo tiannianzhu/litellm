@@ -8,7 +8,7 @@ import json
 from collections.abc import Callable
 from datetime import datetime
 from types import MappingProxyType
-from typing import Final
+from typing import Final, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,9 +18,10 @@ import litellm
 from litellm.constants import PROXY_REJECTED_BEFORE_ROUTING_KEY
 from litellm.exceptions import BlockedPiiEntityError, GuardrailRaisedException, ModifyResponseException
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.proxy._types import ProxyErrorTypes, UserAPIKeyAuth
 from litellm.proxy.utils import REJECTED_BEFORE_REQUEST_SETUP, REJECTED_BEFORE_REQUEST_SETUP_KEY, ProxyLogging
-from litellm.types.utils import CachingDetails
+from litellm.types.utils import CachingDetails, StandardLoggingPayload, Usage
 
 
 @pytest.fixture(autouse=True)
@@ -1418,3 +1419,53 @@ async def test_a_fallback_refusal_the_client_gets_is_logged_on_the_fallback_depl
         seen["standard_logging_object"]["model_group"],
         seen["metadata"]["model_info"]["id"],
     ) == (*logged_deployment, logged_deployment[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ["aresponses", "acompletion"])
+async def test_responses_bridge_rejection_dispatches_failure_callback_with_consumed_usage(
+    proxy_logging: ProxyLogging,
+    make_user_api_key_auth: Callable[..., UserAPIKeyAuth],
+    monkeypatch: pytest.MonkeyPatch,
+    call_type: str,
+) -> None:
+    class FailureRecorder(CustomLogger):
+        def __init__(self) -> None:
+            self.payloads: tuple[StandardLoggingPayload, ...] = ()
+
+        async def async_log_failure_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            self.payloads = (*self.payloads, cast(StandardLoggingPayload, kwargs["standard_logging_object"]))
+
+    recorder: Final = FailureRecorder()
+    monkeypatch.setattr(litellm, "_async_failure_callback", [recorder])
+    logging_obj: Final = Logging(
+        model="hosted_vllm/test-model",
+        messages=[{"role": "user", "content": "synthetic input"}],
+        stream=True,
+        call_type=call_type,
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="bridge-rejection",
+        function_id="bridge-rejection",
+    )
+    logging_obj.update_environment_variables(
+        model="test-model", user="", optional_params={}, litellm_params={}, custom_llm_provider="hosted_vllm"
+    )
+    logging_obj.record_partial_usage_for_failure(Usage(prompt_tokens=30, completion_tokens=5, total_tokens=35), 0.04)
+    await proxy_logging.post_call_failure_hook(
+        request_data={"litellm_logging_obj": logging_obj, "model": "test-model", "metadata": {}},
+        original_exception=litellm.BadGatewayError(
+            message="custom tool arguments must include a content field", model="test-model", llm_provider="hosted_vllm"
+        ),
+        user_api_key_dict=make_user_api_key_auth(request_route="/v1/responses"),
+    )
+    assert len(recorder.payloads) == int(call_type == "aresponses")
+    if call_type == "aresponses":
+        payload: Final = recorder.payloads[0]
+        assert (
+            payload["status"],
+            payload["prompt_tokens"],
+            payload["completion_tokens"],
+            payload["response_cost"],
+        ) == ("failure", 30, 5, 0.04)

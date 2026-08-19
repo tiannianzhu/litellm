@@ -143,6 +143,7 @@ from litellm.litellm_core_utils.core_helpers import (
     reconstruct_model_name,
     reports_native_messages_cost,
     require_attributes,
+    require_get,
     set_response_cost_in_hidden_params,
     single_log_line,
     subscript,
@@ -228,6 +229,7 @@ from litellm.types.llms.openai import (
     AllMessageValues,
     Batch,
     ChatCompletionSystemMessage,
+    ChatCompletionUserMessage,
     FineTuningJob,
     HttpxBinaryResponseContent,
     OpenAIFileObject,
@@ -1327,11 +1329,13 @@ class Logging(LiteLLMLoggingBaseClass):
 
         self.model_info_api_key: str | None = None
 
+        instructions: Final = _LITELLM_PARAMS.validate_python(kwargs or {}).get("instructions")
         self.model_call_details: dict[str, Any] = {
             "_accounting_request_id": uuid.uuid4().hex,
             "litellm_trace_id": self.litellm_trace_id,
             "litellm_call_id": litellm_call_id,
             "input": _input,
+            "instructions": instructions if isinstance(instructions, str) else None,
             "litellm_params": litellm_params,
             "applied_guardrails": applied_guardrails,
             "model": model,
@@ -8396,17 +8400,24 @@ class StandardLoggingPayloadSetup:
         """
         Prepend the request's top-level `system` prompt, text or content blocks, to the logged messages
         """
-        system: Final = kwargs.get("system") if kwargs is not None else None
-        if not isinstance(system, str) and not (isinstance(system, list) and system):
+        if kwargs is None:
             return messages
-        system_message: Final = ChatCompletionSystemMessage(role="system", content=system)
+        system: Final = kwargs.get("system")
+        system_prompt: Final = (
+            system if isinstance(system, str) or isinstance(system, list) and system else kwargs.get("instructions")
+        )
+        if not isinstance(system_prompt, str) and not (isinstance(system_prompt, list) and system_prompt):
+            return messages
+        system_message: Final = ChatCompletionSystemMessage(role="system", content=system_prompt)
         if messages is None:
             return [system_message]
         if isinstance(messages, str):
-            return [system_message, {"role": "user", "content": messages}]
+            user_message: Final[ChatCompletionUserMessage] = {"role": "user", "content": messages}
+            return [system_message, user_message]
         if not isinstance(messages, list):
             return messages
-        if messages and messages[0].get("role") == "system" and messages[0].get("content") == system:
+        first: Final = require_get(cast(Sequence[object], messages)[0]) if messages else None  # cast-ok: read as object
+        if first is not None and first.get("role") == "system" and first.get("content") == system_prompt:
             return messages
         return [system_message, *messages]
 

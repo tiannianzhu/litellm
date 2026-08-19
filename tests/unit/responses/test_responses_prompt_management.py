@@ -13,16 +13,22 @@ Covers:
   I) async path propagates optional params to downstream handler
 """
 
-from importlib import import_module
 import asyncio
+from collections.abc import Awaitable
+from datetime import datetime, timezone
+from importlib import import_module
 from typing import Final, List, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+import respx
 from fastapi import HTTPException
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm.integrations.anthropic_cache_control_hook import (
+    MAX_CACHE_CONTROL_BLOCKS,
     AnthropicCacheControlHook,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -722,3 +728,69 @@ def test_responses_ignores_a_shared_session_that_is_not_a_client_session() -> No
 
     assert response is handler.return_value
     assert handler.call_args.kwargs["shared_session"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_generator_tools_reserve_cache_marks_before_prompt_injection(
+    monkeypatch: pytest.MonkeyPatch, asynchronous: bool
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="anthropic/claude-sonnet-5-5",
+        messages=[],
+        stream=False,
+        call_type="aresponses" if asynchronous else "responses",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="cache-budget-test",
+        function_id="cache-budget-test",
+    )
+    with respx.mock as http:
+        route: Final = http.post("https://api.anthropic.com/v1/messages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "msg_cache_budget",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-sonnet-5-5",
+                    "content": [{"type": "text", "text": "done"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            )
+        )
+        response: Final = (litellm.aresponses if asynchronous else litellm.responses)(
+            model="anthropic/claude-sonnet-5-5",
+            api_key="test-key",
+            litellm_logging_obj=logging_obj,
+            input=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"},
+                {"role": "user", "content": "third"},
+                {"role": "assistant", "content": "fourth"},
+            ],
+            tools=iter(
+                [
+                    {
+                        "type": "function",
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            ),
+            cache_control_injection_points=[{"location": "message", "index": index} for index in range(4)],
+        )
+        if isinstance(response, Awaitable):
+            await response
+
+    body: Final = TypeAdapter(dict[str, JsonValue]).validate_json(route.calls[0].request.content)
+    messages: Final = TypeAdapter(list[dict[str, JsonValue]]).validate_python(body["messages"])
+    wire_tools: Final = TypeAdapter(list[dict[str, JsonValue]]).validate_python(body["tools"])
+    assert route.call_count == 1
+    assert AnthropicCacheControlHook.count_request_cache_breakpoints(messages, wire_tools) == (
+        MAX_CACHE_CONTROL_BLOCKS
+    )
+    assert [tool["name"] for tool in wire_tools] == ["lookup"]
+    assert wire_tools[0]["cache_control"] == {"type": "ephemeral"}

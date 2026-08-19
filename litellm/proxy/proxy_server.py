@@ -187,6 +187,7 @@ from litellm.proxy.common_utils.callback_utils import (
     normalize_callback_names,
     process_callback,
 )
+from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
 from litellm.proxy.common_utils.realtime_utils import (  # noqa: F401, RUF100  # legacy module exports
     _realtime_request_body,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
     realtime_request_body,
@@ -10747,6 +10748,7 @@ async def async_data_generator(
     *,
     responses_stream_errors: bool = False,
     dispatched_call_type: str | None = None,
+    responses_error: ResponsesContextErrorFormatter | None = None,
 ):
     verbose_proxy_logger.debug("inside generator")
     stream_completed = False
@@ -10887,6 +10889,8 @@ async def async_data_generator(
             if error_state is not None:
                 error_state.observe_chunk(chunk)
             raw_passthrough = False
+            if responses_error is not None:
+                responses_error.observe(chunk)
             if isinstance(chunk, BaseModel):
                 chunk = _serialize_streaming_chunk(chunk)
             elif isinstance(chunk, bytes):
@@ -10975,6 +10979,8 @@ async def async_data_generator(
                 await close_guarded_stream(guarded_layer)
         raise
     except Exception as e:  # noqa: BLE001  # stream boundary: any failure must end the SSE body as an error event
+        if not needs_iterator_wrap:
+            ProxyLogging.finish_deferred_stream_logging_on_failure(request_data, e)
         verbose_proxy_logger.exception("litellm.proxy.proxy_server.async_data_generator(): Exception occured - %s", e)
         replacement: Final = await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
@@ -10988,6 +10994,13 @@ async def async_data_generator(
             e,
         )
 
+        responses_frame: Final = (
+            responses_error.format(client_error, stream=response) if responses_error is not None else None
+        )
+        if responses_frame is not None:
+            stream_completed = True
+            yield responses_frame
+            return
         if error_state is not None:
             stream_completed = True
             error_frame: Final = error_state.format_failure(client_error)
@@ -10996,7 +11009,7 @@ async def async_data_generator(
             if ends_with_openai_done:
                 yield _OPENAI_STREAM_DONE_FRAME
             return
-        if isinstance(e, HTTPException) and (not stream_started or not ends_with_openai_done):
+        if isinstance(e, HTTPException) and responses_error is None and (not stream_started or not ends_with_openai_done):
             raise client_error
         error_returned: Final = json.dumps(
             {
@@ -11038,6 +11051,7 @@ def select_data_generator(
     request: Request | None = None,
     *,
     responses_stream_errors: bool = False,
+    responses_error: ResponsesContextErrorFormatter | None = None,
 ):
     return async_data_generator(
         response=response,
@@ -11045,6 +11059,7 @@ def select_data_generator(
         request_data=request_data,
         request=request,
         responses_stream_errors=responses_stream_errors,
+        responses_error=responses_error,
     )
 
 

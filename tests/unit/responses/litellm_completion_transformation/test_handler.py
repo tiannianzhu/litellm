@@ -18,6 +18,7 @@ import json
 import sys
 import threading
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from itertools import chain
 from types import MappingProxyType, SimpleNamespace
 from typing import Final
@@ -26,6 +27,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 import respx
+from openai.types.responses import ResponseFunctionToolCall
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm.caching.caching import Cache
@@ -52,7 +55,80 @@ from litellm.router_utils.cooldown_handlers import _should_cooldown_deployment
 from litellm.types.caching import CachingSupportedCallTypes, LiteLLMCacheType
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams, ResponsesAPIResponse
 from litellm.types.router import RetryPolicy
-from litellm.types.utils import ADDRESSED_RESPONSE_ID_FIELD, ChatCompletionDeltaToolCall, ModelResponseStream
+from litellm.types.utils import ADDRESSED_RESPONSE_ID_FIELD, ChatCompletionDeltaToolCall, ModelResponseStream, Usage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", (False, True))
+async def test_rejected_nonstream_custom_output_preserves_consumed_usage(is_async: bool) -> None:
+    def provider(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-rejected",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "synthetic-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_rejected",
+                                    "type": "function",
+                                    "function": {"name": "edit", "arguments": '{"content":false}'},
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 5, "total_tokens": 35},
+            },
+        )
+
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="synthetic-model",
+        messages=[{"role": "user", "content": "synthetic input"}],
+        stream=False,
+        call_type="aresponses" if is_async else "responses",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="nonstream-rejection",
+        function_id="nonstream-rejection",
+    )
+    logging_obj.update_environment_variables(
+        model="synthetic-model", user="", optional_params={}, litellm_params={}, custom_llm_provider="hosted_vllm"
+    )
+    async_client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(provider))
+    try:
+        with httpx.Client(transport=httpx.MockTransport(provider)) as sync_client:
+            client: Final = async_client if is_async else HTTPHandler(client=sync_client)
+
+            async def invoke() -> object:
+                result: Final = LiteLLMCompletionTransformationHandler().response_api_handler(
+                    model="synthetic-model",
+                    input="synthetic input",
+                    responses_api_request={"tools": [{"type": "custom", "name": "edit"}]},
+                    custom_llm_provider="hosted_vllm",
+                    _is_async=is_async,
+                    api_key="synthetic-key",
+                    api_base="https://synthetic.invalid/v1",
+                    client=client,
+                    litellm_logging_obj=logging_obj,
+                    num_retries=0,
+                )
+                return await result if is_async else result
+
+            with pytest.raises(litellm.BadGatewayError, match="content must be a string"):
+                await invoke()
+    finally:
+        await async_client.close()
+
+    usage: Final = logging_obj.model_call_details.get("combined_usage_object")
+    assert isinstance(usage, Usage)
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (30, 5, 35)
 
 
 _UPSTREAM_PARAM_CASES: Final = [
@@ -454,7 +530,7 @@ async def test_bridged_turn_with_a_client_field_named_previous_response_client_i
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("client_field", ["caller_input", "names_non_string_fields"])
+@pytest.mark.parametrize("client_field", ["caller_input", "names_non_string_fields", "summarizes_into_compaction"])
 async def test_bridged_turn_with_a_client_field_named_like_a_bridge_keyword_reaches_the_provider(client_field: str):
     provider: Final = _RecordingAnthropicHandler(_ANTHROPIC_MESSAGE_PAYLOAD)
     client: Final = AsyncHTTPHandler()
@@ -947,8 +1023,72 @@ async def test_bridged_follow_up_after_a_client_tool_search_reports_auto_for_an_
     assert response.tool_choice == "auto"
 
 
+def test_hosted_bridge_enforces_allowed_custom_tools_and_preserves_choice() -> None:
+    choice: Final = {
+        "type": "allowed_tools",
+        "mode": "required",
+        "tools": [{"type": "custom", "name": "edit", "namespace": "workspace"}],
+    }
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        sent: Final = json.loads(request.content)
+        assert [tool["function"]["name"] for tool in sent["tools"]] == ["workspace__edit"]
+        assert sent["tool_choice"] == "required"
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-allowed",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_edit",
+                                    "type": "function",
+                                    "function": {"name": "workspace__edit", "arguments": '{"content":"patch"}'},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        response: Final = litellm.responses(
+            model="hosted_vllm/test-model",
+            input="Edit the file",
+            tools=[
+                {"type": "namespace", "name": "workspace", "tools": [{"type": "custom", "name": "edit"}]},
+                {"type": "function", "name": "lookup", "parameters": {"type": "object"}},
+            ],
+            tool_choice=choice,
+            use_chat_completions_api=True,
+            api_base="https://hosted.example.test/v1",
+            api_key="test-key",
+            client=HTTPHandler(client=client),
+        )
+
+    assert response.model_dump(mode="json")["tool_choice"] == choice
+    assert response.output[0].model_dump(exclude_none=True) == {
+        "type": "custom_tool_call",
+        "id": "ctc_call_edit",
+        "call_id": "call_edit",
+        "name": "edit",
+        "namespace": "workspace",
+        "input": "patch",
+        "status": "completed",
+    }
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("client_field", ["caller_input", "names_non_string_fields"])
+@pytest.mark.parametrize("client_field", ["caller_input", "names_non_string_fields", "summarizes_into_compaction"])
 async def test_bridged_follow_up_after_a_client_tool_search_with_a_client_field_named_like_a_bridge_keyword_reaches_the_provider(
     client_field: str,
 ):
@@ -974,6 +1114,87 @@ async def test_bridged_follow_up_after_a_client_tool_search_with_a_client_field_
 
     assert provider.request_body is not None, "the bridged turn never reached the provider"
     assert isinstance(response, ResponsesAPIResponse)
+
+
+@pytest.mark.parametrize("loaded_by_search", [False, True], ids=["declared", "loaded-by-search"])
+def test_hosted_bridge_restores_long_function_namespace(loaded_by_search: bool) -> None:
+    namespace: Final = "workspace_" * 6
+    name: Final = "lookup"
+    wire_name: Final = f"{namespace}__{name}"
+    namespace_tool: Final = {"type": "namespace", "name": namespace, "tools": [{"type": "function", "name": name}]}
+    request_input: Final = (
+        [
+            {
+                "type": "tool_search_call",
+                "call_id": "search-lookup",
+                "arguments": {"query": name},
+                "execution": "client",
+            },
+            {
+                "type": "tool_search_output",
+                "call_id": "search-lookup",
+                "execution": "client",
+                "tools": [namespace_tool],
+            },
+        ]
+        if loaded_by_search
+        else "Look up the workspace"
+    )
+    request_tools: Final = [{"type": "tool_search", "execution": "client"}] if loaded_by_search else [namespace_tool]
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        body: Final = TypeAdapter(dict[str, JsonValue]).validate_json(request.content)
+        assert body["tool_choice"] == {"type": "function", "function": {"name": wire_name}}
+        tools: Final = TypeAdapter(tuple[dict[str, JsonValue], ...]).validate_python(body["tools"])
+        names: Final = tuple(fn["name"] for tool in tools if isinstance(fn := tool.get("function"), dict))
+        assert names.count(wire_name) == 1
+        if loaded_by_search:
+            messages: Final = TypeAdapter(tuple[dict[str, JsonValue], ...]).validate_python(body["messages"])
+            results: Final = tuple(message.get("content") for message in messages if message.get("role") == "tool")
+            assert results == (f"Loaded these tools, which are now callable: {wire_name}",)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-lookup",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call_lookup",
+                                    "type": "function",
+                                    "function": {"name": wire_name, "arguments": "{}"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(provider)) as client:
+        response: Final = litellm.responses(
+            model="hosted_vllm/test-model",
+            input=request_input,
+            tools=request_tools,
+            tool_choice={"type": "function", "name": name, "namespace": namespace},
+            use_chat_completions_api=True,
+            api_base="https://hosted.example.test/v1",
+            api_key="test-key",
+            client=HTTPHandler(client=client),
+        )
+
+    assert isinstance(response, ResponsesAPIResponse)
+    [tool_call] = response.output
+    assert isinstance(tool_call, ResponseFunctionToolCall)
+    assert (tool_call.type, tool_call.name, tool_call.namespace) == ("function_call", name, namespace)
 
 
 _LONG_NAMESPACE: Final = "mcp__codex_apps__codex_document_control_handler_test"

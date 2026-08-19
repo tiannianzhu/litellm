@@ -1,5 +1,5 @@
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import chain
 from types import MappingProxyType
@@ -149,7 +149,9 @@ def _without_deferral(spec: Mapping[str, object]) -> Mapping[str, object]:
     return {key: value for key, value in spec.items() if key != "defer_loading"}
 
 
-def _loaded_tools(tool: Mapping[str, object], deferred_names: frozenset[str] = frozenset()) -> tuple[_LoadedTool, ...]:
+def _loaded_tools(
+    tool: Mapping[str, object], member_name: Callable[[str, str], str], deferred_names: frozenset[str]
+) -> tuple[_LoadedTool, ...]:
     spec: Final = _tool_spec(tool)
     if spec is None:
         return ()
@@ -163,16 +165,18 @@ def _loaded_tools(tool: Mapping[str, object], deferred_names: frozenset[str] = f
             namespace=spec.name,
             namespace_description=spec.description,
             spec=_without_deferral(member),
-            callable_name=chat_member_name(spec.name, str(member.get("name") or "")),
+            callable_name=member_name(spec.name, str(member.get("name") or "")),
         )
         for member in spec.tools
     )
 
 
 def _all_loaded_tools(
-    tools: Iterable[Mapping[str, object]], deferred_names: frozenset[str] = frozenset()
+    tools: Iterable[Mapping[str, object]],
+    member_name: Callable[[str, str], str],
+    deferred_names: frozenset[str] = frozenset(),
 ) -> tuple[_LoadedTool, ...]:
-    return tuple(chain.from_iterable(_loaded_tools(tool, deferred_names) for tool in tools))
+    return tuple(chain.from_iterable(_loaded_tools(tool, member_name, deferred_names) for tool in tools))
 
 
 def _deferred_top_level_names(tools: Iterable[Mapping[str, object]]) -> frozenset[str]:
@@ -183,13 +187,13 @@ def _deferred_top_level_names(tools: Iterable[Mapping[str, object]]) -> frozense
     )
 
 
-def _callable_names(tool: object) -> tuple[str, ...]:
+def _callable_names(tool: object, member_name: Callable[[str, str], str]) -> tuple[str, ...]:
     spec: Final = _tool_spec(tool)
     if spec is None:
         return ()
     if spec.type != "namespace":
         return (spec.name,)
-    return tuple(chat_member_name(spec.name, str(member.get("name") or "")) for member in spec.tools)
+    return tuple(member_name(spec.name, str(member.get("name") or "")) for member in spec.tools)
 
 
 def _first_occurrences(loaded: Sequence[_LoadedTool], taken: frozenset[str]) -> tuple[_LoadedTool, ...]:
@@ -246,7 +250,9 @@ def _search_arguments_json(arguments: object) -> str:
     return arguments if isinstance(arguments, str) else json.dumps(arguments or {})
 
 
-def _bridged_item(item: ResponseInputItemParam) -> ResponseInputItemParam | None:
+def _bridged_item(
+    item: ResponseInputItemParam, member_name: Callable[[str, str], str]
+) -> ResponseInputItemParam | None:
     parsed: Final = _client_tool_search_item(item)
     if parsed is None:
         return item
@@ -262,24 +268,35 @@ def _bridged_item(item: ResponseInputItemParam) -> ResponseInputItemParam | None
     return FunctionCallOutput(
         type="function_call_output",
         call_id=parsed.call_id,
-        output=_search_output_text(tuple(chain.from_iterable(map(_callable_names, parsed.tools)))),
+        output=_search_output_text(
+            tuple(chain.from_iterable(_callable_names(tool, member_name) for tool in parsed.tools))
+        ),
     )
 
 
-def bridged_client_tool_search_input(input: str | ResponseInputParam) -> str | ResponseInputParam:
+def bridged_client_tool_search_input(
+    input: str | ResponseInputParam, *, member_name: Callable[[str, str], str] = chat_member_name
+) -> str | ResponseInputParam:
     return (
-        input if isinstance(input, str) else [bridged for item in input if (bridged := _bridged_item(item)) is not None]
+        input
+        if isinstance(input, str)
+        else [bridged for item in input if (bridged := _bridged_item(item, member_name)) is not None]
     )
 
 
-def tools_loaded_by_client_tool_search(input: object) -> tuple[ALL_RESPONSES_API_TOOL_PARAMS, ...]:
-    return _regrouped(_first_occurrences(_all_loaded_tools(client_tool_search_loaded_tools(input)), frozenset()))
+def tools_loaded_by_client_tool_search(
+    input: object, *, member_name: Callable[[str, str], str] = chat_member_name
+) -> tuple[ALL_RESPONSES_API_TOOL_PARAMS, ...]:
+    loaded: Final = _all_loaded_tools(client_tool_search_loaded_tools(input), member_name)
+    return _regrouped(_first_occurrences(loaded, frozenset()))
 
 
 def bridge_client_tool_search(
     input: str | ResponseInputParam,
     tools: Sequence[ALL_RESPONSES_API_TOOL_PARAMS] | None,
     loaded_earlier: Sequence[Mapping[str, object]] = (),
+    *,
+    member_name: Callable[[str, str], str] = chat_member_name,
 ) -> ClientToolSearchBridge:
     existing: Final = tuple(tools or ())
     searches_on_client: Final = has_client_tool_search(existing)
@@ -293,11 +310,11 @@ def bridge_client_tool_search(
         else existing
     )
     loaded: Final = _all_loaded_tools(
-        (*loaded_earlier, *client_tool_search_loaded_tools(input)), _deferred_top_level_names(existing)
+        (*loaded_earlier, *client_tool_search_loaded_tools(input)), member_name, _deferred_top_level_names(existing)
     )
-    taken: Final = frozenset(chain.from_iterable(map(_callable_names, eager)))
+    taken: Final = frozenset(chain.from_iterable(_callable_names(tool, member_name) for tool in eager))
     return ClientToolSearchBridge(
-        input=bridged_client_tool_search_input(input),
+        input=bridged_client_tool_search_input(input, member_name=member_name),
         tools=(*eager, *_regrouped(_first_occurrences(loaded, taken))),
         bridged=True,
     )
