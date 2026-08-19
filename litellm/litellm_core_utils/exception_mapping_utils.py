@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Final, Protocol, cast
 
 import httpx
+from pydantic import TypeAdapter, ValidationError
 
 import litellm
 from litellm._logging import _ENABLE_SECRET_REDACTION, _redact_string, verbose_logger
@@ -34,6 +35,21 @@ from ..exceptions import (
     Timeout,
     UnprocessableEntityError,
 )
+
+_ERROR_DICT_ADAPTER: Final = TypeAdapter(dict[str, object])
+
+
+def _validated_error_dict(value: object) -> dict[str, object] | None:
+    try:
+        return _ERROR_DICT_ADAPTER.validate_python(value)
+    except ValidationError:
+        return None
+
+
+def _decode_json_value(decoder: json.JSONDecoder, raw_message: str, start: int) -> object:
+    return decoder.raw_decode(  # pyright: ignore[reportAny]  # JSONDecoder returns Any
+        raw_message, start
+    )[0]
 
 
 class ExceptionCheckers:
@@ -134,7 +150,7 @@ class ExceptionCheckers:
         return False
 
 
-def get_error_message(error_obj) -> str | None:
+def get_error_message(error_obj: object) -> str | None:
     """
     OpenAI Returns Error message that is nested, this extract the message
 
@@ -177,6 +193,41 @@ def get_error_message(error_obj) -> str | None:
         return None
     except Exception:
         return None
+
+
+def extract_error_message_from_dict(error: Mapping[str, object]) -> str | None:
+    for key in ("detail", "error"):
+        nested = error.get(key)
+        validated_nested = _validated_error_dict(nested)
+        if validated_nested is not None:
+            nested_message = validated_nested.get("message")
+            if isinstance(nested_message, str):
+                return nested_message
+    for key in ("Message", "message"):
+        message = error.get(key)
+        if isinstance(message, str):
+            return message
+    return None
+
+
+def extract_error_dict(
+    raw_message: str,
+) -> dict[str, object] | None:  # mutable-ok: callers may enrich the parsed error payload
+    decoder: Final = json.JSONDecoder()
+    for start in (index for index, character in enumerate(raw_message) if character == "{"):
+        try:
+            candidate: object = _decode_json_value(decoder, raw_message, start)
+        except json.JSONDecodeError:
+            continue
+        error = _validated_error_dict(candidate)
+        if error is not None and extract_error_message_from_dict(error) is not None:
+            return error
+    return None
+
+
+def extract_error_message_from_string(raw_message: str) -> str | None:
+    error: Final = extract_error_dict(raw_message)
+    return extract_error_message_from_dict(error) if error is not None else None
 
 
 ####### EXCEPTION MAPPING ################
@@ -269,6 +320,16 @@ def _litellm_proxy_response(
         status_code=response.status_code,
         headers=[(str(k), str(v)) for k, v in pairs],
         request=getattr(original_exception, "request", None),
+    )
+
+
+def _exception_response(exception: object, status_code: int) -> httpx.Response:
+    response: Final = getattr(exception, "response", None)
+    if isinstance(response, httpx.Response):
+        return response
+    return httpx.Response(
+        status_code=status_code,
+        request=httpx.Request("GET", "https://litellm.ai"),
     )
 
 
@@ -695,7 +756,7 @@ def _map_replicate_exception(
                 message=f"ReplicateException - {original_exception.message}",
                 model=model,
                 llm_provider="replicate",
-                response=getattr(original_exception, "response", None),
+                response=_exception_response(original_exception, 422),
             )
         elif original_exception.status_code == 408:
             raise Timeout(
@@ -938,7 +999,7 @@ def _map_bedrock_exception(
             message=f"BedrockException PermissionDeniedError - {error_str}",
             model=model,
             llm_provider="bedrock",
-            response=getattr(original_exception, "response", None),
+            response=_exception_response(original_exception, 403),
         )
     elif "throttlingException" in error_str or "ThrottlingException" in error_str:
         raise RateLimitError(

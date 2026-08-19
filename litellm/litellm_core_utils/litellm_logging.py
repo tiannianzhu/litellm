@@ -127,6 +127,8 @@ from litellm.types.interactions import (
 from litellm.types.llms.openai import (
     AllMessageValues,
     Batch,
+    ChatCompletionSystemMessage,
+    ChatCompletionUserMessage,
     FineTuningJob,
     HttpxBinaryResponseContent,
     OpenAIFileObject,
@@ -707,10 +709,12 @@ class Logging(LiteLLMLoggingBaseClass):
         # Passthrough endpoint guardrails config for field targeting
         self.passthrough_guardrails_config: dict[str, object] | None = None
 
+        instructions: Final = kwargs.get("instructions") if kwargs else None
         self.model_call_details: dict[str, Any] = {
             "litellm_trace_id": self.litellm_trace_id,
             "litellm_call_id": litellm_call_id,
             "input": _input,
+            "instructions": instructions if isinstance(instructions, str) else None,
             "litellm_params": litellm_params,
             "applied_guardrails": applied_guardrails,
             "model": model,
@@ -5697,24 +5701,23 @@ class StandardLoggingPayloadSetup:
         """
         Append system prompt messages to the messages
         """
-        if kwargs is not None:
-            if kwargs.get("system") is not None and isinstance(kwargs.get("system"), str):
-                if messages is None:
-                    return [{"role": "system", "content": kwargs.get("system")}]
-                elif isinstance(messages, list):
-                    if len(messages) == 0:
-                        return [{"role": "system", "content": kwargs.get("system")}]
-                    # check for duplicates
-                    if messages[0].get("role") == "system" and messages[0].get("content") == kwargs.get("system"):
-                        return messages
-                    messages = [{"role": "system", "content": kwargs.get("system")}] + messages
-                elif isinstance(messages, str):
-                    messages = [
-                        {"role": "system", "content": kwargs.get("system")},
-                        {"role": "user", "content": messages},
-                    ]
+        if kwargs is None:
+            return messages
+        system_prompt: Final = (
+            kwargs.get("system") if isinstance(kwargs.get("system"), str) else kwargs.get("instructions")
+        )
+        if not isinstance(system_prompt, str):
+            return messages
+        system_message: Final[ChatCompletionSystemMessage] = {"role": "system", "content": system_prompt}
+        if messages is None or isinstance(messages, list) and not messages:
+            return [system_message]
+        if isinstance(messages, list):
+            if messages[0].get("role") == "system" and messages[0].get("content") == system_prompt:
                 return messages
-
+            return [system_message, *messages]
+        if isinstance(messages, str):
+            user_message: Final[ChatCompletionUserMessage] = {"role": "user", "content": messages}
+            return [system_message, user_message]
         return messages
 
     @staticmethod
