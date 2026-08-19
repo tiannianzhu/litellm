@@ -2332,3 +2332,41 @@ def test_native_messages_tool_config_point_marks_last_tool_and_drops_the_key(mon
     assert "cache_control" not in captured["params"]["tools"][0]
     assert captured["messages"][0]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     assert tools == tools_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported_endpoints", [[], ["/v1/messages"]])
+async def test_hosted_vllm_messages_use_chat_even_with_native_endpoint_declared(
+    supported_endpoints: list[str],
+) -> None:
+    from litellm.llms.anthropic.pass_through.messages import handler
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        assert json.loads(request.content)["messages"] == [{"role": "user", "content": "Hello"}]
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(upstream))
+    async with client.client:
+        response: Final = await handler.anthropic_messages(
+            max_tokens=100,
+            messages=[{"role": "user", "content": "Hello"}],
+            model="hosted_vllm/fixture-model",
+            api_key="synthetic",
+            api_base="https://fixture.invalid/v1",
+            model_info={"supported_endpoints": supported_endpoints},
+            client=client,
+        )
+
+    assert response["content"] == [{"type": "text", "text": "ok"}]
+    assert response["stop_reason"] == "end_turn"
