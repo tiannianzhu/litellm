@@ -1,14 +1,57 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 from litellm.proxy._types import ProxyErrorTypes, ProxyException
 from litellm.proxy.common_utils.openai_error_payload import (
+    ResponsesContextErrorFormatter,
     error_status_code,
     openai_error_param,
     openai_error_type,
 )
+
+
+def test_responses_context_error_preserves_terminal_response_and_usage_through_router_wrapper():
+    import litellm
+    from litellm.router_utils.add_retry_fallback_headers import HiddenParamsAsyncIteratorWrapper
+    from litellm.types.llms.openai import ResponseAPIUsage, ResponseFailedEvent, ResponsesAPIResponse
+
+    terminal = ResponseFailedEvent(
+        type="response.failed", sequence_number=12,
+        response=ResponsesAPIResponse(
+            id="resp_fixture", object="response", created_at=123, model="fixture-model", output=[], status="failed",
+            usage=ResponseAPIUsage(input_tokens=10, output_tokens=2, total_tokens=12),
+            user="fixture-user", metadata={"thread": "fixture-thread"},
+            error={"code": "context_length_exceeded", "message": "backend message"},
+        ),
+    )
+    stream = HiddenParamsAsyncIteratorWrapper(SimpleNamespace(completed_response=terminal))
+    formatter = ResponsesContextErrorFormatter("public-model")
+    frame = formatter.format(
+        litellm.ContextWindowExceededError(message="safe message", model="fixture-model", llm_provider="hosted_vllm"),
+        stream=stream,
+    )
+    event = json.loads(frame.split("data: ", 1)[1])
+    assert event["type"] == "response.failed"
+    assert event["sequence_number"] == 12
+    assert event["response"]["id"] == "resp_fixture"
+    assert event["response"]["created_at"] == 123
+    assert event["response"]["user"] == "fixture-user"
+    assert event["response"]["metadata"] == {"thread": "fixture-thread"}
+    assert event["response"]["usage"]["total_tokens"] == 12
+    assert event["response"]["error"]["code"] == "context_length_exceeded"
+    assert "safe message" in event["response"]["error"]["message"]
+    assert terminal.response.error["message"] == "backend message"
+
+
+@pytest.mark.parametrize("code", [400, "400", "invalid_request_error", "rate_limit_exceeded", "context_length_exceeded"])
+def test_responses_context_error_requires_typed_or_explicit_overflow(code):
+    error = ProxyException(message="context_length_exceeded text alone is not enough", type="invalid_request_error",
+                           param=None, code=400, openai_code=code)
+    frame = ResponsesContextErrorFormatter("fixture").format(error)
+    assert (frame is not None) is (code == "context_length_exceeded")
 
 
 @pytest.mark.parametrize(

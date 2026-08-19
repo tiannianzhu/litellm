@@ -9,7 +9,16 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from functools import lru_cache
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Final,
+    Literal,
+    Protocol,
+    cast,  # noqa: TID251  # upstream response unions require validated casts for custom-tool events
+    overload,
+    runtime_checkable,
+)
 
 import httpx
 from openai._streaming import SSEDecoder
@@ -221,6 +230,30 @@ def _status_code_for_error_fields(error_type: str | None, error_code: str | None
     )
 
 
+def _exception_for_error_fields(
+    *,
+    error_message: str,
+    error_type: str | None,
+    error_code: str | None,
+    llm_provider: str,
+    model: str,
+) -> litellm.APIError | litellm.ContextWindowExceededError:
+    if error_code == "context_length_exceeded":
+        exception: Final = litellm.ContextWindowExceededError(
+            message=error_message,
+            llm_provider=llm_provider,
+            model=model,
+        )
+        exception.code = error_code
+        return exception
+    return litellm.APIError(
+        status_code=_status_code_for_error_fields(error_type, error_code),
+        message=error_message,
+        llm_provider=llm_provider,
+        model=model,
+    )
+
+
 class BaseResponsesAPIStreamingIterator:
     """
     Base class for streaming iterators that process responses from the Responses API.
@@ -254,6 +287,7 @@ class BaseResponsesAPIStreamingIterator:
         self._completed_response_cache_hit: bool | None = None
         self._persist_completed_response_before_logging = True
         self._stream_created_time: float = time.time()
+        self._pending_provider_chunks: tuple[str, ...] = ()
 
         # track request context for hooks
         self.litellm_metadata = litellm_metadata
@@ -290,6 +324,11 @@ class BaseResponsesAPIStreamingIterator:
                 model=self.model or "",
                 llm_provider=self.custom_llm_provider or "",
             )
+
+    def _prepare_provider_chunk(self, chunk: str) -> tuple[str, ...]:
+        if self.responses_api_provider_config is None:
+            return (chunk,)
+        return self.responses_api_provider_config.prepare_streaming_chunk(chunk)
 
     def _process_chunk(self, chunk: str) -> ResponsesAPIStreamingResponse | None:
         """Process a single chunk of data from the stream"""
@@ -523,9 +562,10 @@ class BaseResponsesAPIStreamingIterator:
         error_info: Final = getattr(response_obj, "error", None) if response_obj else None
         error_message, error_type, error_code = _error_event_fields(error_info)
         self._record_failed_response_usage(response_obj)
-        exception: Final = litellm.APIError(
-            status_code=_status_code_for_error_fields(error_type, error_code),
-            message=error_message,
+        exception: Final = _exception_for_error_fields(
+            error_message=error_message,
+            error_type=error_type,
+            error_code=error_code,
             llm_provider=self.custom_llm_provider or "",
             model=self.model or "",
         )
@@ -563,14 +603,14 @@ class BaseResponsesAPIStreamingIterator:
         )
 
         error_message, error_type, error_code = _error_event_fields(error_obj)
-        status_code: Final = _status_code_for_error_fields(error_type, error_code)
-        mapped_exception: Final = litellm.APIError(
-            status_code=status_code,
-            message=error_message,
+        mapped_exception: Final = _exception_for_error_fields(
+            error_message=error_message,
+            error_type=error_type,
+            error_code=error_code,
             llm_provider=self.custom_llm_provider or "",
             model=self.model or "",
         )
-        if 400 <= status_code < 500 and status_code != 429:
+        if 400 <= mapped_exception.status_code < 500 and mapped_exception.status_code != 429:
             raise mapped_exception
         raise MidStreamFallbackError(
             message=str(mapped_exception),
@@ -862,13 +902,19 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             while True:
                 # Get the next chunk from the stream
                 try:
-                    sse = await self.stream_iterator.__anext__()
+                    if not self._pending_provider_chunks:
+                        sse = await self.stream_iterator.__anext__()
+                        self._pending_provider_chunks = self._prepare_provider_chunk(sse.data)
+                    if not self._pending_provider_chunks:
+                        continue
+                    provider_chunk, *remaining_chunks = self._pending_provider_chunks
+                    self._pending_provider_chunks = tuple(remaining_chunks)
                 except StopAsyncIteration:
                     self.finished = True
                     raise StopAsyncIteration
 
                 self._check_max_streaming_duration()
-                result = self._process_chunk(sse.data)
+                result = self._process_chunk(provider_chunk)
 
                 if self.finished:
                     raise StopAsyncIteration
@@ -944,13 +990,19 @@ class SyncResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
             while True:
                 # Get the next chunk from the stream
                 try:
-                    sse = next(self.stream_iterator)
+                    if not self._pending_provider_chunks:
+                        sse = next(self.stream_iterator)
+                        self._pending_provider_chunks = self._prepare_provider_chunk(sse.data)
+                    if not self._pending_provider_chunks:
+                        continue
+                    provider_chunk, *remaining_chunks = self._pending_provider_chunks
+                    self._pending_provider_chunks = tuple(remaining_chunks)
                 except StopIteration:
                     self.finished = True
                     raise StopIteration
 
                 self._check_max_streaming_duration()
-                result = self._process_chunk(sse.data)
+                result = self._process_chunk(provider_chunk)
 
                 if self.finished:
                     raise StopIteration
@@ -1156,8 +1208,8 @@ def _dump_response_object(obj: object) -> Mapping[str, object]:
 
 def _build_response_status_event(
     event_type: Literal[
-        "response.created",
-        "response.in_progress",
+        ResponsesAPIStreamEvents.RESPONSE_CREATED,
+        ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS,
     ],
     transformed: ResponsesAPIResponse,
 ) -> ResponsesAPIStreamingResponse:
@@ -1338,7 +1390,7 @@ def build_synthetic_response_events(
     transformed: ResponsesAPIResponse,
     logging_obj: LiteLLMLoggingObj | None,
     chunk_size: int,
-) -> list[ResponsesAPIStreamingResponse]:
+) -> tuple[ResponsesAPIStreamingResponse, ...]:
     openai_types: Final = _get_openai_response_types()
     _stamp_responses_usage_cost(transformed, logging_obj)
 
@@ -1358,7 +1410,7 @@ def build_synthetic_response_events(
             openai_types.OutputItemAddedEvent(
                 type=openai_types.ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
                 output_index=output_index,
-                item=openai_types.BaseLiteLLMOpenAIResponseObject(**output_item_payload),
+                item=openai_types.BaseLiteLLMOpenAIResponseObject(**_synthetic_added_item_payload(output_item_payload)),
             )
         )
 
@@ -1410,6 +1462,39 @@ def build_synthetic_response_events(
                     arguments=arguments,
                 )
             )
+        elif item_type == "custom_tool_call":
+            custom_input = str(output_item_payload.get("input") or "")
+            for index in range(0, len(custom_input), chunk_size):
+                sequence_number += 1
+                events.append(
+                    cast(  # cast-ok: upstream union omits valid custom-tool delta events
+                        ResponsesAPIStreamingResponse,
+                        openai_types.BaseLiteLLMOpenAIResponseObject(
+                            **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                                "type": openai_types.ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DELTA,
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": custom_input[index : index + chunk_size],
+                                "sequence_number": sequence_number,
+                            }
+                        ),
+                    )
+                )
+            sequence_number += 1
+            events.append(
+                cast(  # cast-ok: upstream union omits valid custom-tool completion events
+                    ResponsesAPIStreamingResponse,
+                    openai_types.BaseLiteLLMOpenAIResponseObject(
+                        **{  # noqa: PIE804  # Pydantic extra fields; # mutable-ok: event payload must be a mapping
+                            "type": openai_types.ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "input": custom_input,
+                            "sequence_number": sequence_number,
+                        }
+                    ),
+                )
+            )
         elif item_type == "reasoning":
             summaries: Sequence[object] = _json_array_or_empty(output_item_payload.get("summary"))
             for summary_index, summary in enumerate(summaries):
@@ -1458,13 +1543,27 @@ def build_synthetic_response_events(
             )
         )
 
-    events.append(
-        openai_types.ResponseCompletedEvent(
-            type=openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
-            response=transformed,
-        )
+    events.append(_synthetic_terminal_event(transformed))
+    return tuple(
+        event.model_copy(update=MappingProxyType({"sequence_number": index})) for index, event in enumerate(events)
     )
-    return events
+
+
+def _synthetic_added_item_payload(payload: Mapping[str, object]) -> Mapping[str, object]:
+    if payload.get("type") == "custom_tool_call":
+        return MappingProxyType({**payload, "input": "", "status": "in_progress"})
+    return payload
+
+
+def _synthetic_terminal_event(response: ResponsesAPIResponse) -> ResponsesAPIStreamingResponse:
+    openai_types: Final = _get_openai_response_types()
+    if response.status == "incomplete":
+        return openai_types.ResponseIncompleteEvent(
+            type=ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE, response=response
+        )
+    if response.status in ("failed", "cancelled"):
+        return openai_types.ResponseFailedEvent(type=ResponsesAPIStreamEvents.RESPONSE_FAILED, response=response)
+    return openai_types.ResponseCompletedEvent(type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED, response=response)
 
 
 # ---------------------------------------------------------------------------

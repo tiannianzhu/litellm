@@ -244,6 +244,9 @@ class BaseResponsesAPIConfig(ABC):
         """Returns True if litellm should fake a stream for the given model and stream value"""
         return False
 
+    def prepare_streaming_chunk(self, chunk: str) -> tuple[str, ...]:
+        return (chunk,)
+
     def supports_native_websocket(self) -> bool:
         """
         Returns True if the provider has a native WebSocket endpoint for Responses API.

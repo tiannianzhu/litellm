@@ -3,6 +3,8 @@ Test for response_api_endpoints/endpoints.py
 """
 
 import unittest
+import asyncio
+import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,6 +14,186 @@ from httpx import Response
 
 import litellm
 from litellm.proxy.proxy_server import app
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before_headers", "before_chunk", "after_chunk", "after_ping"])
+@pytest.mark.parametrize("context_error", [True, False])
+@pytest.mark.parametrize("sanitize", [True, False])
+async def test_responses_stream_error_protocol_and_failure_cleanup(monkeypatch, phase, context_error, sanitize):
+    import httpx
+    from fastapi import FastAPI, HTTPException
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import create_response
+    from litellm.proxy.response_api_endpoints import endpoints
+    from litellm.types.llms.openai import ResponseCreatedEvent, ResponsesAPIResponse
+
+    auth = UserAPIKeyAuth(api_key="sk-fixture", user_id="fixture-owner")
+    logging = MagicMock()
+    logging.needs_iterator_wrap.return_value = False
+    logging.needs_per_chunk_streaming_hook.return_value = False
+    logging.post_call_failure_hook = AsyncMock(
+        return_value=HTTPException(status_code=400, detail="sanitized rejection") if sanitize else None
+    )
+    logging.post_call_response_headers_hook = AsyncMock(return_value={"x-fixture-audit": "kept"})
+    logging._arelease_max_parallel_requests_on_disconnect = AsyncMock()
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging)
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(litellm, "sse_keepalive_ping_interval_seconds", 0.001 if phase == "after_ping" else 0)
+    closed = asyncio.Event()
+    error_type = litellm.ContextWindowExceededError if context_error else litellm.BadRequestError
+    error = error_type(message="fixture rejected input", model="fixture-model", llm_provider="hosted_vllm")
+
+    async def upstream():
+        try:
+            if phase == "after_chunk":
+                yield ResponseCreatedEvent(
+                    type="response.created", sequence_number=7,
+                    response=ResponsesAPIResponse(
+                        id="resp_fixture", object="response", created_at=1, model="fixture-model",
+                        status="in_progress", output=[], user="fixture-user",
+                    ),
+                )
+            raise error
+        finally:
+            closed.set()
+
+    async def produce(self, **kwargs):
+        self.data["litellm_call_id"] = "fixture-call"
+        if phase == "after_ping":
+            await asyncio.sleep(0.02)
+            raise error
+        if phase == "before_headers":
+            raise error
+        generator = kwargs["select_data_generator"](
+            response=upstream(), user_api_key_dict=auth, request_data=self.data,
+        )
+        return await create_response(generator, "text/event-stream", {"x-litellm-call-id": "fixture-call"})
+
+    monkeypatch.setattr(  # test-quality-ok: inject a controlled upstream failure into the existing request-processing seam
+        endpoints.ProxyBaseLLMRequestProcessing, "_process_llm_request", produce
+    )
+    test_app = FastAPI()
+    test_app.add_exception_handler(proxy_server.ProxyException, proxy_server.openai_exception_handler)
+    test_app.include_router(endpoints.router)
+    test_app.dependency_overrides[endpoints.user_api_key_auth] = lambda: auth
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=test_app), base_url="http://fixture") as client:
+        response = await client.post("/v1/responses", json={
+            "model": "fixture-model", "input": "hello", "stream": True, "user": "fixture-user",
+        })
+
+    logging.post_call_failure_hook.assert_awaited_once()
+    call = logging.post_call_failure_hook.await_args.kwargs
+    assert call["original_exception"] is error
+    assert call["user_api_key_dict"] is auth
+    assert call["request_data"]["user"] == "fixture-user"
+    assert call["request_data"]["litellm_call_id"] == "fixture-call"
+    logging._arelease_max_parallel_requests_on_disconnect.assert_not_called()
+    if phase in ("before_chunk", "after_chunk"):
+        assert closed.is_set()
+    if not context_error or sanitize:
+        assert "response.failed" not in response.text
+        assert response.status_code == (200 if phase in ("after_chunk", "after_ping") else 400)
+        if sanitize:
+            assert "sanitized rejection" in response.text
+            assert "fixture rejected input" not in response.text
+        return
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    failed = events[-1]
+    assert failed["type"] == "response.failed"
+    assert failed["response"]["status"] == "failed"
+    assert failed["response"]["error"]["code"] == "context_length_exceeded"
+    assert failed["response"]["usage"] is None
+    assert not any(event["type"] == "response.completed" for event in events)
+    if phase == "after_chunk":
+        assert failed["response"]["id"] == "resp_fixture"
+        assert failed["response"]["user"] == "fixture-user"
+        assert failed["sequence_number"] == 8
+    if phase == "before_headers":
+        assert response.headers["x-litellm-call-id"] == "fixture-call"
+        assert response.headers["x-fixture-audit"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_responses_nonstream_context_error_keeps_http_400(monkeypatch):
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+    from litellm.proxy.response_api_endpoints import endpoints
+
+    error = ProxyException(message="too long", type="invalid_request_error", param=None,
+                           code=400, openai_code="context_length_exceeded")
+    monkeypatch.setattr(proxy_server, "_read_request_body", AsyncMock(return_value={"model": "fixture", "stream": False}))
+    monkeypatch.setattr(  # test-quality-ok: inject a routed rejection without calling a provider
+        endpoints.ProxyBaseLLMRequestProcessing, "base_process_llm_request", AsyncMock(side_effect=error)
+    )
+    monkeypatch.setattr(  # test-quality-ok: isolate the nonstream wire contract from failure logging
+        endpoints.ProxyBaseLLMRequestProcessing, "_handle_llm_api_exception", AsyncMock(side_effect=error)
+    )
+    with pytest.raises(ProxyException) as caught:
+        await endpoints.responses_api(MagicMock(), MagicMock(), UserAPIKeyAuth(api_key="sk-fixture"))
+    assert caught.value.code == "400"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_message", "expected_message"),
+    (
+        (
+            'litellm.BadRequestError: Hosted_vllmException - {"error":{"message":'
+            '"deepseek-v4-flash is not a multimodal model","type":"BadRequestError"}}. '
+            "Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+            "deepseek-v4-flash is not a multimodal model",
+        ),
+        (
+            'litellm.ContextWindowExceededError: {"object":"error","message":'
+            '"This model maximum context length is 131072 tokens","type":"BadRequestError","code":400}. '
+            "Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+            "This model maximum context length is 131072 tokens",
+        ),
+    ),
+)
+async def test_responses_api_returns_inner_provider_error_message(raw_message, expected_message):
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+    from litellm.proxy.response_api_endpoints import endpoints
+
+    routed_error = ProxyException(
+        message=raw_message,
+        type="BadRequestError",
+        param=None,
+        code=400,
+    )
+
+    with (
+        patch.object(  # test-quality-ok: request-body helper has no injection seam
+            proxy_server, "_read_request_body", new=AsyncMock(return_value={"model": "test-model"})
+        ),
+        patch(  # test-quality-ok: polling decision has no injection seam
+            "litellm.proxy.response_polling.polling_handler.should_use_polling_for_request",
+            return_value=False,
+        ),
+        patch.object(  # test-quality-ok: deterministic routed failure needs the processing seam
+            endpoints.ProxyBaseLLMRequestProcessing,
+            "base_process_llm_request",
+            new=AsyncMock(side_effect=Exception("upstream error")),
+        ),
+        patch.object(  # test-quality-ok: error normalization requires the internal exception seam
+            endpoints.ProxyBaseLLMRequestProcessing,
+            "_handle_llm_api_exception",
+            new=AsyncMock(side_effect=routed_error),
+        ),
+        pytest.raises(ProxyException) as exc_info,
+    ):
+        await endpoints.responses_api(
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(api_key="sk-test"),
+        )
+
+    assert exc_info.value.message == expected_message
 
 
 class TestResponsesAPIEndpoints(unittest.TestCase):
@@ -191,9 +373,6 @@ class TestResponsesAPIEndpoints(unittest.TestCase):
         assert "x-litellm-response-cost" in response.headers
         response_cost_value = float(response.headers["x-litellm-response-cost"])
         assert response_cost_value == pytest.approx(0.0005, abs=1e-10)
-
-
-import json
 
 
 class TestManagedResponsesWSFirstMessage:

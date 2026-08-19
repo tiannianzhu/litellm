@@ -3,19 +3,23 @@ import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Mapping
 from enum import Enum
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast, get_args
 from uuid import uuid4
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from openai.types.responses.response_create_params import ResponseInputParam
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from typing_extensions import ReadOnly, TypedDict
 
 from litellm._logging import verbose_proxy_logger
 from litellm.integrations.custom_guardrail import ModifyResponseException
+from litellm.litellm_core_utils.exception_mapping_utils import (
+    extract_error_message_from_string,
+)
 from litellm.llms.base_llm.guardrail_translation.utils import (
     blocked_responses_api_usage as _blocked_responses_api_usage,
 )
@@ -30,6 +34,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_set_request_parsed_body,
 )
+from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
 from litellm.types.llms.openai import (
     REASONING_EFFORT,
     ResponsesAPIOptionalRequestParams,
@@ -53,6 +58,22 @@ _TOOL_PAYLOAD_KEYS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     }
 )
 _EMPTY_TOOL_PAYLOAD: Final[Mapping[str, object]] = MappingProxyType({})
+
+
+def _extract_responses_error_message(raw_message: str) -> str:
+    return extract_error_message_from_string(raw_message) or raw_message
+
+
+def _normalize_responses_api_exception(exception: ProxyException) -> ProxyException:
+    return ProxyException(
+        message=_extract_responses_error_message(exception.message),
+        type=exception.type,
+        param=exception.param,
+        code=exception.code,
+        headers=exception.headers,
+        openai_code=str(exception.openai_code) if exception.openai_code is not None else None,
+        provider_specific_fields=exception.provider_specific_fields,
+    )
 
 
 def _convert_tool_payload_value(key: str, value: object, *, to_chat: bool) -> object:
@@ -292,12 +313,15 @@ async def responses_api(
                 llm_router=llm_router,
             )
         except Exception as e:
-            raise await processor._handle_llm_api_exception(
-                e=e,
-                user_api_key_dict=user_api_key_dict,
-                proxy_logging_obj=proxy_logging_obj,
-                version=version,
-            )
+            try:
+                raise await processor._handle_llm_api_exception(
+                    e=e,
+                    user_api_key_dict=user_api_key_dict,
+                    proxy_logging_obj=proxy_logging_obj,
+                    version=version,
+                )
+            except ProxyException as exception:
+                raise _normalize_responses_api_exception(exception) from exception
 
         # Initialize polling handler with configured TTL (from global config)
         polling_handler: Final = ResponsePollingHandler(
@@ -344,6 +368,7 @@ async def responses_api(
         return initial_state
 
     # Normal response flow
+    responses_error: Final = ResponsesContextErrorFormatter(data.get("model")) if data.get("stream") is True else None
     processor = ProxyBaseLLMRequestProcessing(data=data)
     try:
         response: Final = await processor.base_process_llm_request(
@@ -355,7 +380,7 @@ async def responses_api(
             llm_router=llm_router,
             general_settings=general_settings,
             proxy_config=proxy_config,
-            select_data_generator=select_data_generator,
+            select_data_generator=partial(select_data_generator, responses_error=responses_error),
             model=None,
             user_model=user_model,
             user_temperature=user_temperature,
@@ -363,6 +388,7 @@ async def responses_api(
             user_max_tokens=user_max_tokens,
             user_api_base=user_api_base,
             version=version,
+            responses_error=responses_error,
         )
 
         # Store in managed objects table if background mode is enabled
@@ -431,12 +457,32 @@ async def responses_api(
         )
         return response_obj
     except Exception as e:
-        raise await processor._handle_llm_api_exception(
-            e=e,
-            user_api_key_dict=user_api_key_dict,
-            proxy_logging_obj=proxy_logging_obj,
-            version=version,
-        )
+        try:
+            raise await processor._handle_llm_api_exception(
+                e=e,
+                user_api_key_dict=user_api_key_dict,
+                proxy_logging_obj=proxy_logging_obj,
+                version=version,
+            )
+        except ProxyException as exception:
+            normalized: Final = _normalize_responses_api_exception(exception)
+            error_frame: Final = responses_error.format(normalized) if responses_error is not None else None
+            if error_frame is None:
+                raise normalized from exception
+
+            async def failed_stream() -> AsyncIterator[str]:
+                yield error_frame
+
+            return StreamingResponse(
+                failed_stream(),
+                media_type="text/event-stream",
+                headers={
+                    **normalized.headers,
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                    "x-accel-buffering": "no",
+                },
+            )
 
 
 @router.get(

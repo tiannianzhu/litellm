@@ -3978,6 +3978,161 @@ def test_get_standard_logging_object_payload_includes_litellm_call_id(logging_ob
     assert payload["litellm_call_id"] == call_id
 
 
+@pytest.mark.parametrize(
+    ("status", "input_items"),
+    [
+        ("success", "native responses input"),
+        (
+            "success",
+            [
+                {"role": "user", "content": "bridged responses input"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            ],
+        ),
+        ("failure", "failed responses input"),
+    ],
+)
+def test_standard_logging_payload_preserves_responses_instructions(status, input_items):
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import get_standard_logging_object_payload
+
+    instructions: Final = "Follow the Responses API instructions"
+    logging_obj: Final = LitellmLogging(
+        model="test_model",
+        messages=input_items,
+        stream=False,
+        call_type="aresponses",
+        start_time=time.time(),
+        litellm_call_id="responses-instructions",
+        function_id="responses-instructions",
+        kwargs={"input": input_items, "instructions": instructions},
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    now: Final = datetime.now()
+    payload: Final = get_standard_logging_object_payload(
+        kwargs=logging_obj.model_call_details,
+        init_response_obj={},
+        start_time=now,
+        end_time=now,
+        logging_obj=logging_obj,
+        status=status,
+    )
+
+    assert payload is not None
+    assert payload["messages"] == [
+        {"role": "system", "content": instructions},
+        *logging_obj.messages,
+    ]
+
+
+def test_standard_logging_payload_does_not_duplicate_responses_instructions():
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import get_standard_logging_object_payload
+
+    instructions: Final = "Follow the Responses API instructions"
+    input_items: Final = [
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": "input with an existing system message"},
+    ]
+    logging_obj: Final = LitellmLogging(
+        model="test_model",
+        messages=input_items,
+        stream=False,
+        call_type="aresponses",
+        start_time=time.time(),
+        litellm_call_id="responses-instructions-duplicate",
+        function_id="responses-instructions-duplicate",
+        kwargs={"input": input_items, "instructions": instructions},
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    now: Final = datetime.now()
+    payload: Final = get_standard_logging_object_payload(
+        kwargs=logging_obj.model_call_details,
+        init_response_obj={},
+        start_time=now,
+        end_time=now,
+        logging_obj=logging_obj,
+        status="success",
+    )
+
+    assert payload is not None
+    assert payload["messages"] == input_items
+
+
+def test_standard_logging_payload_truncates_base64_in_responses_instructions():
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.litellm_logging import get_standard_logging_object_payload
+
+    instructions: Final = "data:text/plain;base64," + "A" * 65
+    logging_obj: Final = LitellmLogging(
+        model="test_model",
+        messages=[{"role": "user", "content": "input"}],
+        stream=False,
+        call_type="aresponses",
+        start_time=time.time(),
+        litellm_call_id="responses-instructions-base64",
+        function_id="responses-instructions-base64",
+        kwargs={"input": "input", "instructions": instructions},
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    now: Final = datetime.now()
+    payload: Final = get_standard_logging_object_payload(
+        kwargs=logging_obj.model_call_details,
+        init_response_obj={},
+        start_time=now,
+        end_time=now,
+        logging_obj=logging_obj,
+        status="success",
+    )
+
+    assert payload is not None
+    assert payload["messages"][0]["content"] == "data:text/plain;base64,[base64_data truncated: 48B]"
+
+
+@pytest.mark.asyncio
+async def test_async_standard_logging_payload_preserves_responses_instructions():
+    from datetime import datetime
+
+    from litellm.types.utils import ModelResponse
+
+    instructions: Final = "Follow the Responses API instructions"
+    input_items: Final = [{"role": "user", "content": "bridged responses input"}]
+    logging_obj: Final = LitellmLogging(
+        model="test_model",
+        messages=input_items,
+        stream=False,
+        call_type="aresponses",
+        start_time=time.time(),
+        litellm_call_id="async-responses-instructions",
+        function_id="async-responses-instructions",
+        kwargs={"input": input_items, "instructions": instructions},
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={})
+    now: Final = datetime.now()
+
+    with patch.object(logging_obj, "get_combined_callback_list", return_value=[]):
+        await logging_obj.async_success_handler(
+            result=ModelResponse(model="test_model"),
+            start_time=now,
+            end_time=now,
+            cache_hit=False,
+        )
+
+    payload: Final = logging_obj.model_call_details["standard_logging_object"]
+    assert payload["messages"] == [
+        {"role": "system", "content": instructions},
+        *input_items,
+    ]
+
+
 def test_get_standard_logging_object_payload_carries_matched_access_groups(logging_obj):
     """Access groups stamped at auth time reach the logging payload, so integrations see what a request billed."""
     from datetime import datetime

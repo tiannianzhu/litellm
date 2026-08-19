@@ -182,6 +182,7 @@ class TestPerformRedaction:
             "messages": [{"role": "user", "content": "sensitive input"}],
             "prompt": "sensitive prompt",
             "input": "sensitive input",
+            "instructions": "sensitive Responses API instructions",
             "standard_logging_object": {
                 "messages": [{"role": "user", "content": "sensitive input"}],
                 "response": {
@@ -210,6 +211,7 @@ class TestPerformRedaction:
         ]
         assert details["prompt"] == ""
         assert details["input"] == ""
+        assert details["instructions"] == ""
 
         logged_response = details["standard_logging_object"]["response"]
         assert logged_response["usage"] == {"total_tokens": 1}
