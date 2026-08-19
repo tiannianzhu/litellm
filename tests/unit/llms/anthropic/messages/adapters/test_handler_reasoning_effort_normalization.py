@@ -22,10 +22,13 @@ from litellm.constants import (
     DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_MEDIUM_THINKING_BUDGET,
 )
+from litellm.exceptions import UnsupportedParamsError
 from litellm.llms.anthropic.messages.adapters.handler import (
     LiteLLMMessagesToCompletionTransformationHandler,
 )
+from litellm.llms.anthropic.messages.native.handler import anthropic_messages_handler
 from litellm.llms.anthropic.messages.utils import maps_bare_output_effort, model_reasoning_efforts
+from litellm.llms.custom_httpx.http_handler import HTTPHandler
 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import VertexGeminiConfig
 from litellm.router import Router
 from litellm.utils import reasoning_effort_with_summary_alias, supports_none_reasoning_effort, supports_reasoning
@@ -1189,3 +1192,63 @@ def test_a_custom_named_deployment_gets_the_effort_its_base_model_gets_beside_a_
         return completion_kwargs.get("reasoning_effort")
 
     assert sent_effort("azure/my-pro-deployment", base_model_kwargs) == sent_effort("azure/gpt-5.4-pro", {})
+
+
+def _hosted_vllm_mapped_effort(model: str, provider: str | None, effort: str) -> object:
+    sent: Final[list[object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/chat/completions"
+        sent.append(json.loads(request.content).get("reasoning_effort"))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        anthropic_messages_handler(
+            max_tokens=1024,
+            messages=MESSAGES,
+            model=model,
+            custom_llm_provider=provider,
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            client=HTTPHandler(client=client),
+            model_info={
+                "supported_endpoints": ["/v1/messages"],
+                "reasoning_effort": {"disabled": "reject", "levels": {"max": ["xhigh"], "low": ["minimal"]}},
+            },
+            output_config={"effort": effort},
+            thinking={"type": "adaptive"},
+        )
+
+    (wire_effort,) = sent
+    return wire_effort
+
+
+@pytest.mark.parametrize(
+    "model,provider",
+    [("hosted_vllm/fixture-model", None), ("fixture-model", "hosted_vllm")],
+)
+@pytest.mark.parametrize("effort,expected", [("max", "max"), ("xhigh", "max"), ("minimal", "low")])
+def test_hosted_vllm_model_info_effort_levels_reach_chat_mapper(
+    local_model_cost_map: None, model: str, provider: str | None, effort: str, expected: str
+) -> None:
+    assert _hosted_vllm_mapped_effort(model, provider, effort) == expected
+
+
+@pytest.mark.parametrize(
+    "model,provider",
+    [("hosted_vllm/fixture-model", None), ("fixture-model", "hosted_vllm")],
+)
+def test_hosted_vllm_rejects_disabling_reasoning_when_configured(
+    local_model_cost_map: None, model: str, provider: str | None
+) -> None:
+    with pytest.raises(UnsupportedParamsError):
+        _hosted_vllm_mapped_effort(model, provider, "none")

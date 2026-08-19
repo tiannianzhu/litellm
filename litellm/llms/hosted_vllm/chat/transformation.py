@@ -7,6 +7,8 @@ import json
 from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator, Mapping, Sequence
 from typing import Final, Literal, cast, overload
 
+from pydantic import TypeAdapter
+
 from litellm.constants import VLLM_STREAM_PROMPT_FIELDS
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.prompt_templates.factory import parse_mime_type
@@ -35,6 +37,7 @@ from ...openai.chat.gpt_transformation import (
     OpenAIGPTConfig,
 )
 
+_JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
 _THINKING_KEYS: Final = frozenset({"thinking_blocks"})
 _THINKING_AND_REASONING_KEYS: Final = frozenset({"thinking_blocks", "reasoning_content"})
 
@@ -169,7 +172,7 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
 
     def get_supported_openai_params(self, model: str) -> list[str]:
         params: Final = super().get_supported_openai_params(model)
-        params.extend(["reasoning_effort", "thinking"])
+        params.extend(("reasoning_effort", "thinking"))
         return params
 
     def map_openai_params(
@@ -178,7 +181,7 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         optional_params: dict[str, object],
         model: str,
         drop_params: bool,
-    ) -> dict:
+    ) -> dict[str, object]:
         params: Final = dict[str, object](non_default_params)
         mapped_params: Final = {
             key: value
@@ -202,8 +205,8 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         )
         if thinking_effort is not None:
             mapped_params["reasoning_effort"] = thinking_effort
-
-        return super().map_openai_params(mapped_params, optional_params, model, drop_params)
+        mapped_result: Final[object] = super().map_openai_params(mapped_params, optional_params, model, drop_params)
+        return _JSON_OBJECT_ADAPTER.validate_python(mapped_result)
 
     def _get_openai_compatible_provider_info(
         self, api_base: str | None, api_key: str | None
