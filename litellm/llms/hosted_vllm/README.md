@@ -19,3 +19,14 @@ the standard `thinking` field
   controls directly with the same disable and effort-level semantics
 - Tests: the chat and Messages tests below
   `tests/test_litellm/llms/hosted_vllm/`
+
+## Cache creation usage
+
+Some vLLM Chat Completions payloads expose cache creation usage as
+`created_cache_tokens`. LiteLLM maps it to `cache_write_tokens`, which feeds
+`cache_creation_input_tokens` and cache-write cost accounting.
+
+- Code: `litellm/types/utils.py`, `PromptTokensDetailsWrapper`
+- Remove when: upstream LiteLLM performs this mapping, or vLLM consistently
+  emits the standard cache-creation field consumed by LiteLLM
+- Tests: `tests/test_litellm/test_utils.py`
