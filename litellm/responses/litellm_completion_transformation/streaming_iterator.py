@@ -2,7 +2,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from itertools import filterfalse
-from typing import Any, Final, cast
+from typing import Any, Final, cast  # noqa: TID251  # upstream event unions require Any and validated casts
 
 import litellm
 from litellm.litellm_core_utils.hidden_params import get_or_create_hidden_params
@@ -12,6 +12,7 @@ from litellm.responses.litellm_completion_transformation.custom_tools import (
     extract_custom_tool_names,
     is_custom_tool_call,
     serialize_tool_call_arguments,
+    unwrap_custom_tool_arguments,
 )
 from litellm.responses.litellm_completion_transformation.reasoning_items import mint_reasoning_item_id
 from litellm.responses.litellm_completion_transformation.transformation import (
@@ -307,6 +308,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             else:
                 fn_name = str(getattr(fn, "name", "") or "")
                 fn_args_delta = serialize_tool_call_arguments(getattr(fn, "arguments", ""))
+            is_custom_tool = is_custom_tool_call(fn_name, self._custom_tool_names)
             output_index = self._get_or_assign_tool_output_index(call_id)
 
             if call_id not in self._tool_args_by_call_id:
@@ -324,6 +326,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
             if fn_args_delta:
                 self._tool_args_by_call_id[call_id] += fn_args_delta
+
+                if is_custom_tool:
+                    continue
 
                 # Split large argument deltas into smaller chunks to match OpenAI's streaming behavior
                 # This is especially important for providers like Bedrock that send complete arguments at once
@@ -374,6 +379,10 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             else:
                 fn_name = str(getattr(fn, "name", "") or "")
                 fn_args = serialize_tool_call_arguments(getattr(fn, "arguments", ""))
+            is_custom_tool = is_custom_tool_call(fn_name, self._custom_tool_names)
+            tool_name, tool_namespace = (
+                (fn_name, None) if is_custom_tool else self._responses_namespace_tool_call_fields(fn_name)
+            )
             web_search_call = self._web_search_calls.get(call_id)
             if web_search_call is not None:
                 if call_id not in self._queued_web_search_call_ids:
@@ -399,6 +408,16 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 self._pending_tool_events.append(event)
 
             final_args = fn_args or self._tool_args_by_call_id.get(call_id, "")
+
+            if is_custom_tool:
+                self._queue_custom_tool_call_done_events(
+                    call_id=call_id,
+                    output_index=output_index,
+                    tool_name=tool_name,
+                    tool_namespace=tool_namespace,
+                    arguments=final_args,
+                )
+                continue
 
             # Emit delta events for arguments that weren't streamed yet
             # This handles cases where Bedrock sends the complete tool call at the end
@@ -535,6 +554,60 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             responses_api_response=response,
             custom_llm_provider=self.custom_llm_provider,
             litellm_metadata=self.litellm_metadata,
+        )
+
+    def _queue_custom_tool_call_done_events(
+        self,
+        call_id: str,
+        output_index: int,
+        tool_name: str,
+        tool_namespace: str | None,
+        arguments: str,
+    ) -> None:
+        custom_input: Final = unwrap_custom_tool_arguments(arguments)
+        for index in range(0, len(custom_input), 10):
+            self._sequence_number += 1
+            self._pending_tool_events.append(
+                BaseLiteLLMOpenAIResponseObject(
+                    **{  # noqa: PIE804  # Pydantic extra fields;
+                        "type": ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DELTA,
+                        "item_id": call_id,
+                        "output_index": output_index,
+                        "delta": custom_input[index : index + 10],
+                        "sequence_number": self._sequence_number,
+                    }
+                )
+            )
+        self._sequence_number += 1
+        self._pending_tool_events.append(
+            BaseLiteLLMOpenAIResponseObject(
+                **{  # noqa: PIE804  # Pydantic extra fields;
+                    "type": ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE,
+                    "item_id": call_id,
+                    "output_index": output_index,
+                    "input": custom_input,
+                    "sequence_number": self._sequence_number,
+                }
+            )
+        )
+
+        self._sequence_number += 1
+        item_kwargs: Final = build_tool_call_item_kwargs(
+            call_id,
+            tool_name,
+            arguments,
+            "completed",
+            self._custom_tool_names,
+        )
+        if tool_namespace:
+            item_kwargs["namespace"] = tool_namespace
+        self._pending_tool_events.append(
+            OutputItemDoneEvent(
+                type=ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+                output_index=output_index,
+                sequence_number=self._sequence_number,
+                item=BaseLiteLLMOpenAIResponseObject(**item_kwargs),
+            )
         )
 
     def _default_response_created_event_data(self) -> dict:
@@ -728,7 +801,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         {
             "type": "response.reasoning_summary_text.done",
             "item_id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
-            "output_index": 0,
+            "output_index": self._reasoning_index(),
             "sequence_number": 97,
             "summary_index": 0,
             "text": "**Clarifying the first humans**\n\nThe  I'm addressing the user's specific interest."
@@ -756,7 +829,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         {
             "type": "response.reasoning_summary_part.done",
             "item_id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
-            "output_index": 0,
+            "output_index": self._reasoning_index(),
             "part": {
                 "type": "summary_text",
                 "text": "**Clarifying the first humans**\n\nThe  earlier hominins. It feels important to ensure I'm addressing the user's specific interest."
@@ -863,7 +936,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         Example:
         {
             "type": "response.output_item.done",
-            "output_index": 0,
+            "output_index": self._reasoning_index(),
             "sequence_number": 99,
             "item": {
                 "id": "rs_0c5dae30e53172980069708ba2f59c8197b71ca9820edad07c",
