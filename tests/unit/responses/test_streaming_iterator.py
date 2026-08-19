@@ -30,6 +30,7 @@ from litellm.responses.streaming_iterator import (
     ResponsesAPIStreamingIterator,
     SyncResponsesAPIStreamingIterator,
     _estimate_usage_from_text,
+    build_synthetic_response_events,
 )
 from litellm.types.llms.openai import (
     ResponseAPIUsage,
@@ -2835,3 +2836,26 @@ async def test_websocket_turns_logging_survives_garbage_collection(terminal_even
     await _run_websocket_turn(logger, terminal_event)
 
     assert await _logging_tasks_left_after_garbage_collection(logger) == 1
+
+
+@pytest.mark.parametrize("status", ["failed", "incomplete"])
+def test_synthetic_stream_preserves_unsuccessful_terminal_status(status):
+    response = ResponsesAPIResponse(
+        id="resp_terminal",
+        created_at=1,
+        model="fixture",
+        object="response",
+        status=status,
+        output=[],
+        usage=ResponseAPIUsage(input_tokens=2, output_tokens=3, total_tokens=5),
+        error={"code": "server_error", "message": "fixture failure"} if status == "failed" else None,
+        incomplete_details={"reason": "max_output_tokens"} if status == "incomplete" else None,
+    )
+    events = build_synthetic_response_events(transformed=response, logging_obj=None, chunk_size=5)
+    assert events[-1].type == f"response.{status}"
+    assert events[-1].response.status == status
+    assert events[-1].response.usage.total_tokens == 5
+    assert events[-1].response.error == response.error
+    assert events[-1].response.incomplete_details == response.incomplete_details
+    assert all(event.type != "response.completed" for event in events)
+    assert [event.sequence_number for event in events] == list(range(len(events)))

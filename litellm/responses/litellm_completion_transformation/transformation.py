@@ -292,7 +292,7 @@ def _responses_image_part(item: Mapping[str, object]) -> _ResponsesImagePart:
         _IMAGE_URL_ADAPTER,
         {
             "url": (fields.get("url") if isinstance(source, Mapping) else source) or "",
-            "detail": detail if isinstance(detail, str) else "auto",
+            "detail": detail if isinstance(detail, str) and detail != "original" else "auto",
             **({"format": media_format} if media_format is not None else {}),
             **({"video_metadata": video_metadata} if video_metadata is not None else {}),
         },
