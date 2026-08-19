@@ -93,6 +93,18 @@ def test_usage_anthropic_cache_creation_maps_to_cache_write_tokens():
     assert usage.prompt_tokens_details.cached_tokens == 120
 
 
+def test_usage_vllm_created_cache_tokens_maps_to_cache_write_tokens():
+    usage = Usage(
+        prompt_tokens=1000,
+        completion_tokens=10,
+        total_tokens=1010,
+        prompt_tokens_details={"cached_tokens": 0, "created_cache_tokens": 800},
+    )
+    assert usage.prompt_tokens_details.cache_write_tokens == 800
+    assert usage.prompt_tokens_details.cache_creation_tokens == 800
+    assert usage.prompt_tokens_details.created_cache_tokens == 800
+
+
 def test_prompt_tokens_details_no_cache_write_tokens_when_absent():
     """A read-only cache hit (no cache write) must not surface cache-write fields."""
     details = PromptTokensDetailsWrapper(cached_tokens=800)
