@@ -21,6 +21,12 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
 
+NATIVE_REASONING_CONFIG = {
+    "levels": {"high": ["medium", "high"], "max": ["xhigh", "max"]},
+    "disabled": "reject",
+}
+NATIVE_DEFAULT_REASONING_CONFIG = {}
+
 
 def _make_mock_responses_api_response(content: str = "Hello! I'm doing well.") -> dict:
     return {
@@ -188,3 +194,47 @@ def test_hosted_vllm_validate_environment_custom_api_key():
     )
 
     assert headers.get("Authorization") == "Bearer my-custom-key"
+
+
+@pytest.mark.parametrize(
+    "optional_params, reasoning_config, expected",
+    [
+        (
+            {"reasoning": {"effort": "xhigh", "summary": "auto"}},
+            NATIVE_REASONING_CONFIG,
+            {"reasoning": {"effort": "max", "summary": "auto"}},
+        ),
+        (
+            {},
+            NATIVE_DEFAULT_REASONING_CONFIG,
+            {"reasoning": {"effort": "high"}},
+        ),
+        (
+            {"reasoning": {"effort": "none"}},
+            NATIVE_DEFAULT_REASONING_CONFIG,
+            {"reasoning": {"effort": "none"}},
+        ),
+    ],
+)
+def test_hosted_vllm_responses_reasoning_config(optional_params, reasoning_config, expected):
+    request = HostedVLLMResponsesAPIConfig().transform_responses_api_request(
+        model="model",
+        input="hello",
+        response_api_optional_request_params=optional_params,
+        litellm_params=GenericLiteLLMParams(model_info={"reasoning_effort": reasoning_config}),
+        headers={},
+    )
+
+    assert {key: request[key] for key in expected} == expected
+    assert "chat_template_kwargs" not in request
+
+
+def test_hosted_vllm_responses_rejects_disabling_native_reasoning():
+    with pytest.raises(litellm.UnsupportedParamsError, match="always has reasoning enabled"):
+        HostedVLLMResponsesAPIConfig().transform_responses_api_request(
+            model="model",
+            input="hello",
+            response_api_optional_request_params={"reasoning": {"effort": "none"}},
+            litellm_params=GenericLiteLLMParams(model_info={"reasoning_effort": NATIVE_REASONING_CONFIG}),
+            headers={},
+        )

@@ -1,12 +1,20 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
 
+import litellm
 from litellm.constants import (
     DEFAULT_REASONING_EFFORT_HIGH_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET,
 )
 from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
+
+NATIVE_REASONING_CONFIG = {
+    "levels": {"high": ["medium", "high"], "max": ["xhigh", "max"]},
+    "disabled": "reject",
+}
+NATIVE_DEFAULT_REASONING_CONFIG = {}
 
 
 def test_hosted_vllm_chat_transformation_file_url():
@@ -433,3 +441,70 @@ def test_hosted_vllm_custom_tools_use_top_level_input_schema():
     assert tools[0]["function"]["name"] == "search"
     assert tools[0]["function"]["description"] == "Search docs"
     assert tools[0]["function"]["parameters"] == input_schema
+
+
+@pytest.mark.parametrize(
+    "params, optional_params, expected",
+    [
+        (
+            {"reasoning_effort": "xhigh", "reasoning_effort_config": NATIVE_REASONING_CONFIG},
+            {},
+            {"reasoning_effort": "max"},
+        ),
+        (
+            {"reasoning_effort_config": NATIVE_DEFAULT_REASONING_CONFIG},
+            {},
+            {"reasoning_effort": "high"},
+        ),
+        (
+            {"reasoning_effort": "medium", "reasoning_effort_config": NATIVE_DEFAULT_REASONING_CONFIG},
+            {},
+            {"reasoning_effort": "high"},
+        ),
+        (
+            {"reasoning_effort": "xhigh", "reasoning_effort_config": NATIVE_DEFAULT_REASONING_CONFIG},
+            {},
+            {"reasoning_effort": "max"},
+        ),
+        (
+            {"reasoning_effort": "none", "reasoning_effort_config": NATIVE_DEFAULT_REASONING_CONFIG},
+            {},
+            {"reasoning_effort": "none"},
+        ),
+        (
+            {"thinking": {"type": "enabled", "budget_tokens": 1}, "reasoning_effort": "max"},
+            {},
+            {"reasoning_effort": "max"},
+        ),
+    ],
+)
+def test_hosted_vllm_reasoning_config(params, optional_params, expected):
+    result = HostedVLLMChatConfig().map_openai_params(
+        non_default_params=params,
+        optional_params=optional_params,
+        model="hosted_vllm/model",
+        drop_params=False,
+    )
+
+    assert result == expected
+
+
+def test_hosted_vllm_reasoning_config_rejects_disabling_native_reasoning():
+    with pytest.raises(litellm.UnsupportedParamsError, match="always has reasoning enabled"):
+        HostedVLLMChatConfig().map_openai_params(
+            non_default_params={"reasoning_effort": "none", "reasoning_effort_config": NATIVE_REASONING_CONFIG},
+            optional_params={},
+            model="hosted_vllm/model",
+            drop_params=False,
+        )
+
+
+@pytest.mark.parametrize("default", [None, "max"])
+def test_hosted_vllm_rejects_model_specific_reasoning_defaults(default):
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        HostedVLLMChatConfig().map_openai_params(
+            non_default_params={"reasoning_effort_config": {"default": default}},
+            optional_params={},
+            model="hosted_vllm/model",
+            drop_params=False,
+        )

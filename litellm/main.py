@@ -5442,6 +5442,11 @@ def completion(
             if bridges_to_responses_api
             else kwargs.get("allowed_openai_params")
         )
+        reasoning_effort_config: Final = (
+            model_info.get("reasoning_effort")
+            if custom_llm_provider == "hosted_vllm" and isinstance(model_info, dict)
+            else None
+        )
         optional_param_args: Final = {
             "functions": functions,
             "function_call": function_call,
@@ -5475,6 +5480,7 @@ def completion(
             "messages": messages,
             "reasoning_effort": reasoning_effort,
             "verbosity": verbosity,
+            "reasoning_effort_config": reasoning_effort_config,
             "thinking": thinking,
             "web_search_options": web_search_options,
             "include_server_side_tool_invocations": (
