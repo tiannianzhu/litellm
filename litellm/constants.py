@@ -814,6 +814,7 @@ DEFAULT_CHAT_COMPLETION_PARAM_VALUES: Final = {
     "additional_drop_params": None,
     "messages": None,
     "reasoning_effort": None,
+    "reasoning_effort_config": None,
     "verbosity": None,
     "thinking": None,
     "web_search_options": None,

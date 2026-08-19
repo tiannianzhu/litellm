@@ -4178,6 +4178,7 @@ def get_optional_params(
     drop_params=None,
     allowed_openai_params: list[str] | None = None,
     reasoning_effort=None,
+    reasoning_effort_config: object = None,
     verbosity=None,
     additional_drop_params=None,
     messages: list[AllMessageValues] | None = None,

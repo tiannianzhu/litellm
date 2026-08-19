@@ -3,8 +3,10 @@ Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
 import json
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from typing import Any, Final, Literal, cast, overload
+
+from pydantic import TypeAdapter
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     _get_image_mime_type_from_url,
@@ -25,6 +27,9 @@ from litellm.types.llms.openai import (
 
 from ....utils import _remove_additional_properties, _remove_strict_from_schema
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+from ..reasoning import get_reasoning_effort_config
+
+_JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
@@ -79,16 +84,16 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
 
     def get_supported_openai_params(self, model: str) -> list[str]:
         params: Final = super().get_supported_openai_params(model)
-        params.extend(["reasoning_effort", "thinking"])
+        params.extend(("reasoning_effort", "reasoning_effort_config", "thinking"))
         return params
 
     def map_openai_params(
         self,
-        non_default_params: dict,
-        optional_params: dict,
+        non_default_params: dict[str, object],
+        optional_params: dict[str, object],
         model: str,
         drop_params: bool,
-    ) -> dict:
+    ) -> dict[str, object]:
         _tools = non_default_params.pop("tools", None)
         if _tools is not None:
             _tools = _remove_additional_properties(_tools)
@@ -98,15 +103,74 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
         if _tools is not None:
             non_default_params["tools"] = _tools
 
+        reasoning_config: Final = get_reasoning_effort_config(non_default_params.pop("reasoning_effort_config", None))
+        reasoning_effort: Final = non_default_params.pop("reasoning_effort", None)
         thinking: Final = non_default_params.pop("thinking", None)
-        if thinking is not None and isinstance(thinking, dict):
-            if thinking.get("type") == "enabled":
-                if "reasoning_effort" not in non_default_params:
-                    non_default_params["reasoning_effort"] = reasoning_effort_from_thinking_budget(
-                        thinking.get("budget_tokens", 0)
-                    )
+        thinking_params: Final = (
+            _JSON_OBJECT_ADAPTER.validate_python(thinking) if isinstance(thinking, Mapping) else None
+        )
+        budget_tokens: Final = thinking_params.get("budget_tokens", 0) if thinking_params is not None else 0
+        thinking_effort: Final = (
+            reasoning_effort_from_thinking_budget(budget_tokens)
+            if thinking_params is not None
+            and thinking_params.get("type") == "enabled"
+            and isinstance(budget_tokens, int)
+            and reasoning_effort is None
+            else None
+        )
+        requested_effort: Final = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else "none"
+            if thinking_params is not None and thinking_params.get("type") == "disabled"
+            else thinking_effort
+        )
+        if reasoning_config is not None:
+            normalized_effort: Final = reasoning_config.normalize(requested_effort, model=model)
+            if reasoning_config.target == "native":
+                native_params: Final = (
+                    {  # mutable-ok: inherited parameter mapper consumes a mutable request dict
+                        **non_default_params,
+                        "reasoning_effort": "none" if normalized_effort == "disabled" else normalized_effort,
+                    }
+                    if normalized_effort is not None
+                    else non_default_params
+                )
+                native_mapped_params: Final[object] = super().map_openai_params(
+                    native_params, optional_params, model, drop_params
+                )
+                return _JSON_OBJECT_ADAPTER.validate_python(native_mapped_params)
 
-        return super().map_openai_params(non_default_params, optional_params, model, drop_params)
+            if normalized_effort is not None:
+                chat_template_kwargs = reasoning_config.get_chat_template_kwargs(normalized_effort, model=model)
+                raw_extra_body: Final = optional_params.get("extra_body")
+                extra_body: Final = (
+                    _JSON_OBJECT_ADAPTER.validate_python(raw_extra_body)
+                    if chat_template_kwargs and isinstance(raw_extra_body, Mapping)
+                    else {}  # mutable-ok: request assembly requires a mutable nested JSON object
+                    if chat_template_kwargs and raw_extra_body is None
+                    else None
+                )
+                raw_template_kwargs: Final = extra_body.get("chat_template_kwargs") if extra_body is not None else None
+                existing_template_kwargs: Final = (
+                    _JSON_OBJECT_ADAPTER.validate_python(raw_template_kwargs)
+                    if isinstance(raw_template_kwargs, Mapping)
+                    else {}  # mutable-ok: vLLM template kwargs are accumulated in place
+                    if extra_body is not None and raw_template_kwargs is None
+                    else None
+                )
+                if existing_template_kwargs is not None and extra_body is not None:
+                    for key, value in chat_template_kwargs.items():
+                        existing_template_kwargs.setdefault(key, value)
+                    extra_body["chat_template_kwargs"] = existing_template_kwargs
+                    optional_params["extra_body"] = extra_body
+        elif reasoning_effort is not None or thinking_effort is not None:
+            non_default_params["reasoning_effort"] = requested_effort
+
+        mapped_params: Final[object] = super().map_openai_params(
+            non_default_params, optional_params, model, drop_params
+        )
+        return _JSON_OBJECT_ADAPTER.validate_python(mapped_params)
 
     def _get_openai_compatible_provider_info(
         self, api_base: str | None, api_key: str | None

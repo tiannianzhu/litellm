@@ -5398,6 +5398,11 @@ def completion(
         if dynamic_api_key is not None:
             api_key = dynamic_api_key
         # check if user passed in any of the OpenAI optional params
+        reasoning_effort_config: Final = (
+            model_info.get("reasoning_effort")
+            if custom_llm_provider == "hosted_vllm" and isinstance(model_info, dict)
+            else None
+        )
         optional_param_args: Final = {
             "functions": functions,
             "function_call": function_call,
@@ -5431,6 +5436,7 @@ def completion(
             "messages": messages,
             "reasoning_effort": reasoning_effort,
             "verbosity": verbosity,
+            "reasoning_effort_config": reasoning_effort_config,
             "thinking": thinking,
             "web_search_options": web_search_options,
             "include_server_side_tool_invocations": (

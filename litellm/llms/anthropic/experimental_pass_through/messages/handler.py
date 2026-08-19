@@ -568,13 +568,20 @@ def anthropic_messages_handler(
     if anthropic_messages_provider_config is None and _deployment_passes_through_anthropic_messages(
         kwargs.get("model_info")
     ):
-        from litellm.llms.openai_like.messages.transformation import (
-            OpenAILikeAnthropicMessagesConfig,
-        )
+        if custom_llm_provider == LlmProviders.HOSTED_VLLM.value:
+            from litellm.llms.hosted_vllm.messages.transformation import (
+                HostedVLLMAnthropicMessagesConfig,
+            )
 
-        anthropic_messages_provider_config = OpenAILikeAnthropicMessagesConfig(
-            cache_control_ttl=_deployment_supports_cache_control_ttl(kwargs.get("model_info")),
-        )
+            anthropic_messages_provider_config = HostedVLLMAnthropicMessagesConfig()
+        else:
+            from litellm.llms.openai_like.messages.transformation import (
+                OpenAILikeAnthropicMessagesConfig,
+            )
+
+            anthropic_messages_provider_config = OpenAILikeAnthropicMessagesConfig(
+                cache_control_ttl=_deployment_supports_cache_control_ttl(kwargs.get("model_info")),
+            )
     if anthropic_messages_provider_config is None:
         # Route to Responses API for OpenAI / Azure, chat/completions for everything else.
         if _should_route_to_responses_api(custom_llm_provider, original_model, model):
