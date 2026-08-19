@@ -447,6 +447,13 @@ class LiteLLMMessagesToCompletionTransformationHandler:
 
         model: Final = completion_kwargs.get("model", "")
         custom_llm_provider: Final = completion_kwargs.get("custom_llm_provider")
+        model_info: Final = completion_kwargs.get("model_info")
+        if (
+            (custom_llm_provider == "hosted_vllm" or model.startswith("hosted_vllm/"))
+            and isinstance(model_info, Mapping)
+            and model_info.get("reasoning_effort") is not None
+        ):
+            return
 
         if isinstance(reasoning_effort, str):
             normalized = normalize_reasoning_effort_value(
