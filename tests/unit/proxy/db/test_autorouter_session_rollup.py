@@ -121,6 +121,7 @@ class TestBuildTransaction:
             cache_hit=True,
             cache_ttl_seconds=300,
             cache_touched=True,
+            cache_write_ttl_unknown=False,
             baseline_model="anthropic/claude-opus-5",
         )
 
@@ -206,16 +207,30 @@ class TestBuildTransaction:
         metadata = _metadata(
             usage_object={
                 "prompt_tokens": 90,
-                "cache_creation_input_tokens": 4,
                 "prompt_tokens_details": {"cache_creation_token_details": {"ephemeral_1h_input_tokens": 4}},
             }
         )
         transaction = _build(metadata=metadata)
-        assert transaction is not None and transaction.cache_ttl_seconds == 3600
+        assert transaction is not None
+        assert transaction.cache_ttl_seconds == 3600
+        assert transaction.cache_touched is True
 
-    def test_a_cache_write_without_ttl_detail_is_the_provider_default_five_minutes(self):
-        transaction = _build(metadata=_metadata(usage_object={"prompt_tokens": 90, "cache_creation_input_tokens": 12}))
+    def test_anthropic_cache_write_without_ttl_detail_uses_the_provider_default_five_minutes(self):
+        transaction = _build(
+            payload=_payload(custom_llm_provider="anthropic"),
+            metadata=_metadata(usage_object={"prompt_tokens": 90, "cache_creation_input_tokens": 12}),
+        )
         assert transaction is not None and transaction.cache_ttl_seconds == 300
+
+    def test_hosted_vllm_cache_write_without_ttl_detail_does_not_infer_expiration(self):
+        transaction = _build(
+            payload=_payload(custom_llm_provider="hosted_vllm"),
+            metadata=_metadata(usage_object={"prompt_tokens": 90, "cache_creation_input_tokens": 12}),
+        )
+        assert transaction is not None
+        assert transaction.cache_ttl_seconds is None
+        assert transaction.cache_touched is True
+        assert transaction.cache_write_ttl_unknown is True
 
     def test_a_turn_that_wrote_nothing_records_no_ttl(self):
         transaction = _build()
@@ -249,8 +264,10 @@ class TestBuildTransaction:
         adapter: Final = TypeAdapter(AutoRouterTurnTransaction)
         assert transaction is not None
         assert adapter.validate_json(adapter.dump_json(transaction)).token_counts_recorded is True
-        legacy: Final = adapter.dump_json(transaction, exclude={"token_counts_recorded"})
-        assert adapter.validate_json(legacy).token_counts_recorded is False
+        legacy: Final = adapter.dump_json(transaction, exclude={"token_counts_recorded", "cache_write_ttl_unknown"})
+        restored: Final = adapter.validate_json(legacy)
+        assert restored.token_counts_recorded is False
+        assert restored.cache_write_ttl_unknown is None
 
     def test_a_covered_turn_that_neither_read_nor_wrote_did_not_touch_the_cache(self):
         transaction = _build()
@@ -381,6 +398,7 @@ class TestFlush:
             0.0,
             "canonical-user",
             0,
+            None,
         )
 
     def test_a_keys_turns_stay_chronological_when_its_canonical_user_changes(self) -> None:
