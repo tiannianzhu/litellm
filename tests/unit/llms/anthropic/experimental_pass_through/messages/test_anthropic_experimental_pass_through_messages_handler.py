@@ -1685,3 +1685,27 @@ async def test_anthropic_messages_forwards_safeguards_and_dangerous_tool_use_bet
     assert "anthropic_beta" not in captured["body"]
     assert captured["anthropic-beta"].split(",").count("dangerous-tool-use-2026-09-03") == 1
     assert response["safeguard_results"] == safeguard_results
+
+
+def test_gate_uses_hosted_vllm_messages_config(monkeypatch):
+    from litellm.llms.anthropic.experimental_pass_through.messages.handler import (
+        anthropic_messages_handler,
+    )
+    from litellm.llms.hosted_vllm.messages.transformation import (
+        HostedVLLMAnthropicMessagesConfig,
+    )
+
+    captured, translation_calls = _gate_stubs(monkeypatch)
+
+    result = anthropic_messages_handler(
+        max_tokens=100,
+        messages=[{"role": "user", "content": "Hello"}],
+        model="hosted_vllm/glm-5.2",
+        api_key="sk-test",
+        api_base="https://host/v1",
+        model_info={"supported_endpoints": ["/v1/messages"]},
+    )
+
+    assert result == "native-passthrough"
+    assert isinstance(captured["config"], HostedVLLMAnthropicMessagesConfig)
+    assert translation_calls["count"] == 0
