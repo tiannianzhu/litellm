@@ -16,6 +16,12 @@ from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.types.utils import ModelResponse
 
+NATIVE_REASONING_CONFIG = {
+    "levels": {"high": ["medium", "high"], "max": ["xhigh", "max"]},
+    "disabled": "reject",
+}
+NATIVE_DEFAULT_REASONING_CONFIG = {}
+
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("dependent_options", [False, True])
@@ -555,3 +561,79 @@ def test_hosted_vllm_tools_are_rewritten_without_touching_the_callers_tool() -> 
         }
     ]
     assert tools == tools_before
+
+
+def _hosted_vllm_chat_effort(params: dict[str, object], model_info: dict[str, object]) -> object:
+    sent: Final[list[object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        sent.append(body.get("reasoning_effort"))
+        assert "reasoning_effort_config" not in body
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        litellm.completion(
+            model="hosted_vllm/fixture",
+            messages=[{"role": "user", "content": "fixture"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            client=HTTPHandler(client=client),
+            model_info=model_info,
+            drop_params=True,
+            **params,
+        )
+    (effort,) = sent
+    return effort
+
+
+@pytest.mark.parametrize(
+    ("params", "policy", "expected"),
+    [
+        ({"reasoning_effort": "xhigh"}, NATIVE_REASONING_CONFIG, "max"),
+        ({}, NATIVE_DEFAULT_REASONING_CONFIG, "high"),
+        ({"additional_drop_params": ["reasoning_effort"]}, NATIVE_DEFAULT_REASONING_CONFIG, "high"),
+        ({"reasoning_effort": {"effort": "xhigh", "summary": "auto"}}, NATIVE_DEFAULT_REASONING_CONFIG, "max"),
+        ({"reasoning_effort": "medium"}, NATIVE_DEFAULT_REASONING_CONFIG, "high"),
+        ({"reasoning_effort": "none"}, NATIVE_DEFAULT_REASONING_CONFIG, "none"),
+        ({"thinking": {"type": "enabled", "budget_tokens": 1}}, NATIVE_DEFAULT_REASONING_CONFIG, "low"),
+        (
+            {"thinking": {"type": "enabled", "budget_tokens": 1}, "reasoning_effort": "max"},
+            NATIVE_DEFAULT_REASONING_CONFIG,
+            "max",
+        ),
+    ],
+)
+def test_hosted_vllm_reasoning_config(params: dict[str, object], policy: dict[str, object], expected: str) -> None:
+    assert _hosted_vllm_chat_effort(params, {"reasoning_effort": policy}) == expected
+
+
+@pytest.mark.parametrize(
+    ("params", "error"),
+    [
+        ({"reasoning_effort": "none"}, "always has reasoning enabled"),
+        ({"reasoning_effort": "turbo"}, "Unsupported reasoning effort 'turbo'"),
+        ({"extra_body": {"reasoning_effort": "none"}}, "Send reasoning controls as request fields"),
+    ],
+)
+def test_hosted_vllm_policy_checks_original_reasoning_before_filtering(params: dict[str, object], error: str) -> None:
+    with pytest.raises(litellm.UnsupportedParamsError, match=error):
+        _hosted_vllm_chat_effort(
+            {**params, "additional_drop_params": ["reasoning_effort_config", "reasoning_effort"]},
+            {"reasoning_effort": NATIVE_REASONING_CONFIG, "reasoning_effort_levels": ["high", "max"]},
+        )
+
+
+@pytest.mark.parametrize("default", [None, "max"])
+def test_hosted_vllm_rejects_model_specific_reasoning_defaults(default: str | None) -> None:
+    with pytest.raises(litellm.APIConnectionError, match="Extra inputs are not permitted"):
+        _hosted_vllm_chat_effort({}, {"reasoning_effort": {"default": default}})

@@ -55,6 +55,7 @@ from litellm.llms.anthropic.messages.utils import (
     proxy_sub_call_logging_kwargs,
     proxy_sub_call_trace_id,
 )
+from litellm.llms.hosted_vllm.reasoning import hosted_vllm_reasoning_policy
 from litellm.types.integrations.custom_logger import CONVERTED_STREAM_KEYS
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
@@ -689,7 +690,6 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         model: Final = completion_kwargs.get("model", "")
         custom_llm_provider: Final = completion_kwargs.get("custom_llm_provider")
         deployment_model_info: Final = completion_kwargs.get("model_info")
-
         if isinstance(reasoning_effort, str):
             normalized = normalize_reasoning_effort_value(
                 reasoning_effort,
@@ -859,7 +859,16 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         # (e.g. "max" → "xhigh"/"high", "minimal" → "low" if unsupported)
         # Must run BEFORE _route_openai_thinking, which prepends "responses/"
         # to the model name and would break get_model_info() lookups.
-        LiteLLMMessagesToCompletionTransformationHandler._normalize_reasoning_effort(completion_kwargs)
+        policy_provider: Final = (
+            "hosted_vllm" if model.startswith("hosted_vllm/") else completion_kwargs.get("custom_llm_provider")
+        )
+        if hosted_vllm_reasoning_policy(policy_provider, completion_kwargs.get("model_info")) is None:
+            LiteLLMMessagesToCompletionTransformationHandler._normalize_reasoning_effort(completion_kwargs)
+        elif (output_config := as_str_mapping(extra_kwargs.get("output_config"))) is not None:
+            thinking_fields: Final = as_str_mapping(thinking)
+            output_effort: Final = output_config.get("effort")
+            if output_effort is not None and (thinking_fields is None or thinking_fields.get("type") != "disabled"):
+                completion_kwargs["reasoning_effort"] = output_effort
 
         LiteLLMMessagesToCompletionTransformationHandler._route_openai_thinking_to_responses_api_if_needed(
             completion_kwargs,

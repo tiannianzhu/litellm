@@ -1,6 +1,7 @@
 from typing import Final
 
 import litellm
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.url_utils import join_api_base
 from litellm.llms.anthropic.common_utils import normalize_cache_control_in_anthropic_payload
 from litellm.llms.anthropic.messages.native.transformation import (
@@ -30,9 +31,10 @@ class OpenAILikeAnthropicMessagesConfig(AnthropicMessagesConfig):
     inherited from the native Anthropic config.
     """
 
-    def __init__(self, cache_control_ttl: bool = False) -> None:
+    def __init__(self, cache_control_ttl: bool = False, hosted_vllm: bool = False) -> None:
         super().__init__()
         self._cache_control_ttl: Final = cache_control_ttl
+        self._hosted_vllm: Final = hosted_vllm
 
     def is_native_messages_route(self) -> bool:
         return False
@@ -94,16 +96,31 @@ class OpenAILikeAnthropicMessagesConfig(AnthropicMessagesConfig):
         is not supported``), so unless the provider declares ttl support the
         hints are reduced to their portable ``{"type": ...}`` core.
         """
+        optional_fields: Final = as_str_mapping(anthropic_messages_optional_request_params) or {}
+        preserved: Final = (
+            {key: optional_fields[key] for key in ("thinking", "output_config") if key in optional_fields}
+            if self._hosted_vllm
+            else {}
+        )
+        params: Final = (
+            {key: value for key, value in optional_fields.items() if key not in preserved}
+            if preserved
+            else anthropic_messages_optional_request_params
+        )
         request: Final = super().transform_anthropic_messages_request(
             model=model,
             messages=messages,
-            anthropic_messages_optional_request_params=anthropic_messages_optional_request_params,
+            anthropic_messages_optional_request_params=params,
             litellm_params=litellm_params,
             headers=headers,
         )
+        extra: Final = (
+            as_str_mapping((litellm_params.model_extra or {}).get("extra_body")) if self._hosted_vllm else None
+        )
+        payload: Final = {**request, **(extra or {}), **preserved} if extra or preserved else request
         if self.supports_cache_control_ttl():
-            return request
-        return normalize_cache_control_in_anthropic_payload(request)
+            return payload
+        return normalize_cache_control_in_anthropic_payload(payload)
 
     def get_complete_url(
         self,

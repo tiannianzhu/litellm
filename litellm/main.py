@@ -129,6 +129,7 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
 )
 from litellm.litellm_core_utils.provider_affinity import add_provider_affinity_header
 from litellm.litellm_core_utils.reasoning_effort_capability import (
+    ChatReasoning,
     RequestedReasoningEffort,
     model_group_from_metadata,
     reasoning_effort_needs_allowing,
@@ -156,6 +157,7 @@ from litellm.llms.bedrock.common_utils import (
 from litellm.llms.bedrock_mantle.chat.claude_transformation import bedrock_mantle_chat_config
 from litellm.llms.cohere.common_utils import CohereModelInfo
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler, http2_enabled
+from litellm.llms.hosted_vllm.reasoning import resolve_hosted_vllm_reasoning_effort
 from litellm.llms.openai.chat.gpt_reasoning_transformation import (
     DeferredReasoningDropWarnings,
     OpenAIGPT5Config,
@@ -1442,6 +1444,61 @@ def _completion_fakes_stream(
         return _azure_completion_fakes_stream(model, base_model)
     return provider_config is not None and provider_config.should_fake_stream(
         model=model, stream=True, custom_llm_provider=custom_llm_provider
+    )
+
+
+def _completion_reasoning(
+    effort: RequestedReasoningEffort,
+    thinking: AnthropicThinkingParam | None,
+    output_config: Mapping[str, object] | None,
+    *,
+    model: str,
+    custom_llm_provider: str,
+    kwargs: Mapping[str, object],
+    model_group: str | None,
+    drop_params: bool,
+) -> tuple[ChatReasoning, bool]:
+    hosted: Final = resolve_hosted_vllm_reasoning_effort(
+        effort if effort is not None else output_config,
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        deployment_model_info=kwargs.get("model_info"),
+        model_group=model_group,
+        drop_params=drop_params,
+        thinking=thinking,
+        extra_body=kwargs.get("extra_body"),
+    )
+    if hosted is not None:
+        return ChatReasoning(effort=hosted, thinking=None, output_config=output_config), True
+    return (
+        resolve_chat_reasoning(
+            effort,
+            thinking,
+            output_config,
+            model=model,
+            custom_llm_provider=custom_llm_provider,
+            deployment_model_info=kwargs.get("model_info"),
+            model_group=model_group,
+            drop_params=drop_params,
+        ),
+        False,
+    )
+
+
+def _completion_provider_reasoning(
+    effort: RequestedReasoningEffort,
+    params: Mapping[str, object],
+    provider_config: BaseConfig | None,
+    *,
+    hosted_chat_policy: bool,
+) -> object:
+    if hosted_chat_policy and isinstance(effort, Mapping):
+        level: Final = effort.get("effort")
+        return level if isinstance(level, str) else None
+    return reasoning_effort_with_summary_alias(
+        effort,
+        params,
+        accepts_summary=provider_config is not None and provider_config.accepts_reasoning_summary_in_reasoning_effort,
     )
 
 
@@ -5974,13 +6031,13 @@ def completion(
             routing_kwargs.get("metadata"), routing_kwargs.get("litellm_metadata")
         )
         requested_output_config: Final = as_str_mapping(non_default_params.get("output_config"))
-        chat_reasoning: Final = resolve_chat_reasoning(
+        chat_reasoning, hosted_policy = _completion_reasoning(
             reasoning_effort,
             thinking,
             requested_output_config,
             model=model,
             custom_llm_provider=custom_llm_provider,
-            deployment_model_info=routing_kwargs.get("model_info"),
+            kwargs=routing_kwargs,
             model_group=reasoning_model_group,
             drop_params=drop_unsupported_reasoning,
         )
@@ -6153,11 +6210,12 @@ def completion(
             "allowed_openai_params": allowed_openai_params,
             "base_model": base_model,
         }
-        provider_reasoning_effort: Final = reasoning_effort_with_summary_alias(
+        hosted_chat_policy: Final = hosted_policy and not bridges_to_responses_api
+        provider_reasoning_effort: Final = _completion_provider_reasoning(
             resolved_reasoning_effort,
             provider_params,
-            accepts_summary=provider_config is not None
-            and provider_config.accepts_reasoning_summary_in_reasoning_effort,
+            provider_config,
+            hosted_chat_policy=hosted_chat_policy,
         )
 
         mapping_args: Final = MappingProxyType({**optional_param_args, "reasoning_effort": provider_reasoning_effort})
@@ -6167,12 +6225,15 @@ def completion(
             deployment_info: Mapping[str, object] | None,
             reasoning_drop_logger: WarningLogger = verbose_logger,
         ) -> dict[str, object]:
-            return get_optional_params(
+            mapped: Final = get_optional_params(
                 **mapping_args,
                 model_info=deployment_info,
                 _litellm_reasoning_drop_logger=reasoning_drop_logger,
                 **mapping_special_params,
             )
+            if hosted_chat_policy and "reasoning_effort" not in mapped:
+                return {**mapped, "reasoning_effort": provider_reasoning_effort}
+            return mapped
 
         validated_model_info: Final = (
             _MODEL_INFO_ADAPTER.validate_python(model_info) if isinstance(model_info, dict) else None

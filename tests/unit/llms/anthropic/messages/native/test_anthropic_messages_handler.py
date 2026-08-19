@@ -3131,3 +3131,78 @@ async def test_a_v2_callback_between_pre_request_hooks_sees_the_first_rewrite(mo
     await _pre_request_hooks()
 
     assert journal == ["first", ("v2", [{"name": "rewritten"}]), "second"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(("effort", "disabled"), [(None, "reject"), ("none", "reject"), ("none", None)])
+async def test_hosted_vllm_messages_applies_policy_on_each_route(
+    native: bool, effort: str | None, disabled: str | None
+) -> None:
+    from litellm.llms.anthropic.messages.native import handler
+
+    sent: Final[list[object]] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == ("/v1/messages" if native else "/v1/chat/completions")
+        assert body["fixture_extension"] == "preserved"
+        sent.append(
+            (body["output_config"]["effort"] if effort is None else body["thinking"])
+            if native
+            else body["reasoning_effort"]
+        )
+        if native:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg-fixture",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "model": "fixture-model",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(upstream))
+    request: Final = {
+        "max_tokens": 100,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "model": "hosted_vllm/fixture-model",
+        "api_key": "synthetic",
+        "api_base": "https://fixture.invalid/v1",
+        "model_info": {
+            "supported_endpoints": ["/v1/messages"] if native else [],
+            "reasoning_effort": {"disabled": disabled},
+            "reasoning_effort_levels": ["low", "high", "max"],
+        },
+        "thinking": {"type": "disabled"} if effort is not None else None,
+        "drop_params": True,
+        "additional_drop_params": (
+            ["output_config", "output_config.effort", "thinking", "thinking.type"] if native else ["reasoning_effort"]
+        ),
+        "extra_body": {"fixture_extension": "preserved"},
+        "client": client,
+    }
+    async with client.client:
+        if effort is not None and disabled == "reject":
+            with pytest.raises(litellm.UnsupportedParamsError, match="always has reasoning enabled"):
+                await handler.anthropic_messages(**request)
+            return
+        response: Final = await handler.anthropic_messages(**request)
+
+    assert response["content"] == [{"type": "text", "text": "ok"}]
+    assert sent == ["high" if effort is None else {"type": "disabled"} if native else "none"]

@@ -54,6 +54,7 @@ from litellm.llms.base_llm.anthropic_messages.transformation import (
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+from litellm.llms.hosted_vllm.reasoning import reasoning_policy_drop_paths, resolve_hosted_vllm_reasoning_effort
 from litellm.responses.mcp.tool_precheck import may_name_litellm_mcp_gateway
 from litellm.types.llms.anthropic import AllAnthropicToolsValues
 from litellm.types.llms.anthropic_messages.anthropic_request import AnthropicMetadata
@@ -322,7 +323,10 @@ def _native_messages_config(
         OpenAILikeAnthropicMessagesConfig,
     )
 
-    return OpenAILikeAnthropicMessagesConfig(cache_control_ttl=_deployment_supports_cache_control_ttl(model_info))
+    return OpenAILikeAnthropicMessagesConfig(
+        cache_control_ttl=_deployment_supports_cache_control_ttl(model_info),
+        hosted_vllm=custom_llm_provider == LlmProviders.HOSTED_VLLM.value,
+    )
 
 
 async def _proxy_classifies(model: str, safeguards: object, native_config: BaseAnthropicMessagesConfig | None) -> bool:
@@ -844,8 +848,10 @@ def anthropic_messages_handler(
             **kwargs,
         )
 
-    anthropic_messages_provider_config: Final = _native_messages_config(
-        model, custom_llm_provider, kwargs.get("model_info"), api_base
+    anthropic_messages_provider_config: Final = (
+        None
+        if not is_async and custom_llm_provider == LlmProviders.HOSTED_VLLM.value
+        else _native_messages_config(model, custom_llm_provider, kwargs.get("model_info"), api_base)
     )
     thread: Final[object] = kwargs.get("thread")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # **kwargs of the handler is untyped
     if thread is not None and (
@@ -940,13 +946,53 @@ def anthropic_messages_handler(
     request_kwargs: Final = cast(dict[str, object], kwargs)  # cast-ok: **kwargs of the handler is untyped
     marked_tools: Final = tools_marked_for_cache_points(local_vars.get("tools"), request_kwargs)
     local_vars.update({**request_kwargs, **({"tools": marked_tools} if marked_tools is not None else {})})
+    hosted_output_config: Final = as_str_mapping(local_vars.get("output_config")) or {}
+    hosted_thinking: Final = as_str_mapping(thinking)
+    effort_alias: Final = request_kwargs.get("reasoning_effort")
+    effort_alias_fields: Final = as_str_mapping(effort_alias)
+    requested_effort: Final = (
+        "none"
+        if hosted_thinking is not None and hosted_thinking.get("type") == "disabled"
+        else hosted_output_config.get(
+            "effort", effort_alias_fields.get("effort") if effort_alias_fields is not None else effort_alias
+        )
+    )
+    hosted_reasoning: Final = resolve_hosted_vllm_reasoning_effort(
+        {**hosted_output_config, "effort": requested_effort},
+        model=model,
+        custom_llm_provider=custom_llm_provider,
+        deployment_model_info=request_kwargs.get("model_info"),
+        model_group=model_group_from_metadata(request_kwargs.get("litellm_metadata"), request_kwargs.get("metadata")),
+        drop_params=litellm.drop_params is True or litellm_params.get("drop_params") is True,
+        thinking=thinking,
+        extra_body=request_kwargs.get("extra_body"),
+    )
+    if hosted_reasoning is not None:
+        local_vars.pop("reasoning_effort", None)
+        output: Final = as_str_mapping(hosted_reasoning.value) or {}
+        if output.get("effort") == "none":
+            local_vars["thinking"] = {**(hosted_thinking or {}), "type": "disabled"}
+            local_vars["output_config"] = {key: value for key, value in output.items() if key != "effort"} or None
+        else:
+            local_vars["output_config"] = output
+    drop_paths: Final = additional_drop_paths(request_kwargs)
+    effective_drop_paths: Final = (
+        drop_paths
+        if hosted_reasoning is None
+        else tuple(
+            reasoning_policy_drop_paths(
+                drop_paths, "output_config", "output_config.effort", "thinking", "thinking.type"
+            )
+            or ()
+        )
+    )
     anthropic_messages_optional_request_params: Final = (
         AnthropicMessagesRequestUtils.get_requested_anthropic_messages_optional_param(
             params=local_vars,
             model=model,
             drop_params=litellm_params.get("drop_params") is True,
             custom_llm_provider=custom_llm_provider,
-            additional_drop_params=additional_drop_paths(request_kwargs),
+            additional_drop_params=effective_drop_paths,
         )
     )
     resolved_api_base: Final = (
@@ -967,7 +1013,9 @@ def anthropic_messages_handler(
         ),
         anthropic_messages_provider_config=anthropic_messages_provider_config,
         anthropic_messages_optional_request_params=dict(
-            _with_deployment_output_effort(
+            anthropic_messages_optional_request_params
+            if hosted_reasoning is not None
+            else _with_deployment_output_effort(
                 anthropic_messages_optional_request_params,
                 model=model,
                 custom_llm_provider=custom_llm_provider,
@@ -978,7 +1026,11 @@ def anthropic_messages_handler(
         _is_async=is_async,
         client=client,
         custom_llm_provider=custom_llm_provider,
-        litellm_params=litellm_params,
+        litellm_params=(
+            litellm_params
+            if hosted_reasoning is None
+            else litellm_params.model_copy(update={"additional_drop_params": effective_drop_paths})
+        ),
         logging_obj=litellm_logging_obj,
         api_key=api_key,
         api_base=resolved_api_base,
