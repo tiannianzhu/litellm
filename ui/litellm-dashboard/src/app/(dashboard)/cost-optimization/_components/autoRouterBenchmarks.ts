@@ -80,7 +80,7 @@ export const bucketRows = (cache: AutoRouterCacheStats): BucketRow[] => {
 
 export const expiredMissShare = (cache: AutoRouterCacheStats): number | null => {
   const total = bucketTurnsTotal(cache);
-  if (total <= 0) return null;
+  if (total <= 0 || cache.ttl_5m_turns + cache.ttl_1h_turns <= 0) return null;
   return (100 * cache.return_misses_expired) / total;
 };
 
