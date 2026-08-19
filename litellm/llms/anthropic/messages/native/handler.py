@@ -221,7 +221,11 @@ def _native_messages_config(
     native_config: Final = (
         provider_config if provider_config is not None and provider_config.serves_api_base(model, api_base) else None
     )
-    if native_config is not None or not _deployment_passes_through_anthropic_messages(model_info):
+    if (
+        native_config is not None
+        or custom_llm_provider == LlmProviders.HOSTED_VLLM.value
+        or not _deployment_passes_through_anthropic_messages(model_info)
+    ):
         return native_config
     from litellm.llms.openai_like.messages.transformation import (
         OpenAILikeAnthropicMessagesConfig,

@@ -135,6 +135,7 @@ from litellm.llms.bedrock.common_utils import (
 from litellm.llms.bedrock_mantle.chat.claude_transformation import bedrock_mantle_chat_config
 from litellm.llms.cohere.common_utils import CohereModelInfo
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler, http2_enabled
+from litellm.llms.hosted_vllm.reasoning import get_deployment_reasoning_effort_config
 from litellm.llms.openai.chat.gpt_reasoning_transformation import OpenAIGPT5Config
 from litellm.llms.openai.common_utils import get_openai_credentials
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
@@ -6019,6 +6020,7 @@ def completion(
             )
             else kwargs.get("allowed_openai_params")
         )
+        reasoning_effort_config: Final = get_deployment_reasoning_effort_config(custom_llm_provider, model_info)
         optional_param_args: Final = {
             "functions": functions,
             "function_call": function_call,
@@ -6052,6 +6054,7 @@ def completion(
             "messages": messages,
             "reasoning_effort": resolved_reasoning_effort,
             "verbosity": verbosity,
+            "reasoning_effort_config": reasoning_effort_config,
             "thinking": chat_reasoning.thinking,
             "web_search_options": web_search_options,
             "include_server_side_tool_invocations": (

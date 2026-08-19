@@ -17,9 +17,11 @@ import pytest
 import respx
 
 import litellm
+from litellm.exceptions import UnsupportedParamsError
 from litellm.llms.anthropic.messages.adapters.handler import (
     LiteLLMMessagesToCompletionTransformationHandler,
 )
+from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
 from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import VertexGeminiConfig
 from litellm.router import Router
 from litellm.utils import reasoning_effort_with_summary_alias
@@ -582,3 +584,72 @@ class TestADeclaredDeploymentRoundsTheMessagesTierOntoItsLevels:
 
         sent: Final = json.loads(route.calls.last.request.read())
         assert functools.reduce(lambda body, key: body[key], effort_path, sent) == "minimal"
+
+
+def _hosted_vllm_mapped_effort(model: str, provider: str | None, effort: str) -> object:
+    extra_kwargs: Final = {
+        key: value
+        for key, value in (
+            ("custom_llm_provider", provider),
+            (
+                "model_info",
+                {
+                    "reasoning_effort": {
+                        "disabled": "reject",
+                        "levels": {"max": ["xhigh", "max"], "low": ["minimal"]},
+                    }
+                },
+            ),
+            ("output_config", {"effort": effort}),
+        )
+        if value is not None
+    }
+    completion_kwargs, _ = LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+        max_tokens=1024,
+        messages=MESSAGES,
+        model=model,
+        metadata=None,
+        stop_sequences=None,
+        stream=False,
+        system=None,
+        temperature=None,
+        thinking={"type": "adaptive"},
+        tool_choice=None,
+        tools=None,
+        top_k=None,
+        top_p=None,
+        output_format=None,
+        extra_kwargs=extra_kwargs,
+    )
+
+    return HostedVLLMChatConfig().map_openai_params(
+        non_default_params={
+            "reasoning_effort": completion_kwargs["reasoning_effort"],
+            "reasoning_effort_config": extra_kwargs["model_info"]["reasoning_effort"],
+        },
+        optional_params={},
+        model=model,
+        drop_params=False,
+    )["reasoning_effort"]
+
+
+@pytest.mark.parametrize(
+    "model,provider",
+    [("hosted_vllm/fixture-model", None), ("fixture-model", "hosted_vllm")],
+)
+@pytest.mark.parametrize("effort,expected", [("max", "max"), ("xhigh", "max"), ("minimal", "low")])
+def test_hosted_vllm_model_info_effort_levels_reach_chat_mapper(
+    local_model_cost_map: None, model: str, provider: str | None, effort: str, expected: str
+) -> None:
+    assert _hosted_vllm_mapped_effort(model, provider, effort) == expected
+
+
+@pytest.mark.parametrize(
+    "model,provider",
+    [("hosted_vllm/fixture-model", None), ("fixture-model", "hosted_vllm")],
+)
+def test_hosted_vllm_rejects_disabling_reasoning_when_configured(
+    local_model_cost_map: None, model: str, provider: str | None
+) -> None:
+    with pytest.raises(UnsupportedParamsError):
+        _hosted_vllm_mapped_effort(model, provider, "none")
