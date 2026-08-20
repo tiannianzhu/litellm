@@ -10,6 +10,10 @@ from typing import Final
 
 from pydantic import TypeAdapter, ValidationError
 
+from litellm.litellm_core_utils.exception_mapping_utils import (
+    extract_error_dict,
+    extract_error_message_from_dict,
+)
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 
 from .exceptions import AnthropicErrorDetail, AnthropicErrorResponse, AnthropicErrorType
@@ -113,22 +117,6 @@ class AnthropicExceptionMapping:
         )
 
     @staticmethod
-    def _extract_message_from_dict(parsed: dict, raw_message: str) -> str:
-        """
-        Extract error message from a parsed provider-specific dict.
-
-        Handles:
-        - Bedrock: {"detail": {"message": "..."}}
-        - AWS: {"Message": "..."}
-        - Generic: {"message": "..."}
-        """
-        # Bedrock format
-        if "detail" in parsed and isinstance(parsed["detail"], dict):
-            return parsed["detail"].get("message", raw_message)
-        # AWS/generic format
-        return parsed.get("Message") or parsed.get("message") or raw_message
-
-    @staticmethod
     def transform_to_anthropic_error(
         status_code: int,
         raw_message: str,
@@ -152,9 +140,7 @@ class AnthropicExceptionMapping:
         Returns:
             AnthropicErrorResponse dict
         """
-        # Try to parse as JSON once
-        decoded: Final = _PARSED_ERROR_BODY.validate_python(safe_json_loads(raw_message))
-        parsed: Final[dict[str, object] | None] = decoded if isinstance(decoded, dict) else None
+        parsed: Final = extract_error_dict(raw_message)
 
         # If parsed and already in Anthropic format - passthrough
         if parsed is not None and AnthropicExceptionMapping._is_anthropic_error_dict(parsed):
@@ -165,7 +151,7 @@ class AnthropicExceptionMapping:
 
         # Extract message - use parsed dict if available, otherwise raw string
         if parsed is not None:
-            message = AnthropicExceptionMapping._extract_message_from_dict(parsed, raw_message)
+            message = extract_error_message_from_dict(parsed) or raw_message
         else:
             message = raw_message
 

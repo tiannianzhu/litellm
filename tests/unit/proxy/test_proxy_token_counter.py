@@ -6205,7 +6205,7 @@ async def test_messages_count_tokens_answers_400_for_a_thinking_budget_messages_
         "messages": [{"role": "user", "content": "Read the README"}],
         "thinking": {"type": "enabled", "budget_tokens": "lots"},
     }
-    with pytest.raises(BadRequestError) as rejected:
+    with pytest.raises(BadRequestError, match=r"thinking\.budget_tokens must be a number, got str"):
         _messages_inference_fields(AnthropicMessagesConfig(), "claude-opus-5-5", body, _COUNTED_OPTION_FIELDS)
 
     response, route = await _count_messages_body(
@@ -6218,7 +6218,10 @@ async def test_messages_count_tokens_answers_400_for_a_thinking_budget_messages_
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
-    assert rejected.value.message in json.loads(response.body)["error"]["message"]
+    error_body: Final = json.loads(response.body)
+    assert error_body["type"] == "error"
+    assert error_body["error"]["type"] == "invalid_request_error"
+    assert error_body["error"]["message"].startswith("thinking.budget_tokens must be a number, got str.")
     assert not route.called
 
 

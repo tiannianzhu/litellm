@@ -260,12 +260,13 @@ class TestAnthropicErrorSseFrame:
         }
 
 
+THREAD_NOT_FOUND_MESSAGE: Final = "No thread state was found for the requested `previous_message_id`."
 THREAD_NOT_FOUND_UPSTREAM: Final = json.dumps(
     {
         "type": "error",
         "error": {
             "type": "not_found_error",
-            "message": "No thread state was found for the requested `previous_message_id`.",
+            "message": THREAD_NOT_FOUND_MESSAGE,
             "details": {"error_code": "thread_not_found"},
         },
         "request_id": "req_upstream",
@@ -274,7 +275,7 @@ THREAD_NOT_FOUND_UPSTREAM: Final = json.dumps(
 
 
 class TestEmbeddedErrorDetails:
-    def test_a_wrapped_upstream_error_keeps_its_details_next_to_the_wrapped_message(self) -> None:
+    def test_a_wrapped_upstream_error_keeps_its_details_and_unwraps_the_message(self) -> None:
         wrapped: Final = (
             f"litellm.NotFoundError: AnthropicException - {THREAD_NOT_FOUND_UPSTREAM}\n\n"
             "LiteLLM: model group 'haiku' failed with the error above. No fallback was attempted."
@@ -282,7 +283,7 @@ class TestEmbeddedErrorDetails:
         response: Final = AnthropicExceptionMapping.transform_to_anthropic_error(status_code=404, raw_message=wrapped)
         assert response["error"]["details"] == {"error_code": "thread_not_found"}
         assert response["error"]["type"] == "not_found_error"
-        assert response["error"]["message"] == wrapped
+        assert response["error"]["message"] == THREAD_NOT_FOUND_MESSAGE
 
     def test_the_error_event_of_a_failed_stream_carries_the_same_details(self) -> None:
         wrapped: Final = f"litellm.NotFoundError: AnthropicException - {THREAD_NOT_FOUND_UPSTREAM}"

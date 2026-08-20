@@ -31,55 +31,132 @@ from litellm.types.guardrails import GuardrailEventHooks
 from litellm.types.utils import ModelResponseStream, TokenCountResponse
 
 
-class TestAnthropicEndpoints(unittest.TestCase):
-    @patch("litellm.litellm_core_utils.safe_json_dumps.safe_dumps")
+class TestAnthropicErrorResponses:
+    @pytest.mark.parametrize(
+        ("raw_message", "expected_message", "expected_type", "expected_status"),
+        (
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "internal_error",
+                            "message": "deepseek-v4-flash is not a multimodal model",
+                        },
+                    }
+                )
+                + ". Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+                "deepseek-v4-flash is not a multimodal model",
+                "internal_error",
+                400,
+            ),
+            (
+                "litellm.ContextWindowExceededError: "
+                + json.dumps(
+                    {
+                        "object": "error",
+                        "message": "This model's maximum context length is 131072 tokens",
+                        "type": "BadRequestError",
+                        "code": 400,
+                    }
+                )
+                + ". Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None"
+                + "\n\nLiteLLM: model group 'fixture' failed: No healthy deployment available",
+                "This model's maximum context length is 131072 tokens",
+                "invalid_request_error",
+                400,
+            ),
+            ("No healthy deployment available", "No healthy deployment available", "rate_limit_error", 429),
+        ),
+    )
     @pytest.mark.asyncio
-    async def test_async_data_generator_anthropic_dict_handling(self, mock_safe_dumps):
-        """Test async_data_generator_anthropic handles dictionary chunks properly"""
-        # Setup
-        mock_response = AsyncMock()
-        mock_response.__aiter__.return_value = [
+    async def test_normalizes_routed_provider_error(
+        self, raw_message: str, expected_message: str, expected_type: str, expected_status: int
+    ) -> None:
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        from litellm.proxy import proxy_server
+
+        exc = Exception()
+        exc.status_code = 400
+        exc.message = raw_message
+
+        with (
+            patch.object(  # test-quality-ok: request-body helper has no injection seam
+                ep, "read_request_body", new=AsyncMock(return_value={})
+            ),
+            patch.object(  # test-quality-ok: deterministic routed failure needs the processing seam
+                ep.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=AsyncMock(side_effect=exc),
+            ),
+            patch.object(  # test-quality-ok: route header setup has no injection seam
+                ep.ProxyBaseLLMRequestProcessing,
+                "get_custom_headers",
+                return_value={},
+            ),
+            patch.object(  # test-quality-ok: route logging uses a proxy module global with no injection seam
+                proxy_server, "proxy_logging_obj"
+            ) as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            request: Final = Request(
+                {
+                    "type": "http", "method": "POST", "path": "/v1/messages",
+                    "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+                }
+            )
+            response = await ep.anthropic_response(
+                fastapi_response=MagicMock(),
+                request=request,
+                user_api_key_dict=MagicMock(),
+            )
+
+        assert response.status_code == expected_status
+        assert json.loads(response.body) == {
+            "type": "error",
+            "error": {
+                "type": expected_type,
+                "message": expected_message,
+            },
+        }
+
+
+class TestAnthropicEndpoints(unittest.IsolatedAsyncioTestCase):
+    async def test_async_data_generator_anthropic_dict_handling(self):
+        from litellm.caching.caching import DualCache
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.utils import ProxyLogging
+
+        chunks: Final = (
             {"type": "message_start", "message": {"id": "msg_123"}},
             "text chunk data",
             {"type": "content_block_delta", "delta": {"text": "more data"}},
             "text chunk data again",
-        ]
-
-        mock_user_api_key_dict = MagicMock()
-        mock_request_data = {}
-        mock_proxy_logging_obj = MagicMock()
-        mock_proxy_logging_obj.async_post_call_streaming_hook = AsyncMock(
-            side_effect=lambda **kwargs: kwargs["response"]
         )
 
-        # Configure safe_dumps to return a properly formatted JSON string
-        mock_safe_dumps.side_effect = lambda chunk: json.dumps(chunk)
+        async def response() -> AsyncIterator[dict[str, object] | str]:
+            for chunk in chunks:
+                yield chunk
 
-        # Execute
-        result = [
+        result: Final = [
             chunk
             async for chunk in ProxyBaseLLMRequestProcessing.async_sse_data_generator(
-                response=mock_response,
-                user_api_key_dict=mock_user_api_key_dict,
-                request_data=mock_request_data,
-                proxy_logging_obj=mock_proxy_logging_obj,
+                response=response(),
+                user_api_key_dict=UserAPIKeyAuth(),
+                request_data={},
+                proxy_logging_obj=ProxyLogging(user_api_key_cache=DualCache()),
             )
         ]
 
-        # Verify
-        expected_result = [
-            'data: {"type": "message_start", "message": {"id": "msg_123"}}\n\n',
-            "text chunk data",
-            'data: {"type": "content_block_delta", "delta": {"text": "more data"}}\n\n',
-            "text chunk data again",
-        ]
-
-        self.assertEqual(result, expected_result)
-
-        # Assert safe_dumps was called for dictionary objects
-        mock_safe_dumps.assert_any_call({"type": "message_start", "message": {"id": "msg_123"}})
-        mock_safe_dumps.assert_any_call({"type": "content_block_delta", "delta": {"text": "more data"}})
-        assert mock_safe_dumps.call_count == 2  # Called twice, once for each dict object
+        self.assertEqual(
+            result,
+            [
+                'data: {"type": "message_start", "message": {"id": "msg_123"}}\n\n',
+                "text chunk data",
+                'data: {"type": "content_block_delta", "delta": {"text": "more data"}}\n\n',
+                "text chunk data again",
+            ],
+        )
 
 
 _BLOCK_CALL_ID: Final = "messages-block"
@@ -369,6 +446,211 @@ class TestAnthropicResponseReportsWhatAFailedAgenticFollowUpBills:
 
 
 class TestProxyExceptionAnthropicEnvelope:
+    @pytest.mark.parametrize(
+        ("redaction_enabled", "expected_message"),
+        (
+            (True, "upstream timed out at REDACTED"),
+            (False, "upstream timed out at db-primary.internal"),
+        ),
+    )
+    def test_messages_preserves_native_error_and_cleans_the_message(
+        self, redaction_enabled: bool, expected_message: str
+    ) -> None:
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.anthropic_endpoints.endpoints import anthropic_error_json_response
+
+        source: Final = {
+            "type": "error",
+            "error": {
+                "type": "timeout_error",
+                "message": (
+                    "Timeout Error: Hosted_vllmException - upstream timed out at db-primary.internal"
+                    "\n\nDeployment Info: internal routing details"
+                ),
+            },
+            "request_id": "provider-request",
+        }
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": [(b"x-request-id", b"caller-request")],
+            }
+        )
+        exc: Final = ProxyException(
+            message=f"{json.dumps(source)}. Received Model Group=fixture",
+            type="internal_server_error",
+            param=None,
+            code=500,
+            headers={"x-litellm-call-id": "call-8302", "x-provider-test": "retained"},
+            provider_specific_fields={"guardrail": "keyword-block"},
+        )
+        with (
+            patch("litellm._logging._ENABLE_SECRET_REDACTION", redaction_enabled),
+            patch("litellm.proxy.proxy_server.general_settings", {"include_call_id_in_error_body": True}),
+        ):
+            response: Final = anthropic_error_json_response(exc, request)
+
+        assert response.status_code == 500
+        assert response.headers["x-litellm-call-id"] == "call-8302"
+        assert response.headers["x-provider-test"] == "retained"
+        assert json.loads(response.body) == {
+            "type": "error",
+            "error": {
+                "type": "timeout_error",
+                "message": expected_message,
+                "provider_specific_fields": {"guardrail": "keyword-block"},
+                "litellm_call_id": "call-8302",
+            },
+            "request_id": "provider-request",
+        }
+
+    def test_messages_native_error_uses_caller_request_id_when_provider_omits_it(self) -> None:
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.anthropic_endpoints.endpoints import anthropic_error_json_response
+
+        source: Final = {
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "service busy"},
+        }
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": [(b"x-request-id", b"caller-request")],
+            }
+        )
+        response: Final = anthropic_error_json_response(
+            ProxyException(message=json.dumps(source), type="server_error", param=None, code=500), request
+        )
+
+        assert response.status_code == 500
+        assert json.loads(response.body) == {**source, "request_id": "caller-request"}
+
+    def test_messages_error_does_not_restore_a_replaced_cause(self) -> None:
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.anthropic_endpoints.endpoints import anthropic_error_json_response
+
+        original: Final = Exception(
+            json.dumps({
+                "type": "error",
+                "error": {"type": "timeout_error", "message": "provider timed out"},
+                "request_id": "provider-request",
+            })
+        )
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": [(b"x-request-id", b"caller-request")],
+            }
+        )
+        with pytest.raises(ProxyException) as caught:
+            raise ProxyException(message="policy rejected the call", type="server_error", param=None, code=500) from original
+
+        response: Final = anthropic_error_json_response(caught.value, request)
+
+        assert response.status_code == 500
+        assert json.loads(response.body) == {
+            "type": "error",
+            "error": {"type": "api_error", "message": "policy rejected the call"},
+            "request_id": "caller-request",
+        }
+
+    def test_messages_error_uses_the_http_status_error_response_body(self) -> None:
+        from litellm.proxy.common_utils.openai_error_payload import anthropic_client_error_body
+
+        source: Final = {
+            "type": "error",
+            "error": {"type": "timeout_error", "message": "provider timed out at db-primary.internal"},
+            "request_id": "provider-request",
+        }
+        request: Final = httpx.Request("POST", "https://provider.test/v1/messages")
+        upstream: Final = httpx.Response(500, request=request, json=source)
+        exc: Final = httpx.HTTPStatusError("provider request failed", request=request, response=upstream)
+
+        with patch("litellm._logging._ENABLE_SECRET_REDACTION", True):
+            body: Final = anthropic_client_error_body(exc, request_id="caller-request")
+
+        assert body == {
+            "type": "error",
+            "error": {"type": "timeout_error", "message": "provider timed out at REDACTED"},
+            "request_id": "provider-request",
+        }
+
+    def test_messages_error_does_not_read_an_unconsumed_http_status_error_response(self) -> None:
+        from litellm.proxy.common_utils.openai_error_payload import anthropic_client_error_body
+
+        request: Final = httpx.Request("POST", "https://provider.test/v1/messages")
+        upstream: Final = httpx.Response(500, request=request, stream=httpx.ByteStream(b"unread response"))
+        exc: Final = httpx.HTTPStatusError("provider request failed", request=request, response=upstream)
+
+        body: Final = anthropic_client_error_body(exc, request_id="caller-request")
+
+        assert body == {
+            "type": "error",
+            "error": {"type": "api_error", "message": "provider request failed"},
+            "request_id": "caller-request",
+        }
+        assert upstream.is_stream_consumed is False
+
+    def test_messages_route_keeps_the_provider_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fastapi import FastAPI
+
+        import litellm.proxy.proxy_server as proxy_server
+        from litellm.llms.custom_httpx import llm_http_handler
+        from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+        from litellm.proxy.anthropic_endpoints.endpoints import router
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+        from litellm.proxy.utils import ProxyLogging
+
+        source: Final = {
+            "type": "error",
+            "error": {"type": "timeout_error", "message": "provider timed out at db-primary.internal"},
+            "request_id": "provider-request",
+        }
+
+        def peer(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, request=request, json=source)
+
+        monkeypatch.setattr(
+            proxy_server,
+            "llm_router",
+            Router(
+                model_list=[
+                    {
+                        "model_name": "fixture-model",
+                        "litellm_params": {
+                            "model": "anthropic/fixture-model",
+                            "api_key": "test-key",
+                            "api_base": "https://provider.test",
+                        },
+                    }
+                ],
+                num_retries=0,
+            ),
+        )
+        monkeypatch.setattr(proxy_server, "proxy_logging_obj", ProxyLogging(user_api_key_cache=DualCache()))
+        monkeypatch.setattr(proxy_server, "general_settings", {})
+        monkeypatch.setattr("litellm._logging._ENABLE_SECRET_REDACTION", True)
+        monkeypatch.setattr(
+            llm_http_handler,
+            "get_async_httpx_client",
+            lambda *args, **kwargs: AsyncHTTPHandler(transport=httpx.MockTransport(peer)),
+        )
+        app: Final = FastAPI()
+        app.include_router(router)
+        app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth()
+        response: Final = TestClient(app).post(
+            "/v1/messages",
+            json={"model": "fixture-model", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 5},
+            headers={"x-request-id": "caller-request"},
+        )
+
+        assert response.status_code == 500, response.text
+        assert response.json() == {
+            "type": "error",
+            "error": {"type": "timeout_error", "message": "provider timed out at REDACTED"},
+            "request_id": "provider-request",
+        }
+
     @pytest.mark.asyncio
     async def test_anthropic_response_maps_proxy_exception_to_anthropic_envelope(self):
         """LIT-6468: a 400 ProxyException from request validation must surface as
@@ -384,8 +666,12 @@ class TestProxyExceptionAnthropicEnvelope:
             param="metadata",
             code=400,
         )
-        request = MagicMock()
-        request.headers = {"x-request-id": "req_test_6468"}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {"x-request-id": "req_test_6468"}.items()),
+            }
+        )
 
         with (
             patch.object(ep, "read_request_body", new=AsyncMock(return_value={})),
@@ -422,17 +708,21 @@ class TestProxyExceptionAnthropicEnvelope:
         import litellm.proxy.anthropic_endpoints.endpoints as ep
         from litellm.proxy._types import ProxyException
 
-        request: Final = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
-        response = ep._anthropic_error_json_response(
+        response = ep.anthropic_error_json_response(
             ProxyException(message="Rate limit exceeded", type="rate_limit_error", param=None, code=429),
             request,
         )
         assert response.status_code == 429
         assert json.loads(response.body)["error"]["type"] == "rate_limit_error"
 
-        fallback = ep._anthropic_error_json_response(
+        fallback = ep.anthropic_error_json_response(
             ProxyException(message="boom", type="None", param=None, code=None),
             request,
         )
@@ -586,8 +876,12 @@ class TestProxyExceptionAnthropicEnvelope:
         import litellm.proxy.anthropic_endpoints.endpoints as ep
         from litellm.proxy._types import ProxyException
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
         exc = ProxyException(
             message="Rate limit exceeded",
             type="rate_limit_error",
@@ -597,7 +891,7 @@ class TestProxyExceptionAnthropicEnvelope:
             provider_specific_fields=provider_specific_fields,
         )
         with patch("litellm.proxy.proxy_server.general_settings", general_settings):
-            return ep._anthropic_error_json_response(exc, request)
+            return ep.anthropic_error_json_response(exc, request)
 
     def test_anthropic_error_copies_the_call_id_into_the_error_when_opted_in(self):
         """With include_call_id_in_error_body on, error.litellm_call_id is byte-identical to
@@ -657,8 +951,12 @@ class TestHttpExceptionDictDetail:
             "guardrail": "keyword-block",
         }
         exc = HTTPException(status_code=400, detail=detail)
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(
@@ -707,8 +1005,12 @@ class TestFailureHookRequestData:
             captured["processor_data"] = self.data
             raise RuntimeError("provider timeout")
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(ep, "read_request_body", new=AsyncMock(return_value={"model": "claude-sonnet"})),
@@ -758,8 +1060,12 @@ class TestErrorLogCarriesCallId:
             self.data = {**self.data, "litellm_call_id": call_id}
             raise RuntimeError("provider timeout")
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(
@@ -797,8 +1103,12 @@ class TestErrorLogCarriesCallId:
             self.data = {**self.data, "litellm_call_id": call_id}
             raise ProxyException(message="budget exceeded", type=ProxyErrorTypes.budget_exceeded, param="key", code=402)
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(
@@ -828,8 +1138,12 @@ class TestErrorLogCarriesCallId:
         from litellm.proxy._types import UserAPIKeyAuth
 
         call_id = "count-tokens-call-7836"
-        request = MagicMock()
-        request.headers = {"x-litellm-call-id": call_id}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages/count_tokens",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {"x-litellm-call-id": call_id}.items()),
+            }
+        )
 
         with (
             patch.object(  # test-quality-ok: endpoint reads the body via a module function; no injection seam
@@ -930,8 +1244,9 @@ async def test_count_tokens_answers_400_for_malformed_tools_without_counting(mod
     import litellm.proxy.proxy_server as proxy_server
     from litellm.proxy._types import UserAPIKeyAuth
 
-    request: Final = MagicMock()
-    request.headers = {}
+    request: Final = Request(
+        {"type": "http", "method": "POST", "path": "/v1/messages/count_tokens", "headers": []}
+    )
     counter: Final = AsyncMock()
     body: Final = {"model": model, "messages": [{"role": "user", "content": "hi"}], "tools": tools}
 
@@ -1480,3 +1795,26 @@ class TestStripTotalTokensFeatureFlag(unittest.TestCase):
         import litellm
 
         assert litellm.strip_anthropic_total_tokens is False
+
+
+def test_count_tokens_keeps_the_source_error_type_and_provider_request_id() -> None:
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.anthropic_endpoints.endpoints import anthropic_error_json_response
+
+    source: Final = {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "count service busy"},
+        "request_id": "provider-count-request",
+    }
+    request: Final = Request(
+        {
+            "type": "http", "method": "POST", "path": "/v1/messages/count_tokens",
+            "headers": [(b"x-request-id", b"caller-request")],
+        }
+    )
+    response: Final = anthropic_error_json_response(
+        ProxyException(message=json.dumps(source), type="server_error", param=None, code=500), request
+    )
+
+    assert response.status_code == 500
+    assert json.loads(response.body) == source

@@ -11,7 +11,6 @@ Pins covered:
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 from typing import Final
 from unittest.mock import MagicMock
 
@@ -36,11 +35,187 @@ from litellm.proxy.proxy_server import (
 from .conftest import normalize
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+@pytest.mark.parametrize("include_call_id", (False, True))
+async def test_local_http_error_preserves_structured_message_headers_and_body_call_id(
+    monkeypatch: pytest.MonkeyPatch, path: str, include_call_id: bool
+) -> None:
+    from fastapi import FastAPI
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from litellm.proxy import proxy_server
+
+    message: Final = "This credential is no longer valid for the requested service."
+    headers: Final = {"x-litellm-call-id": "call-fixture", "retry-after": "Sat, 03 Oct 2026 09:00:00 GMT"}
+    app: Final = FastAPI()
+    app.add_exception_handler(StarletteHTTPException, proxy_server.otlp_http_exception_handler)
+    monkeypatch.setattr(proxy_server, "general_settings", {"include_call_id_in_error_body": include_call_id})
+
+    async def endpoint() -> None:
+        raise HTTPException(status_code=401, detail={"error": {"message": message}}, headers=headers)
+
+    app.add_api_route(path, endpoint, methods=["POST"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+        response: Final = await client.post(path, headers={"x-request-id": "request-fixture"})
+    detail: Final = response.json()["error"]
+    assert response.status_code == 401
+    assert detail["message"] == message
+    assert detail["type"] == "authentication_error"
+    assert ("litellm_call_id" in detail) is include_call_id
+    if include_call_id:
+        assert detail["litellm_call_id"] == response.headers["x-litellm-call-id"]
+    for key, value in headers.items():
+        assert response.headers[key] == value
+    if path.endswith("messages"):
+        assert response.json()["type"] == "error"
+        assert response.json()["request_id"] == "request-fixture"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+@pytest.mark.parametrize("source", ("body", "detail", "httpx"))
+async def test_upstream_message_is_unwrapped_without_changing_status_or_credentials(
+    monkeypatch: pytest.MonkeyPatch, path: str, source: str
+) -> None:
+    from fastapi import FastAPI, Response
+    from openai import AuthenticationError
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.utils import ProxyLogging
+
+    readable: Final = "The upstream credential has expired."
+    secret: Final = "sk-" + "controlledsecret" * 3
+    body: Final = {"error": {"message": f"{readable} api_key={secret}"}}
+    error: Final = (
+        AuthenticationError(
+            message="gateway wrapper",
+            response=httpx.Response(401, request=httpx.Request("POST", "https://fixture.invalid/v1")),
+            body=body,
+        )
+        if source == "body"
+        else HTTPException(status_code=401, detail=json.dumps(body))
+        if source == "detail"
+        else httpx.HTTPStatusError(
+            "gateway status line",
+            request=httpx.Request("POST", "https://fixture.invalid/v1"),
+            response=httpx.Response(401, json=body),
+        )
+    )
+    app: Final = FastAPI()
+    app.add_exception_handler(ProxyException, openai_exception_handler)
+    app.add_exception_handler(HTTPException, proxy_server.otlp_http_exception_handler)
+    logging_obj: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+
+    async def endpoint(request: Request) -> Response:
+        processor: Final = ProxyBaseLLMRequestProcessing(
+            data={
+                "model": "fixture",
+                "litellm_call_id": "call-fixture",
+                "proxy_server_request": {"url": str(request.url), "method": "POST"},
+            }
+        )
+        await processor._handle_llm_api_exception(error, UserAPIKeyAuth(), logging_obj)
+        return Response()
+
+    app.add_api_route(path, endpoint, methods=["POST"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+        response: Final = await client.post(path)
+    assert response.status_code == 401
+    assert response.json()["error"]["message"].startswith(readable)
+    assert secret not in response.text
+    assert "gateway" not in response.json()["error"]["message"]
+    assert response.headers["x-litellm-call-id"] == "call-fixture"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+@pytest.mark.parametrize("failure_kind", ("output_limit", "context", "unsupported", "attribute"))
+async def test_typed_request_failure_preserves_original_message_through_handler(
+    monkeypatch: pytest.MonkeyPatch, path: str, failure_kind: str
+) -> None:
+    from fastapi import FastAPI, Response
+
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.utils import ProxyLogging
+
+    requested: Final = 23
+    limit: Final = 17
+    error: Final = (
+        litellm.ContextWindowExceededError(
+            message="Input exceeds this model context window.", model="fixture", llm_provider="fixture"
+        )
+        if failure_kind == "context"
+        else litellm.UnsupportedParamsError(message="This model always has reasoning enabled and cannot be disabled.")
+        if failure_kind == "unsupported"
+        else litellm.BadRequestError(
+            message="The supplied request value is not a JSON object.", model="fixture", llm_provider=""
+        )
+        if failure_kind == "attribute"
+        else litellm.BadRequestError(
+            message=f"max_output_tokens={requested} exceeds the configured output token limit of {limit}",
+            model="fixture",
+            llm_provider="",
+        )
+    )
+    app: Final = FastAPI()
+    app.add_exception_handler(ProxyException, openai_exception_handler)
+    logging_obj: Final = ProxyLogging(user_api_key_cache=UserApiKeyCache())
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+
+    async def endpoint(request: Request) -> Response:
+        processor: Final = ProxyBaseLLMRequestProcessing(
+            data={
+                "model": "fixture",
+                "litellm_call_id": "call-fixture",
+                "proxy_server_request": {"url": str(request.url), "method": "POST"},
+            }
+        )
+        try:
+            raise error from AttributeError("Invalid object access") if failure_kind == "attribute" else None
+        except Exception as source:
+            await processor._handle_llm_api_exception(source, UserAPIKeyAuth(api_key="sk-fixture"), logging_obj)
+        return Response()
+
+    app.add_api_route(path, endpoint, methods=["POST"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+        response: Final = await client.post(path)
+    detail: Final = response.json()["error"]
+    assert response.status_code == 400
+    assert response.headers["x-litellm-call-id"] == "call-fixture"
+    assert detail["type"] == "invalid_request_error"
+    if failure_kind == "context":
+        assert detail["message"] == "Input exceeds this model context window."
+        if not path.endswith("messages"):
+            assert detail["code"] == "context_length_exceeded"
+    elif failure_kind == "unsupported":
+        assert detail["message"] == "This model always has reasoning enabled and cannot be disabled."
+    elif failure_kind == "attribute":
+        assert detail["message"] == "Invalid request format: The supplied request value is not a JSON object."
+    else:
+        assert f"max_output_tokens={requested}" in detail["message"]
+        assert f"limit of {limit}" in detail["message"]
+    assert "litellm." not in detail["message"]
+
+
 def _make_request(parent_otel_span=None, path="/chat/completions", headers=()):
-    return Request({
-        "type": "http", "method": "POST", "path": path, "headers": list(headers),
-        "state": {"parent_otel_span": parent_otel_span},
-    })
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": path,
+            "headers": list(headers),
+            "state": {"parent_otel_span": parent_otel_span},
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +415,7 @@ async def test_openai_exception_handler_maps_messages_failures_to_anthropic_erro
 async def test_openai_exception_handler_keeps_the_status_of_a_budget_failure_on_messages() -> None:
     exc: Final = ProxyException(message="Budget exceeded", type="budget_exceeded", param=None, code=422)
 
-    response: Final = await openai_exception_handler(
-        request=_make_request(path="/v1/messages/count_tokens"), exc=exc
-    )
+    response: Final = await openai_exception_handler(request=_make_request(path="/v1/messages/count_tokens"), exc=exc)
     body: Final = json.loads(response.body)
 
     assert response.status_code == 422
@@ -594,17 +767,27 @@ async def test_otel_request_validation_exception_handler_leaves_other_routes_on_
 
 
 @pytest.mark.asyncio
-async def test_otel_unhandled_exception_handler_returns_500_generic_payload():
-    exc = RuntimeError("kaboom")
-    request = _make_request()
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+async def test_otel_unhandled_exception_handler_hides_internal_details(path: str) -> None:
+    exc: Final = RuntimeError(
+        "database query failed: SELECT private_note FROM users WHERE email=fixture@example.invalid"
+    )
+    request: Final = _make_request(path=path)
 
-    response = await otel_unhandled_exception_handler(request=request, exc=exc)
-    body = json.loads(response.body)
+    response: Final = await otel_unhandled_exception_handler(request=request, exc=exc)
+    body: Final = json.loads(response.body)
 
     assert response.status_code == 500
+    assert str(exc) not in response.body.decode()
+    if path.endswith("messages"):
+        assert body["type"] == "error"
+        assert body["error"] == {"message": "Internal server error", "type": "api_error"}
+        return
     assert normalize(body) == {
         "error": {
             "message": "Internal server error",
+            "code": "500",
+            "param": None,
             "type": "internal_server_error",
         }
     }
@@ -680,21 +863,31 @@ async def test_otel_unhandled_exception_handler_reraises_http_exception_invalid(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("media_type", ["application/json", "application/x-protobuf"])
 @pytest.mark.parametrize("root_path", ["", "/tenant-a"])
-@pytest.mark.parametrize("error", [
-    ProxyException("database credentials: secret", "auth_error", None, 401),
-    HTTPException(403, "database credentials: secret"),
-])
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProxyException("database credentials: secret", "auth_error", None, 401),
+        HTTPException(403, "database credentials: secret"),
+    ],
+)
 async def test_otlp_auth_errors_hide_internal_details(
-    media_type: str, root_path: str, error: ProxyException | HTTPException,
+    media_type: str,
+    root_path: str,
+    error: ProxyException | HTTPException,
 ) -> None:
     from google.rpc.status_pb2 import Status
 
     from litellm.proxy.proxy_server import otlp_http_exception_handler
 
-    request: Final = Request({
-        "type": "http", "method": "POST", "path": root_path + "/v1/traces", "root_path": root_path,
-        "headers": [(b"content-type", media_type.encode())],
-    })
+    request: Final = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": root_path + "/v1/traces",
+            "root_path": root_path,
+            "headers": [(b"content-type", media_type.encode())],
+        }
+    )
     response: Final = (
         await openai_exception_handler(request, error)
         if isinstance(error, ProxyException)

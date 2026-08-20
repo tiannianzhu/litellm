@@ -19,7 +19,11 @@ from litellm.anthropic_interface.exceptions import (
 from litellm.proxy._types import ProxyException
 from litellm.proxy.auth.auth_utils import get_request_route
 from litellm.proxy.common_utils.error_body_call_id import error_body_call_id
-from litellm.proxy.common_utils.openai_error_payload import LITELLM_CALL_ID_HEADER, openai_error_type_for_status
+from litellm.proxy.common_utils.openai_error_payload import (
+    LITELLM_CALL_ID_HEADER,
+    client_error_message,
+    openai_error_type_for_status,
+)
 
 ANTHROPIC_MESSAGES_ROUTES: Final[frozenset[str]] = frozenset(
     {
@@ -111,7 +115,10 @@ def _anthropic_content(
     body_call_id: Final = error_body_call_id(general_settings, exc.headers.get(LITELLM_CALL_ID_HEADER))
     content: Final[AnthropicErrorResponse] = {
         **envelope,
-        "error": _with_call_id(_with_provider_specific_fields(exc, envelope["error"]), body_call_id),
+        "error": _with_call_id(
+            _with_provider_specific_fields(exc, {**envelope["error"], "message": client_error_message(exc)}),
+            body_call_id,
+        ),
     }
     return content
 

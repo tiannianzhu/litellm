@@ -43,9 +43,59 @@ from tests._support.clock_loops import AutojumpClockLoop
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "path,field",
+    (("/v1/chat/completions", "max_tokens"), ("/v1/responses", "max_output_tokens"), ("/v1/messages", "max_tokens")),
+)
+async def test_configured_output_token_limits_are_actionable_through_the_real_router(monkeypatch, path, field):
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    limit: Final = 13
+    requested: Final = 19
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "fixture-public",
+                "litellm_params": {
+                    "model": "openai/fixture-backend",
+                    "api_base": "https://fixture.invalid/v1",
+                    "api_key": "fixture-key",
+                },
+                "model_info": {"max_output_tokens": limit},
+            }
+        ],
+        num_retries=0,
+    )
+    monkeypatch.setattr(ps, "llm_router", router)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setitem(app.dependency_overrides, user_api_key_auth, _auth_override)
+    body: Final = {
+        "model": "fixture-public",
+        field: requested,
+        **({"input": "hello"} if path.endswith("responses") else {"messages": [{"role": "user", "content": "hello"}]}),
+    }
+    with respx.mock as transport:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+            response: Final = await client.post(path, json=body)
+        assert not transport.calls
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert f"{field}={requested}" in response.json()["error"]["message"]
+    assert str(limit) in response.json()["error"]["message"]
+    assert response.json()["error"]["message"] == (
+        f"{field}={requested} exceeds the configured output token limit of {limit}"
+    )
+    assert "fixture-backend" not in response.text
+    assert "deployment" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "path,error_kind",
     [
         ("/v1/responses", "rate_limit"),
+        ("/v1/responses", "insufficient_quota"),
+        ("/v1/responses", "invalid_prompt"),
         ("/v1/responses", "numeric_rate_limit"),
         ("/v1/responses", "server_error"),
         ("/v1/responses", "response_failed"),
@@ -57,7 +107,10 @@ from tests._support.clock_loops import AutojumpClockLoop
 async def test_streaming_upstream_errors_keep_the_client_protocol(
     monkeypatch: pytest.MonkeyPatch,
     path: str,
-    error_kind: Literal["rate_limit", "numeric_rate_limit", "server_error", "response_failed", "cyber_policy"],
+    error_kind: Literal[
+        "rate_limit", "insufficient_quota", "invalid_prompt", "numeric_rate_limit", "server_error",
+        "response_failed", "cyber_policy",
+    ],
 ) -> None:
     import litellm.proxy.proxy_server as ps
     from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -67,6 +120,8 @@ async def test_streaming_upstream_errors_keep_the_client_protocol(
     code: Final = {
         "rate_limit": "rate_limit_exceeded",
         "numeric_rate_limit": "429",
+        "insufficient_quota": "insufficient_quota",
+        "invalid_prompt": "invalid_prompt",
         "server_error": "server_error",
         "response_failed": "server_error",
         "cyber_policy": "cyber_policy",
@@ -154,6 +209,13 @@ async def test_streaming_upstream_errors_keep_the_client_protocol(
         if "data: [DONE]" not in frame
     )
 
+    if not partial:
+        assert result.status_code == (
+            429 if error_kind in ("rate_limit", "insufficient_quota") else 400 if error_kind == "invalid_prompt" else 500
+        ), result.text
+        assert result.json()["error"]["message"] == message
+        assert result.json()["error"]["code"] == code
+        return
     assert result.status_code == 200, result.text
     assert message in result.text
     if path == "/v1/responses":
@@ -631,6 +693,7 @@ async def test_responses_stream_error_protocol_and_failure_cleanup(monkeypatch, 
         return_value=HTTPException(status_code=400, detail="sanitized rejection") if sanitize else None
     )
     logging.post_call_response_headers_hook = AsyncMock(return_value={"x-fixture-audit": "kept"})
+    logging.arelease_max_parallel_requests = AsyncMock()
     logging._arelease_max_parallel_requests_on_disconnect = AsyncMock()
     monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging)
     monkeypatch.setattr(proxy_server, "llm_router", None)
@@ -687,10 +750,7 @@ async def test_responses_stream_error_protocol_and_failure_cleanup(monkeypatch, 
     if phase in ("before_chunk", "after_chunk"):
         assert closed.is_set()
     if not context_error or sanitize:
-        # Upstream's ResponsesStreamErrorState terminal-frames any failure raised inside the
-        # streaming generator as response.failed; failures before/around it (headers, keepalive)
-        # stay on the plain error payload.
-        in_generator = phase in ("before_chunk", "after_chunk")
+        in_generator = phase in ("before_chunk", "after_chunk", "after_ping")
         assert ("response.failed" in response.text) is in_generator
         assert response.status_code == (400 if phase == "before_headers" else 200)
         if sanitize:
@@ -713,6 +773,56 @@ async def test_responses_stream_error_protocol_and_failure_cleanup(monkeypatch, 
     if phase == "before_headers":
         assert response.headers["x-litellm-call-id"] == "fixture-call"
         assert response.headers["x-fixture-audit"] == "kept"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ("completed", "failed", "incomplete"))
+async def test_responses_context_failure_after_a_sent_terminal_does_not_send_another(
+    monkeypatch: pytest.MonkeyPatch, terminal_status: Literal["completed", "failed", "incomplete"]
+) -> None:
+    from collections.abc import AsyncGenerator
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy.common_utils.responses_stream_errors import ResponsesStreamErrorState, frame_payloads
+    from litellm.types.llms.openai import ResponseCompletedEvent, ResponseFailedEvent, ResponseIncompleteEvent
+
+    logging: Final = MagicMock()
+    logging.needs_iterator_wrap.return_value = False
+    logging.needs_per_chunk_streaming_hook.return_value = False
+    logging.post_call_failure_hook = AsyncMock(return_value=None)
+    logging.arelease_max_parallel_requests = AsyncMock()
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging)
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(litellm, "sse_keepalive_ping_interval_seconds", 0)
+    error: Final = litellm.ContextWindowExceededError(message="late failure", model="fixture", llm_provider="fixture")
+    response: Final = ResponsesAPIResponse(
+        id="resp_terminal", object="response", created_at=123, model="fixture", output=[], status=terminal_status,
+    )
+    event_class: Final = {
+        "completed": ResponseCompletedEvent, "failed": ResponseFailedEvent, "incomplete": ResponseIncompleteEvent,
+    }[terminal_status]
+    terminal: Final = event_class.model_validate({
+        "type": f"response.{terminal_status}", "sequence_number": 7, "response": response,
+    })
+
+    async def upstream() -> AsyncGenerator[object, None]:
+        yield terminal
+        raise error
+
+    frames: Final = [
+        frame async for frame in proxy_server.async_data_generator(
+            upstream(), UserAPIKeyAuth(api_key="sk-fixture"), {},
+            responses_stream_errors=True, responses_error=ResponsesStreamErrorState("fixture"),
+        )
+    ]
+    payloads, _ = frame_payloads(
+        "".join(frame.decode("utf-8") if isinstance(frame, bytes) else frame for frame in frames)
+    )
+    events: Final = tuple(json.loads(payload) for payload in payloads)
+    assert [event["type"] for event in events] == [f"response.{terminal_status}"]
+    assert events[0]["response"]["id"] == response.id
+    logging.post_call_failure_hook.assert_awaited_once()
+    assert logging.post_call_failure_hook.await_args.kwargs["original_exception"] is error
 
 
 @pytest.mark.asyncio
@@ -754,7 +864,6 @@ async def test_responses_nonstream_context_error_keeps_http_400(monkeypatch):
     ),
 )
 async def test_responses_api_returns_inner_provider_error_message(raw_message, expected_message):
-    from litellm.proxy import proxy_server
     from litellm.proxy._types import ProxyException, UserAPIKeyAuth
     from litellm.proxy.response_api_endpoints import endpoints
 
@@ -766,9 +875,6 @@ async def test_responses_api_returns_inner_provider_error_message(raw_message, e
     )
 
     with (
-        patch.object(  # test-quality-ok: request-body helper has no injection seam
-            proxy_server, "_read_request_body", new=AsyncMock(return_value={"model": "test-model"})
-        ),
         patch(  # test-quality-ok: polling decision has no injection seam
             "litellm.proxy.response_polling.polling_handler.should_use_polling_for_request",
             return_value=False,
@@ -776,17 +882,12 @@ async def test_responses_api_returns_inner_provider_error_message(raw_message, e
         patch.object(  # test-quality-ok: deterministic routed failure needs the processing seam
             endpoints.ProxyBaseLLMRequestProcessing,
             "base_process_llm_request",
-            new=AsyncMock(side_effect=Exception("upstream error")),
-        ),
-        patch.object(  # test-quality-ok: error normalization requires the internal exception seam
-            endpoints.ProxyBaseLLMRequestProcessing,
-            "_handle_llm_api_exception",
             new=AsyncMock(side_effect=routed_error),
         ),
         pytest.raises(ProxyException) as exc_info,
     ):
         await endpoints.responses_api(
-            request=MagicMock(),
+            request=_request_for("POST", "/v1/responses", b'{"model":"test-model"}'),
             fastapi_response=MagicMock(),
             user_api_key_dict=UserAPIKeyAuth(api_key="sk-test"),
         )

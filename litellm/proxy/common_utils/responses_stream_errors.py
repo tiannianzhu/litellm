@@ -10,22 +10,20 @@ from itertools import accumulate, chain, groupby, islice, repeat, takewhile
 from types import MappingProxyType
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 from typing_extensions import TypeIs  # noqa: TID251  # the guards narrow hook values to object items, isinstance cannot
 
-from litellm._logging import redact_internal_details_from_client_message
 from litellm._uuid import uuid
 from litellm.exceptions import MidStreamFallbackError
+from litellm.litellm_core_utils.add_retry_fallback_headers import HiddenParamsAsyncIteratorWrapper
+from litellm.proxy.common_utils.openai_error_payload import (
+    attribute_of,
+    client_error_message,
+    inference_error_status_code,
+    is_context_window_error,
+)
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.openai import ResponseFailedEvent, ResponsesAPIResponse, ResponsesAPIStreamEvents
-
-
-class _ResponseIdentity(LiteLLMBaseModel):
-    model_config = ConfigDict(frozen=True, from_attributes=True)
-
-    id: str | None = None
-    model: str | None = None
-    created_at: int | None = None
 
 
 class _StreamEvent(LiteLLMBaseModel):
@@ -33,7 +31,7 @@ class _StreamEvent(LiteLLMBaseModel):
 
     type: str | None = None
     sequence_number: int | None = None
-    response: _ResponseIdentity | None = None
+    response: ResponsesAPIResponse | None = None
 
 
 class _FramedEvent(_StreamEvent):
@@ -46,10 +44,10 @@ _LAX_INT: Final = TypeAdapter(int)
 class _FailureDetails(LiteLLMBaseModel):
     model_config = ConfigDict(frozen=True)
 
-    message: str | None = None
-    code: str | int | None = None
+    code: str | int | None = Field(default=None, validation_alias=AliasChoices("openai_code", "code"))
     type: str | None = None
     status_code: int | None = None
+    message: str | None = None
 
     @field_validator("status_code", mode="before")
     @classmethod
@@ -78,7 +76,13 @@ class _FailureDetails(LiteLLMBaseModel):
 
     @classmethod
     def of_exception(cls, exception: Exception) -> "_FailureDetails":
-        return cls.model_validate({field: getattr(exception, field, None) for field in cls.model_fields})
+        return cls.model_validate(
+            {
+                field: value
+                for field in ("openai_code", *cls.model_fields)
+                if (value := attribute_of(exception, field)) is not None
+            }
+        )
 
 
 class _ErrorPayload(LiteLLMBaseModel):
@@ -177,13 +181,12 @@ def _failure_details(original: Exception) -> _FailureDetails:
     mapped: Final = _FailureDetails.of_exception(original)
     body: Final = getattr(original, "body", None)
     if not isinstance(body, Mapping):
-        return mapped
+        return mapped.model_copy(update={"status_code": inference_error_status_code(original)})
     upstream: Final = _FailureDetails.model_validate(body)
     return _FailureDetails(
-        message=upstream.message or mapped.message,
         code=upstream.code if upstream.code is not None else mapped.code,
         type=upstream.type or mapped.type,
-        status_code=mapped.status_code,
+        status_code=inference_error_status_code(original),
     )
 
 
@@ -339,11 +342,17 @@ def _wire_event(frame: str | bytes) -> _StreamEvent | None:
         return None
 
 
+def responses_error_code(exception: Exception) -> str:
+    original: Final = _original_failure(exception)
+    if is_context_window_error(original):
+        return "context_length_exceeded"
+    return _response_error_code(_failure_details(original))
+
+
 class ResponsesStreamErrorState:
-    def __init__(self) -> None:
-        self.response_id: str | None = None
-        self.model: str | None = None
-        self.created_at: int | None = None
+    def __init__(self, model: object = None) -> None:
+        self._model = model if isinstance(model, str) else None
+        self._response: ResponsesAPIResponse | None = None
         self.sequence_number = -1
         self.terminal_emitted = False
         self._pending_event: _StreamEvent | None = None
@@ -355,10 +364,7 @@ class ResponsesStreamErrorState:
         if event.sequence_number is not None:
             self.sequence_number = max(self.sequence_number, event.sequence_number)
         if event.response is not None:
-            self.response_id = event.response.id or self.response_id
-            self.model = event.response.model or self.model
-            if event.response.created_at is not None:
-                self.created_at = event.response.created_at
+            self._response = event.response
         if event.type in _TERMINAL_EVENT_TYPES:
             self.terminal_emitted = True
 
@@ -388,38 +394,64 @@ class ResponsesStreamErrorState:
         error: Final = sse_error_object(frame.removeprefix("data: "))
         return frame if error is None else self.format_error(error)
 
-    def format_failure(self, exception: Exception) -> str | None:
+    def format_failure(self, exception: Exception, *, stream: object = None) -> str | None:
         if self.terminal_emitted:
             return None
         original: Final = _original_failure(exception)
-        details: Final = _failure_details(original)
+        source: Final = (
+            attribute_of(stream, "_inner") if isinstance(stream, HiddenParamsAsyncIteratorWrapper) else stream
+        )
+        terminal: Final = attribute_of(source, "completed_response")
+        terminal_response: Final = attribute_of(terminal, "response")
+        prior_response: Final = (
+            terminal_response if isinstance(terminal_response, ResponsesAPIResponse) else self._response
+        ) or ResponsesAPIResponse.model_validate(
+            MappingProxyType(
+                {
+                    "id": f"resp_{uuid.uuid4().hex}",
+                    "object": "response",
+                    "created_at": int(time.time()),
+                    "model": self._model,
+                    "output": (),
+                }
+            )
+        )
+        visible_response: Final = prior_response if is_context_window_error(original) else self._response
         response: Final = ResponsesAPIResponse.model_validate(
             MappingProxyType(
                 {
-                    "id": self.response_id or f"resp_{uuid.uuid4().hex}",
-                    "object": "response",
-                    "created_at": self.created_at if self.created_at is not None else int(time.time()),
-                    "model": self.model,
+                    **prior_response.model_dump(),
+                    "id": visible_response.id if visible_response is not None else prior_response.id,
+                    "model": visible_response.model if visible_response is not None else prior_response.model,
+                    "created_at": (
+                        visible_response.created_at if visible_response is not None else prior_response.created_at
+                    ),
+                    "output": attribute_of(visible_response, "output", ()),
                     "status": "failed",
-                    "output": (),
                     "error": MappingProxyType(
                         {
-                            "code": _response_error_code(details),
-                            "message": redact_internal_details_from_client_message(details.message or str(original)),
+                            "code": responses_error_code(original),
+                            "message": client_error_message(original),
                         }
                     ),
                 }
             )
+        )
+        terminal_sequence: Final = attribute_of(terminal, "sequence_number")
+        sequence: Final = (
+            max(0, terminal_sequence)
+            if self.sequence_number < 0 and isinstance(terminal_sequence, int)
+            else self.sequence_number + 1
         )
         event: Final = ResponseFailedEvent.model_validate(
             MappingProxyType(
                 {
                     "type": ResponsesAPIStreamEvents.RESPONSE_FAILED,
                     "response": response,
-                    "sequence_number": self.sequence_number + 1,
+                    "sequence_number": sequence,
                 }
             )
         )
-        payload: Final = event.model_dump_json(exclude_none=True)
+        payload: Final = event.model_dump_json(exclude_none=not is_context_window_error(original))
         self.terminal_emitted = True
         return f"event: response.failed\ndata: {payload}\n\n"

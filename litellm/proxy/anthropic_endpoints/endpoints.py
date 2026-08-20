@@ -2,6 +2,7 @@
 Unified /v1/messages endpoint - (Anthropic Spec)
 """
 
+import json
 from collections.abc import AsyncGenerator, Mapping
 from types import MappingProxyType
 from typing import Final
@@ -44,6 +45,8 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
 )
 from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
+    anthropic_client_error_body,
+    client_error_message,
     error_status_code,
     litellm_call_id_headers,
     openai_error_param,
@@ -68,6 +71,19 @@ _NO_HEADERS: Final[Mapping[str, str]] = MappingProxyType({})
 
 def _anthropic_error_json_response(exc: ProxyException, request: Request) -> JSONResponse:
     return anthropic_handler_error_json_response(exc, request)
+
+
+def anthropic_error_json_response(exc: ProxyException, request: Request) -> JSONResponse:
+    normalized: Final = ProxyException(
+        message=json.dumps(anthropic_client_error_body(exc, request.headers.get("x-request-id"))),
+        type=exc.type,
+        param=exc.param,
+        code=error_status_code(exc, 500),
+        headers=exc.headers,
+        openai_code=exc.openai_code,
+        provider_specific_fields=exc.provider_specific_fields,
+    )
+    return _anthropic_error_json_response(normalized, request)
 
 
 _TOKEN_COUNT_FIELDS: Final = ("model", "messages", "tools", "tool_choice", "system")
@@ -238,7 +254,7 @@ async def anthropic_response(
             )
         body: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
             status_code=e.status_code,
-            raw_message=e.message,
+            raw_message=client_error_message(e),
             request_id=request.headers.get("x-request-id"),
         )
         return JSONResponse(status_code=e.status_code, content=body)
@@ -252,7 +268,7 @@ async def anthropic_response(
         log_llm_api_exception(answered, base_llm_response_processor.litellm_call_id)
 
         if isinstance(answered, ProxyException):
-            return _anthropic_error_json_response(
+            return anthropic_error_json_response(
                 with_litellm_call_id(answered, base_llm_response_processor.litellm_call_id), request
             )
 
@@ -279,12 +295,11 @@ async def anthropic_response(
         )
 
         if isinstance(answered, HTTPException):
-            return _anthropic_error_json_response(proxy_exception_from_http_exception(answered, headers), request)
+            return anthropic_error_json_response(proxy_exception_from_http_exception(answered, headers), request)
 
-        error_msg: Final = f"{answered}"
-        return _anthropic_error_json_response(
+        return anthropic_error_json_response(
             ProxyException(
-                message=getattr(answered, "message", error_msg),
+                message=json.dumps(anthropic_client_error_body(answered)),
                 type=openai_error_type(answered, error_status_code(answered, 500)),
                 param=openai_error_param(answered),
                 code=error_status_code(answered, 500),
@@ -407,7 +422,7 @@ async def _count_tokens(
         )
         if isinstance(token_request, ProxyException):
             return rejected_token_count(
-                _anthropic_error_json_response(with_litellm_call_id(token_request, litellm_call_id), request),
+                anthropic_error_json_response(with_litellm_call_id(token_request, litellm_call_id), request),
                 litellm_call_id,
                 request_model,
             )
@@ -421,15 +436,15 @@ async def _count_tokens(
             **_count_tokens_body_options(data, auto_drop_params),
         )
     except HTTPException as e:
-        return _anthropic_error_json_response(
+        return anthropic_error_json_response(
             with_litellm_call_id(proxy_exception_from_http_exception(e, {}), litellm_call_id), request
         )
     except ProxyException as e:
-        return _anthropic_error_json_response(with_litellm_call_id(e, litellm_call_id), request)
+        return anthropic_error_json_response(with_litellm_call_id(e, litellm_call_id), request)
     except Exception as e:
         answered: Final = with_answered_status(e)
         log_llm_api_exception(answered, litellm_call_id)
-        return _anthropic_error_json_response(
+        return anthropic_error_json_response(
             with_litellm_call_id(proxy_exception_from_route_error(answered), litellm_call_id), request
         )
     else:
