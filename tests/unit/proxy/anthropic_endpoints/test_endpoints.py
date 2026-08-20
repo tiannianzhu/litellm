@@ -5,64 +5,136 @@ Test for anthropic_endpoints/endpoints.py, focusing on handling dictionary objec
 import json
 import logging
 import unittest
+from collections.abc import AsyncIterator
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 
 
-class TestAnthropicEndpoints(unittest.TestCase):
-    @patch("litellm.litellm_core_utils.safe_json_dumps.safe_dumps")
+class TestAnthropicErrorResponses:
+    @pytest.mark.parametrize(
+        ("raw_message", "expected_message"),
+        (
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "internal_error",
+                            "message": "deepseek-v4-flash is not a multimodal model",
+                        },
+                    }
+                )
+                + ". Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+                "deepseek-v4-flash is not a multimodal model",
+            ),
+            (
+                "litellm.ContextWindowExceededError: "
+                + json.dumps(
+                    {
+                        "object": "error",
+                        "message": "This model's maximum context length is 131072 tokens",
+                        "type": "BadRequestError",
+                        "code": 400,
+                    }
+                )
+                + ". Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+                "This model's maximum context length is 131072 tokens",
+            ),
+        ),
+    )
     @pytest.mark.asyncio
-    async def test_async_data_generator_anthropic_dict_handling(self, mock_safe_dumps):
-        """Test async_data_generator_anthropic handles dictionary chunks properly"""
-        # Setup
-        mock_response = AsyncMock()
-        mock_response.__aiter__.return_value = [
+    async def test_normalizes_routed_provider_error(self, raw_message, expected_message):
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        from litellm.proxy import proxy_server
+
+        exc = Exception()
+        exc.status_code = 400
+        exc.message = raw_message
+
+        with (
+            patch.object(  # test-quality-ok: request-body helper has no injection seam
+                ep, "_read_request_body", new=AsyncMock(return_value={})
+            ),
+            patch.object(  # test-quality-ok: deterministic routed failure needs the processing seam
+                ep.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=AsyncMock(side_effect=exc),
+            ),
+            patch.object(  # test-quality-ok: route header setup has no injection seam
+                ep.ProxyBaseLLMRequestProcessing,
+                "get_custom_headers",
+                return_value={},
+            ),
+            patch.object(  # test-quality-ok: route logging uses a proxy module global with no injection seam
+                proxy_server, "proxy_logging_obj"
+            ) as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            request: Final = Request(
+                {
+                    "type": "http", "method": "POST", "path": "/v1/messages",
+                    "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+                }
+            )
+            response = await ep.anthropic_response(
+                fastapi_response=MagicMock(),
+                request=request,
+                user_api_key_dict=MagicMock(),
+            )
+
+        assert response.status_code == 400
+        assert json.loads(response.body) == {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": expected_message,
+            },
+        }
+
+
+class TestAnthropicEndpoints(unittest.IsolatedAsyncioTestCase):
+    async def test_async_data_generator_anthropic_dict_handling(self):
+        from litellm.caching.caching import DualCache
+        from litellm.proxy._types import UserAPIKeyAuth
+        from litellm.proxy.utils import ProxyLogging
+
+        chunks: Final = (
             {"type": "message_start", "message": {"id": "msg_123"}},
             "text chunk data",
             {"type": "content_block_delta", "delta": {"text": "more data"}},
             "text chunk data again",
-        ]
-
-        mock_user_api_key_dict = MagicMock()
-        mock_request_data = {}
-        mock_proxy_logging_obj = MagicMock()
-        mock_proxy_logging_obj.async_post_call_streaming_hook = AsyncMock(
-            side_effect=lambda **kwargs: kwargs["response"]
         )
 
-        # Configure safe_dumps to return a properly formatted JSON string
-        mock_safe_dumps.side_effect = lambda chunk: json.dumps(chunk)
+        async def response() -> AsyncIterator[dict[str, object] | str]:
+            for chunk in chunks:
+                yield chunk
 
-        # Execute
-        result = [
+        result: Final = [
             chunk
             async for chunk in ProxyBaseLLMRequestProcessing.async_sse_data_generator(
-                response=mock_response,
-                user_api_key_dict=mock_user_api_key_dict,
-                request_data=mock_request_data,
-                proxy_logging_obj=mock_proxy_logging_obj,
+                response=response(),
+                user_api_key_dict=UserAPIKeyAuth(),
+                request_data={},
+                proxy_logging_obj=ProxyLogging(user_api_key_cache=DualCache()),
             )
         ]
 
-        # Verify
-        expected_result = [
-            'data: {"type": "message_start", "message": {"id": "msg_123"}}\n\n',
-            "text chunk data",
-            'data: {"type": "content_block_delta", "delta": {"text": "more data"}}\n\n',
-            "text chunk data again",
-        ]
-
-        self.assertEqual(result, expected_result)
-
-        # Assert safe_dumps was called for dictionary objects
-        mock_safe_dumps.assert_any_call({"type": "message_start", "message": {"id": "msg_123"}})
-        mock_safe_dumps.assert_any_call({"type": "content_block_delta", "delta": {"text": "more data"}})
-        assert mock_safe_dumps.call_count == 2  # Called twice, once for each dict object
+        self.assertEqual(
+            result,
+            [
+                'data: {"type": "message_start", "message": {"id": "msg_123"}}\n\n',
+                "text chunk data",
+                'data: {"type": "content_block_delta", "delta": {"text": "more data"}}\n\n',
+                "text chunk data again",
+            ],
+        )
 
 
 class TestBlockedResponseUsage:
@@ -143,8 +215,12 @@ class TestProxyExceptionAnthropicEnvelope:
             param="metadata",
             code=400,
         )
-        request = MagicMock()
-        request.headers = {"x-request-id": "req_test_6468"}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {"x-request-id": "req_test_6468"}.items()),
+            }
+        )
 
         with (
             patch.object(ep, "read_request_body", new=AsyncMock(return_value={})),
@@ -181,17 +257,21 @@ class TestProxyExceptionAnthropicEnvelope:
         import litellm.proxy.anthropic_endpoints.endpoints as ep
         from litellm.proxy._types import ProxyException
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
-        response = ep._anthropic_error_json_response(
+        response = ep.anthropic_error_json_response(
             ProxyException(message="Rate limit exceeded", type="rate_limit_error", param=None, code=429),
             request,
         )
         assert response.status_code == 429
         assert json.loads(response.body)["error"]["type"] == "rate_limit_error"
 
-        fallback = ep._anthropic_error_json_response(
+        fallback = ep.anthropic_error_json_response(
             ProxyException(message="boom", type="None", param=None, code=None),
             request,
         )
@@ -203,8 +283,12 @@ class TestProxyExceptionAnthropicEnvelope:
         import litellm.proxy.anthropic_endpoints.endpoints as ep
         from litellm.proxy._types import ProxyException
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
         exc = ProxyException(
             message="Rate limit exceeded",
             type="rate_limit_error",
@@ -214,7 +298,7 @@ class TestProxyExceptionAnthropicEnvelope:
             provider_specific_fields=provider_specific_fields,
         )
         with patch("litellm.proxy.proxy_server.general_settings", general_settings):
-            return ep._anthropic_error_json_response(exc, request)
+            return ep.anthropic_error_json_response(exc, request)
 
     def test_anthropic_error_copies_the_call_id_into_the_error_when_opted_in(self):
         """With include_call_id_in_error_body on, error.litellm_call_id is byte-identical to
@@ -274,8 +358,12 @@ class TestHttpExceptionDictDetail:
             "guardrail": "keyword-block",
         }
         exc = HTTPException(status_code=400, detail=detail)
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(
@@ -324,8 +412,12 @@ class TestFailureHookRequestData:
             captured["processor_data"] = self.data
             raise RuntimeError("provider timeout")
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(ep, "read_request_body", new=AsyncMock(return_value={"model": "claude-sonnet"})),
@@ -375,8 +467,12 @@ class TestErrorLogCarriesCallId:
             self.data = {**self.data, "litellm_call_id": call_id}
             raise RuntimeError("provider timeout")
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(
@@ -414,8 +510,12 @@ class TestErrorLogCarriesCallId:
             self.data = {**self.data, "litellm_call_id": call_id}
             raise ProxyException(message="budget exceeded", type=ProxyErrorTypes.budget_exceeded, param="key", code=402)
 
-        request = MagicMock()
-        request.headers = {}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {}.items()),
+            }
+        )
 
         with (
             patch.object(
@@ -445,8 +545,12 @@ class TestErrorLogCarriesCallId:
         from litellm.proxy._types import UserAPIKeyAuth
 
         call_id = "count-tokens-call-7836"
-        request = MagicMock()
-        request.headers = {"x-litellm-call-id": call_id}
+        request: Final = Request(
+            {
+                "type": "http", "method": "POST", "path": "/v1/messages/count_tokens",
+                "headers": tuple((key.encode(), value.encode()) for key, value in {"x-litellm-call-id": call_id}.items()),
+            }
+        )
 
         with (
             patch.object(  # test-quality-ok: endpoint reads the body via a module function; no injection seam
@@ -575,3 +679,26 @@ class TestStripTotalTokensFeatureFlag(unittest.TestCase):
         import litellm
 
         assert litellm.strip_anthropic_total_tokens is False
+
+
+def test_count_tokens_keeps_the_source_error_type_and_provider_request_id() -> None:
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.anthropic_endpoints.endpoints import anthropic_error_json_response
+
+    source: Final = {
+        "type": "error",
+        "error": {"type": "overloaded_error", "message": "count service busy"},
+        "request_id": "provider-count-request",
+    }
+    request: Final = Request(
+        {
+            "type": "http", "method": "POST", "path": "/v1/messages/count_tokens",
+            "headers": [(b"x-request-id", b"caller-request")],
+        }
+    )
+    response: Final = anthropic_error_json_response(
+        ProxyException(message=json.dumps(source), type="server_error", param=None, code=500), request
+    )
+
+    assert response.status_code == 500
+    assert json.loads(response.body) == source

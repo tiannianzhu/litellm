@@ -34,9 +34,6 @@ from litellm.integrations.custom_guardrail import ModifyResponseException
 from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.internal_call_metadata import is_background_response, requests_background
 from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
-from litellm.litellm_core_utils.exception_mapping_utils import (
-    extract_error_message_from_string,
-)
 from litellm.llms.openai.responses.guardrail_translation.handler import (
     OpenAIResponsesHandler,
     build_blocked_response,
@@ -55,11 +52,11 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
     read_request_body,
     safe_set_request_parsed_body,
 )
+from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter, client_error_message
 from litellm.proxy.hooks.responses_id_security import ResponsesIDSecurity, decrypted_response_id
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.batch_attribution import (
     request_tags_from_request_data,
 )
-from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
 from litellm.proxy.route_llm_request import raise_if_required_body_param_missing
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.openai import (
@@ -106,13 +103,9 @@ _TOOL_PAYLOAD_KEYS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 _EMPTY_TOOL_PAYLOAD: Final[Mapping[str, object]] = MappingProxyType({})
 
 
-def _extract_responses_error_message(raw_message: str) -> str:
-    return extract_error_message_from_string(raw_message) or raw_message
-
-
 def _normalize_responses_api_exception(exception: ProxyException) -> ProxyException:
     return ProxyException(
-        message=_extract_responses_error_message(exception.message),
+        message=client_error_message(exception),
         type=exception.type,
         param=exception.param,
         code=exception.code,
@@ -309,11 +302,11 @@ async def responses_api(
         version,
     )
 
+    data = await read_request_body(request=request)  # rebind-ok: pre-existing rebinding on a rename-only line
     responses_error: Final = ResponsesContextErrorFormatter(data.get("model")) if data.get("stream") is True else None
     native_data_generator: Final = partial(
         select_data_generator, responses_stream_errors=True, responses_error=responses_error
     )
-    data = await read_request_body(request=request)  # rebind-ok: pre-existing rebinding on a rename-only line
 
     # Check if polling via cache should be used for this request
     from litellm.proxy.response_polling.polling_handler import (
