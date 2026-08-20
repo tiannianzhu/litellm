@@ -55,7 +55,6 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
 from litellm.litellm_core_utils.socket_logging import collect_socket_logging
 from litellm.litellm_core_utils.token_counter import usage_tokenizer_model
-from litellm.litellm_core_utils.exception_mapping_utils import extract_error_message_from_string
 from litellm.litellm_core_utils.tool_fields import TOOL_FIELDS, first_validation_error
 from litellm.llms.openai.responses.guardrail_translation.handler import (
     OpenAIResponsesHandler,
@@ -92,10 +91,13 @@ from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # leg
 )
 from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
+    client_error_message,
     error_status_code,
+    is_context_window_error,
     openai_error_type_for_status,
     with_litellm_call_id,
 )
+from litellm.proxy.common_utils.responses_stream_errors import ResponsesStreamErrorState
 from litellm.proxy.common_utils.token_count_log import answered_with_litellm_call_id, rejected_token_count
 from litellm.proxy.common_utils.token_count_settings import count_source_fields
 from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
@@ -113,7 +115,6 @@ from litellm.proxy.litellm_pre_call_utils import (
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.batch_attribution import (
     request_tags_from_request_data,
 )
-from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
 from litellm.proxy.route_llm_request import raise_if_required_body_param_missing
 from litellm.proxy.utils import (
     FAILURE_ROW_ALREADY_WRITTEN,
@@ -264,13 +265,13 @@ def _extra_query_with_query_params(
     return {**(body_extra_query if isinstance(body_extra_query, dict) else {}), **query}
 
 
-def _extract_responses_error_message(raw_message: str) -> str:
-    return extract_error_message_from_string(raw_message) or raw_message
+async def _failed_responses_stream(error_frame: str) -> AsyncIterator[str]:
+    yield error_frame
 
 
 def _normalize_responses_api_exception(exception: ProxyException) -> ProxyException:
     return ProxyException(
-        message=_extract_responses_error_message(exception.message),
+        message=client_error_message(exception),
         type=exception.type,
         param=exception.param,
         code=exception.code,
@@ -461,11 +462,11 @@ async def responses_api(
         version,
     )
 
-    responses_error: Final = ResponsesContextErrorFormatter(data.get("model")) if data.get("stream") is True else None
+    data = await read_request_body(request=request)  # rebind-ok: pre-existing rebinding on a rename-only line
+    responses_error: Final = ResponsesStreamErrorState(data.get("model")) if data.get("stream") is True else None
     native_data_generator: Final = partial(
         select_data_generator, responses_stream_errors=True, responses_error=responses_error
     )
-    data = await read_request_body(request=request)  # rebind-ok: pre-existing rebinding on a rename-only line
 
     # Check if polling via cache should be used for this request
     from litellm.proxy.response_polling.polling_handler import (
@@ -662,15 +663,16 @@ async def responses_api(
             )
         except ProxyException as exception:
             normalized: Final = _normalize_responses_api_exception(exception)
-            error_frame: Final = responses_error.format(normalized) if responses_error is not None else None
+            error_frame: Final = (
+                responses_error.format_failure(normalized)
+                if responses_error is not None and is_context_window_error(normalized)
+                else None
+            )
             if error_frame is None:
                 raise normalized from exception
 
-            async def failed_stream() -> AsyncIterator[str]:
-                yield error_frame
-
             return StreamingResponse(
-                failed_stream(),
+                _failed_responses_stream(error_frame),
                 media_type="text/event-stream",
                 headers={
                     **normalized.headers,

@@ -421,11 +421,13 @@ def _context_window_exception(
     llm_provider: str,
     model: str,
     headers: httpx.Headers | None = None,
+    body: Mapping[str, object] | None = None,
 ) -> litellm.ContextWindowExceededError:
     exception: Final = litellm.ContextWindowExceededError(
         message=error_message,
         llm_provider=llm_provider,
         model=model,
+        body=body,
         response=(
             httpx.Response(400, headers=headers, request=httpx.Request("POST", f"https://{llm_provider}.com/v1/"))
             if headers is not None
@@ -839,6 +841,7 @@ class BaseResponsesAPIStreamingIterator:
                 llm_provider=self.custom_llm_provider or "",
                 model=self.model or "",
                 headers=provider_request_id_headers(self._raw_response_headers),
+                body=_provider_error_fields(error_obj) or None,
             )
         return map_stream_error_to_exception(
             error_obj,

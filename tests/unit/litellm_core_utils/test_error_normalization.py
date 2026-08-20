@@ -93,6 +93,11 @@ def _proxy_exc(message: str, error_type: str, code: int) -> ProxyException:
                 ),
                 httpx.ReadError(""),
                 httpx.RemoteProtocolError(""),
+                httpx.ReadError("Connection closed."),
+                httpx.ReadError("CONNECTION CLOSED."),
+                litellm.InternalServerError(
+                    "Hosted_vllmException - Server disconnected", llm_provider="hosted_vllm", model="model"
+                ),
             ),
             "500_PROVIDER_CONNECTION_ERROR",
         ),
