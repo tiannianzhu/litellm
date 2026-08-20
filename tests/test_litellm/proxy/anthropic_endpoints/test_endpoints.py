@@ -12,6 +12,107 @@ from fastapi.testclient import TestClient
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 
 
+class TestAnthropicErrorHelpers:
+    def test_reads_status_code_from_exception_code(self):
+        from litellm.proxy.anthropic_endpoints.endpoints import (
+            _get_exception_status_code,
+        )
+
+        exc = Exception()
+        exc.code = "400"
+
+        assert _get_exception_status_code(exc) == 400
+
+    @pytest.mark.parametrize("status_code", (0, 399, 600, "invalid"))
+    def test_rejects_invalid_exception_status_codes(self, status_code):
+        from litellm.proxy.anthropic_endpoints.endpoints import (
+            _get_exception_status_code,
+        )
+
+        exc = Exception()
+        exc.status_code = status_code
+
+        assert _get_exception_status_code(exc) == 500
+
+
+class TestAnthropicErrorResponses:
+    @pytest.mark.parametrize(
+        ("raw_message", "expected_message"),
+        (
+            (
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "internal_error",
+                            "message": "deepseek-v4-flash is not a multimodal model",
+                        },
+                    }
+                )
+                + ". Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+                "deepseek-v4-flash is not a multimodal model",
+            ),
+            (
+                "litellm.ContextWindowExceededError: "
+                + json.dumps(
+                    {
+                        "object": "error",
+                        "message": "This model's maximum context length is 131072 tokens",
+                        "type": "BadRequestError",
+                        "code": 400,
+                    }
+                )
+                + ". Received Model Group=deepseek-v4-flash\nAvailable Model Group Fallbacks=None",
+                "This model's maximum context length is 131072 tokens",
+            ),
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_normalizes_routed_provider_error(self, raw_message, expected_message):
+        import litellm.proxy.anthropic_endpoints.endpoints as ep
+        from litellm.proxy import proxy_server
+
+        exc = Exception()
+        exc.status_code = 400
+        exc.message = raw_message
+
+        with (
+            patch.object(  # test-quality-ok: request-body helper has no injection seam
+                ep, "_read_request_body", new=AsyncMock(return_value={})
+            ),
+            patch.object(  # test-quality-ok: deterministic routed failure needs the processing seam
+                ep.ProxyBaseLLMRequestProcessing,
+                "base_process_llm_request",
+                new=AsyncMock(side_effect=exc),
+            ),
+            patch.object(  # test-quality-ok: route header setup has no injection seam
+                ep.ProxyBaseLLMRequestProcessing,
+                "get_custom_headers",
+                return_value={},
+            ),
+            patch.object(  # test-quality-ok: route logging uses a proxy module global with no injection seam
+                proxy_server, "proxy_logging_obj"
+            ) as mock_logging,
+        ):
+            mock_logging.post_call_failure_hook = AsyncMock()
+            request = MagicMock()
+            request.headers = {}
+            response = await ep.anthropic_response(
+                fastapi_response=MagicMock(),
+                request=request,
+                user_api_key_dict=MagicMock(),
+            )
+
+        assert response.status_code == 400
+        assert json.loads(response.body) == {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": expected_message,
+            },
+        }
+
+
 class TestAnthropicEndpoints(unittest.TestCase):
     @patch("litellm.litellm_core_utils.safe_json_dumps.safe_dumps")
     @pytest.mark.asyncio
