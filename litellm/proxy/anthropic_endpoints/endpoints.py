@@ -35,13 +35,14 @@ def _anthropic_error_json_response(exc: ProxyException, request: Request) -> JSO
         _close_dangling_otel_server_span,  # pyright: ignore[reportPrivateUsage]  # proxy_server keeps the span-close helper private; error JSONResponses returned by the route must stamp the OTel server span like the global ProxyException handler does
     )
 
-    status_code: Final = int(exc.code) if exc.code is not None and exc.code.isdigit() else 500
+    status_code: Final = _get_exception_status_code(exc)
     _close_dangling_otel_server_span(request, status_code, exc=exc)
     envelope: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
         status_code=status_code,
         raw_message=exc.message,
         request_id=request.headers.get("x-request-id"),
     )
+    envelope["error"]["type"] = AnthropicExceptionMapping.get_error_type(status_code)
     if not exc.provider_specific_fields:
         return JSONResponse(status_code=status_code, content=envelope, headers=exc.headers)
     content: Final[AnthropicErrorResponse] = {
@@ -83,6 +84,15 @@ def _strip_total_tokens_from_anthropic_response(response: Any) -> None:
     usage = getattr(response, "usage", None)
     if isinstance(usage, dict) and "total_tokens" in usage:
         usage.pop("total_tokens", None)
+
+
+def _get_exception_status_code(e: Exception) -> int:
+    status_code: Final = getattr(e, "status_code", None) or getattr(e, "code", None) or 500
+    try:
+        parsed_status_code: Final = int(status_code)
+    except (TypeError, ValueError):
+        return 500
+    return parsed_status_code if 400 <= parsed_status_code <= 599 else 500
 
 
 @router.post(
@@ -242,10 +252,10 @@ async def anthropic_response(
         error_msg: Final = f"{e}"
         return _anthropic_error_json_response(
             ProxyException(
-                message=getattr(e, "message", error_msg),
+                message=str(getattr(e, "message", error_msg)),
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
-                code=getattr(e, "status_code", 500),
+                code=_get_exception_status_code(e),
                 headers=headers,
             ),
             request,
