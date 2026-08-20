@@ -511,6 +511,11 @@ class ClassifierLLMConfig(BaseModel):
             "probe closes the circuit and a failed probe restarts the cooldown."
         ),
     )
+    max_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description="Maximum output tokens for the classification call",
+    )
     classification_rubric: ClassificationRubric | None = Field(
         default=None,
         description=(

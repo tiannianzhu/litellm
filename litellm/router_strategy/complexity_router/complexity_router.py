@@ -1940,9 +1940,16 @@ class ComplexityRouter(CustomLogger):
             {"role": "user", "content": user_content},
         ]
         response_format: Final = classifier_response_format
-        classifier_call_params: Mapping[str, str] = EMPTY_MAPPING
-        if llm_config.reasoning_effort is not None:
-            classifier_call_params = MappingProxyType({"reasoning_effort": llm_config.reasoning_effort})
+        classifier_call_params: Final[Mapping[str, str | int]] = MappingProxyType(
+            {
+                key: value
+                for key, value in (
+                    ("reasoning_effort", llm_config.reasoning_effort),
+                    ("max_tokens", llm_config.max_tokens),
+                )
+                if value is not None
+            }
+        )
 
         proxy_server_request: Final = {
             "body": {
