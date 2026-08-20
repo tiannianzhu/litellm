@@ -68,7 +68,8 @@ def _anthropic_error_json_response(exc: ProxyException, request: Request) -> JSO
         general_settings_view,
     )
 
-    status_code: Final = int(exc.code) if exc.code is not None and exc.code.isdigit() else 500
+    raw_status_code: Final = error_status_code(exc, 500)
+    status_code: Final = raw_status_code if 400 <= raw_status_code <= 599 else 500
     _close_dangling_otel_server_span(request, status_code, exc=exc)
     envelope: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
         status_code=status_code,
@@ -76,6 +77,7 @@ def _anthropic_error_json_response(exc: ProxyException, request: Request) -> JSO
         request_id=request.headers.get("x-request-id"),
     )
     body_call_id: Final = error_body_call_id(general_settings_view(), exc.headers.get(LITELLM_CALL_ID_HEADER))
+    envelope["error"]["type"] = AnthropicExceptionMapping.get_error_type(status_code)
     content: Final[AnthropicErrorResponse] = {
         **envelope,
         "error": _anthropic_error_detail(exc, envelope["error"], body_call_id),
