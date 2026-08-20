@@ -532,9 +532,13 @@ from litellm.proxy.common_utils.openai_endpoint_utils import (
 from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
     attribute_of,
+    client_error_message,
     headers_with_litellm_call_id,
+    inference_request_surface,
+    is_context_window_error,
     litellm_call_id_headers,
     openai_error_param,
+    openai_error_type,
     proxy_exception_for,
     route_failure_proxy_exception,
     with_litellm_call_id,
@@ -2354,9 +2358,21 @@ class UserAPIKeyCacheTTLEnum(enum.Enum):
 async def openai_exception_handler(request: Request, exc: ProxyException):
     # NOTE: DO NOT MODIFY THIS, its crucial to map to Openai exceptions
     log_model_access_denial(exc)
+    surface: Final = inference_request_surface(request)
+    if surface == "messages":
+        from litellm.proxy.anthropic_endpoints.endpoints import anthropic_error_json_response
+
+        return anthropic_error_json_response(exc, request)
     headers: Final = exc.headers
+    detail: Final = JSON_OBJECT.validate_python(exc.to_dict())
     error_dict: Final = with_call_id(
-        JSON_OBJECT.validate_python(exc.to_dict()),
+        {
+            **detail,
+            "message": client_error_message(exc),
+            "code": "context_length_exceeded" if is_context_window_error(exc) else detail.get("code"),
+        }
+        if surface is not None
+        else detail,
         error_body_call_id(general_settings_view(), headers.get(LITELLM_CALL_ID_HEADER)),
     )
     status_code: Final = int(exc.code) if exc.code else status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -2386,6 +2402,17 @@ async def aws_error_type_exception_handler(request: Request, exc: AwsErrorTypePr
 async def otlp_http_exception_handler(connection: Request | WebSocket, exc: StarletteHTTPException) -> Response | None:
     if isinstance(connection, WebSocket):
         return await _websocket_http_exception_response(connection, exc)
+    if inference_request_surface(connection) is not None:
+        return await openai_exception_handler(
+            connection,
+            ProxyException(
+                message=client_error_message(exc),
+                type=openai_error_type(exc, exc.status_code),
+                param=openai_error_param(exc),
+                code=exc.status_code,
+                headers=dict(exc.headers or {}),
+            ),
+        )
     response: Final = tracing_endpoints.otlp_error_response(connection, exc.status_code, exc.headers)
     if response is not None:
         _close_dangling_otel_server_span(connection, exc.status_code, exc=exc)
@@ -2592,6 +2619,11 @@ async def _unhandled_exception_response(request: Request, exc: Exception) -> Res
                     call_type=allowlisted(request.url.path, KNOWN_PROXY_ROUTES),
                 )
             )
+        )
+    if inference_request_surface(request) is not None:
+        return await openai_exception_handler(
+            request,
+            ProxyException(message="Internal server error", type="internal_server_error", param=None, code=500),
         )
     _close_dangling_otel_server_span(request, 500, exc=exc)
     otlp_response: Final = tracing_endpoints.otlp_error_response(request, 500)
@@ -10837,7 +10869,9 @@ async def async_data_generator(
                 await close_guarded_stream(guarded_layer)
         raise
     except Exception as e:  # noqa: BLE001  # stream boundary: any failure must end the SSE body as an error event
-        verbose_proxy_logger.exception("litellm.proxy.proxy_server.async_data_generator(): Exception occured - %s", e)
+        log_llm_api_exception(
+            e, request_litellm_call_id(TypeAdapter(Mapping[str, object]).validate_python(request_data))
+        )
         replacement: Final = await proxy_logging_obj.post_call_failure_hook(
             user_api_key_dict=user_api_key_dict,
             original_exception=e,
@@ -10850,6 +10884,9 @@ async def async_data_generator(
             e,
         )
 
+        inference: Final = request is not None and inference_request_surface(request) is not None
+        if inference and request is not None:
+            request.scope["litellm_stream_exception"] = client_error
         responses_frame: Final = (
             responses_error.format(client_error, stream=response) if responses_error is not None else None
         )
@@ -10865,12 +10902,17 @@ async def async_data_generator(
             if ends_with_openai_done:
                 yield _OPENAI_STREAM_DONE_FRAME
             return
-        if isinstance(e, HTTPException) and responses_error is None and (not stream_started or not ends_with_openai_done):
+        if (
+            isinstance(e, HTTPException)
+            and not inference
+            and responses_error is None
+            and (not stream_started or not ends_with_openai_done)
+        ):
             raise client_error
         error_returned: Final = json.dumps(
             {
-                "error": sse_error_payload(client_error)[1]
-                if isinstance(client_error, HTTPException)
+                "error": sse_error_payload(client_error, clean_message=inference)[1]
+                if inference or isinstance(client_error, HTTPException)
                 else route_failure_proxy_exception(
                     client_error,
                     str(attribute_of(client_error, "message", client_error)),
