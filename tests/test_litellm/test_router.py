@@ -13523,3 +13523,49 @@ async def test_router_max_parallel_requests_slot_released_when_stream_closed_ear
 
     assert tracker.peak == 1
     assert tracker.current == 0
+
+
+@pytest.mark.asyncio
+async def test_ageneric_api_call_retries_when_model_id_matches_model_group():
+    from litellm.llms.base_llm.chat.transformation import BaseLLMException
+
+    model_name = "colliding-model-id"
+    attempts = 0
+
+    async def flaky_generic_function(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise BaseLLMException(
+                status_code=502,
+                message="temporary upstream failure",
+                headers={},
+            )
+        return {"result": "success", "model": kwargs.get("model")}
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": model_name,
+                "litellm_params": {
+                    "model": f"hosted_vllm/{model_name}",
+                    "api_base": "http://localhost:8000/v1",
+                    "input_cost_per_token": 0,
+                    "output_cost_per_token": 0,
+                },
+                "model_info": {"id": model_name},
+            }
+        ],
+        num_retries=1,
+        allowed_fails=3,
+    )
+
+    with patch.object(router, "_time_to_sleep_before_retry", return_value=0):
+        result = await router._ageneric_api_call_with_fallbacks(
+            model=model_name,
+            original_function=flaky_generic_function,
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+    assert attempts == 2
+    assert result["result"] == "success"
