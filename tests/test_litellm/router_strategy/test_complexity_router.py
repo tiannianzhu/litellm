@@ -2526,6 +2526,7 @@ def _native_classifier_router(
     failure: Exception | None = None,
     native_router: Router | None = None,
     http_handler: AsyncHTTPHandler | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[ComplexityRouter, MagicMock]:
     dependency: Final = MagicMock(
         aresponses=(
@@ -2551,6 +2552,7 @@ def _native_classifier_router(
                     "model": "classifier",
                     "timeout_ms": 5000 if native_router is not None else 100,
                     "reasoning_effort": "low",
+                    "max_tokens": max_tokens,
                 },
                 "heuristic_first_max_tier": "SIMPLE" if classifier_type == "heuristic_first" else None,
                 "hybrid_boundary_margin": 0.01 if classifier_type == "hybrid" else None,
@@ -2614,8 +2616,11 @@ class TestEncryptedTaskClassifier:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("classifier_type", ["llm", "heuristic_first", "hybrid"])
     @pytest.mark.parametrize("tier,model", [("SIMPLE", "cheap-model"), ("REASONING", "deep-model")])
-    async def test_encrypted_task_routes_by_native_verdict(self, classifier_type: str, tier: str, model: str):
-        router, dependency = _native_classifier_router(json.dumps({"tier": tier}), classifier_type)
+    @pytest.mark.parametrize("max_tokens", [None, 256])
+    async def test_encrypted_task_routes_by_native_verdict(
+        self, classifier_type: str, tier: str, model: str, max_tokens: int | None
+    ):
+        router, dependency = _native_classifier_router(json.dumps({"tier": tier}), classifier_type, max_tokens=max_tokens)
         task: Final = _encrypted_agent_task()
         request: Final = {
             "input": [
@@ -2645,6 +2650,13 @@ class TestEncryptedTaskClassifier:
         assert request == original
         dependency.acompletion.assert_not_called()
         call: Final = dependency.aresponses.call_args.kwargs
+        assert "max_tokens" not in call
+        if max_tokens is None:
+            assert "max_output_tokens" not in call
+            assert "max_output_tokens" not in call["proxy_server_request"]["body"]
+        else:
+            assert call["max_output_tokens"] == max_tokens
+            assert call["proxy_server_request"]["body"]["max_output_tokens"] == max_tokens
         assert call["input"][-1] == task
         assert "opaque-provider-task" not in json.dumps(call["input"][:-1])
         assert "Prior task context" in json.dumps(call["input"][:-1])
@@ -2941,6 +2953,28 @@ class TestLLMClassifier:
         call_kwargs = mock_router_instance.acompletion.call_args.kwargs
         assert call_kwargs["model"] == "haiku-classifier"
         assert call_kwargs["timeout"] == 0.4
+
+    @pytest.mark.asyncio
+    async def test_aclassify_llm_forwards_max_tokens(self, mock_router_instance, llm_classifier_config):
+        config: Final = {
+            **llm_classifier_config,
+            "classifier_llm_config": {
+                **llm_classifier_config["classifier_llm_config"],
+                "max_tokens": 32,
+            },
+        }
+        router: Final = ComplexityRouter(
+            model_name="test-complexity-router",
+            litellm_router_instance=mock_router_instance,
+            complexity_router_config=config,
+        )
+        mock_router_instance.acompletion = AsyncMock(return_value=_llm_response('{"tier": "SIMPLE"}'))
+
+        await router.aclassify("hi")
+
+        call_kwargs: Final = mock_router_instance.acompletion.call_args.kwargs
+        assert call_kwargs["max_tokens"] == 32
+        assert call_kwargs["proxy_server_request"]["body"]["max_tokens"] == 32
 
     @pytest.mark.asyncio
     async def test_aclassify_llm_success_captures_classifier_cost(self, llm_complexity_router, mock_router_instance):
