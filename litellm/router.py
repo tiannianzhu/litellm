@@ -8516,16 +8516,21 @@ class Router:
             return False
         return self._refusal_fallback_available(model, kwargs)
 
-    def _get_healthy_deployments(self, model: str, parent_otel_span: Span | None):
-        _all_deployments: list = []
+    def _get_deployments_for_health_check(  # mutable-ok: inherited router helpers return mutable deployment records
+        self, model: str
+    ) -> list[DeploymentTypedDict] | dict:
         try:
-            _, _all_deployments = self._common_checks_available_deployment(
-                model=model,
-            )
-            if isinstance(_all_deployments, dict):
-                return []
+            deployments: Final = self._get_all_deployments(model_name=model)
+            if deployments:
+                return deployments
+            return self._common_checks_available_deployment(model=model)[1]
         except Exception:
-            pass
+            return []  # mutable-ok: inherited health-check contract uses an empty list sentinel
+
+    def _get_healthy_deployments(self, model: str, parent_otel_span: Span | None):
+        _all_deployments: Final = self._get_deployments_for_health_check(model)
+        if isinstance(_all_deployments, dict):
+            return []  # mutable-ok: inherited health-check contract uses an empty list sentinel
 
         unhealthy_deployments: Final = _get_cooldown_deployments(
             litellm_router_instance=self, parent_otel_span=parent_otel_span
@@ -8538,22 +8543,18 @@ class Router:
 
         return healthy_deployments, _all_deployments
 
-    async def _async_get_healthy_deployments(self, model: str, parent_otel_span: Span | None):
+    async def _async_get_healthy_deployments(
+        self, model: str, parent_otel_span: Span | None
+    ) -> tuple[list[dict], list[DeploymentTypedDict] | dict]:
         """
         Returns Tuple of:
         - Tuple[List[Dict], List[Dict]]:
             1. healthy_deployments: list of healthy deployments
             2. all_deployments: list of all deployments
         """
-        _all_deployments: list = []
-        try:
-            _, _all_deployments = self._common_checks_available_deployment(
-                model=model,
-            )
-            if isinstance(_all_deployments, dict):
-                return [], _all_deployments
-        except Exception:
-            pass
+        _all_deployments: Final = self._get_deployments_for_health_check(model)
+        if isinstance(_all_deployments, dict):
+            return [], _all_deployments  # mutable-ok: inherited health-check contract uses an empty list sentinel
 
         unhealthy_deployments: Final = await _async_get_cooldown_deployments(
             litellm_router_instance=self, parent_otel_span=parent_otel_span
