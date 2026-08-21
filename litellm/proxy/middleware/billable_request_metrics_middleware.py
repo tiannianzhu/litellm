@@ -27,6 +27,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.constants import OPENSEARCH_PASS_THROUGH_ROUTE_PREFIX
 from litellm.proxy._types import LiteLLMRoutes
 from litellm.proxy.auth.route_checks import RouteChecks
+from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 
 
 class BillableCategory(str, Enum):
@@ -120,6 +121,8 @@ def _classify_llm_route(path: str) -> str | None:
     exact_match: Final = next((route for route in _LLM_ROUTE_EXACT if path == route), None)
     if exact_match is not None:
         return exact_match
+    if re.fullmatch(r"/(?:v1/)?search/[^/]+", path) is not None:
+        return "/search"
     suffix_match = next((suffix for suffix in _LLM_ROUTE_SUFFIXES if path == suffix or path.endswith(suffix)), None)
     if suffix_match is not None:
         return suffix_match
@@ -303,13 +306,25 @@ class BillableRequestMetricsMiddleware:
                 model_id = _extract_model_id(response_start.get("headers", []))
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
-
-        if sink is not None:
+        def record_gateway_request(response_status: int) -> None:
+            if sink is None:
+                return
             try:
-                sink.record(category=category, route=route, status_code=status_code)
+                sink.record(category=category, route=route, status_code=response_status)
             except Exception:  # noqa: BLE001 -- metering must never fail a request that was already served
                 verbose_proxy_logger.warning("gateway request metering failed for %s", route, exc_info=True)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as error:
+            if sink is not None:
+                record_gateway_request(
+                    status_code
+                    or (503 if PrismaDBExceptionHandler.is_database_service_unavailable_error_in_chain(error) else 500)
+                )
+            raise
+
+        record_gateway_request(status_code)
 
         if recorder is not None and 200 <= status_code < 300:
             try:
