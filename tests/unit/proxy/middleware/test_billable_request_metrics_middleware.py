@@ -10,14 +10,17 @@ import asyncio
 import threading
 from datetime import datetime, timezone
 from typing import Final, List, Optional, Tuple
+from unittest.mock import AsyncMock
 
 import pytest
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.testclient import TestClient
+from starlette.types import Receive, Scope, Send
 
 from litellm.proxy.db.gateway_request_tracking import GatewayRequestAccumulator
 from litellm.proxy.middleware.billable_request_metrics_middleware import (
@@ -142,6 +145,12 @@ def test_classify_billable(path: str, expected: Tuple[BillableCategory, str]):
     assert classify_billable_request(path) == expected
 
 
+@pytest.mark.parametrize("path", ("/search/web-search", "/v1/search/web-search", "/v1/search/embeddings/"))
+def test_classify_named_search_routes_into_one_search_bucket(path: str) -> None:
+    assert classify_billable_request(path) == (BillableCategory.LLM, "/search")
+    assert classify_billable_request(path, "GET") is None
+
+
 @pytest.mark.parametrize(
     "path",
     [
@@ -153,6 +162,9 @@ def test_classify_billable(path: str, expected: Tuple[BillableCategory, str]):
         "/v1/models",
         "/key/generate",
         "/v1/files",
+        "/v1/search/web-search/history",
+        "/admin/search/web-search",
+        "/v1/search_tools/web-search",
         # tokenization helper, not an inference call
         "/v1/messages/count_tokens",
         # OpenAI Assistants thread messages write no SpendLogs row
@@ -546,6 +558,61 @@ def test_sink_records_failures_that_billing_ignores(status_code: int):
     sink, recorder = FakeSink(), FakeRecorder()
     TestClient(_make_sink_app(recorder, sink, status_code=status_code)).post("/v1/chat/completions")
     assert [call["status_code"] for call in sink.calls] == [status_code]
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    ("started_status", "error", "expected_status"),
+    (
+        (None, RuntimeError("synthetic handler failure"), 500),
+        (None, ConnectionError("synthetic database unavailable"), 503),
+        (200, RuntimeError("synthetic background failure"), 200),
+    ),
+)
+def test_sink_records_unhandled_exception_without_changing_status_or_billing(
+    started_status: int | None, error: Exception, expected_status: int
+) -> None:
+    from litellm.proxy.proxy_server import otel_unhandled_exception_handler
+
+    sink, recorder = FakeSink(), FakeRecorder()
+
+    def fail() -> None:
+        raise error
+
+    async def handler(_request: Request) -> Response:
+        if started_status is None:
+            raise error
+        return JSONResponse({}, status_code=started_status, background=BackgroundTask(fail))
+
+    app: Final = Starlette(
+        routes=[Route("/v1/chat/completions", handler, methods=["POST"])],
+        exception_handlers={Exception: otel_unhandled_exception_handler},
+    )
+    app.add_middleware(BillableRequestMetricsMiddleware, recorder=recorder, sink=sink)
+    with pytest.raises(type(error)) as caught:
+        TestClient(app).post("/v1/chat/completions")
+
+    assert caught.value is error
+    assert sink.calls == [
+        {"category": BillableCategory.LLM, "route": "/chat/completions", "status_code": expected_status}
+    ]
+    assert recorder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_does_not_record_an_http_500() -> None:
+    sink, recorder = FakeSink(), FakeRecorder()
+    cancelled: Final = asyncio.CancelledError("synthetic cancellation")
+
+    async def inner(_scope: Scope, _receive: Receive, _send: Send) -> None:
+        raise cancelled
+
+    middleware: Final = BillableRequestMetricsMiddleware(inner, recorder=recorder, sink=sink)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await middleware({"type": "http", "path": "/v1/chat/completions", "method": "POST"}, AsyncMock(), AsyncMock())
+
+    assert caught.value is cancelled
+    assert sink.calls == []
     assert recorder.calls == []
 
 
