@@ -123,6 +123,7 @@ from litellm.proxy.native_compaction import with_proxy_compaction_executor
 from litellm.proxy.route_llm_request import (
     route_request,
 )
+from litellm.proxy.session_identity import apply_inferred_session_id
 from litellm.proxy.telemetry.request_context import bind_call_id as bind_telemetry_call_id
 from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
     ProxyLogging,
@@ -2271,6 +2272,22 @@ class ProxyBaseLLMRequestProcessing:
                     self.data["model"] = alias_target
 
         aliased_model: Final = self.data.get("model")
+
+        if (
+            llm_router is not None
+            and general_settings.get("infer_session_id") is True
+            and route_type
+            in (
+                "acompletion",
+                "aresponses",
+                "_aresponses_websocket",
+                "anthropic_messages",
+            )
+        ):
+            await apply_inferred_session_id(
+                request_data=self.data,  # pyright: ignore[reportUnknownArgumentType]  # request payload is assembled dynamically
+                cache=llm_router.cache,
+            )
 
         litellm_call_id: Final = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
         self.data["litellm_call_id"] = litellm_call_id
