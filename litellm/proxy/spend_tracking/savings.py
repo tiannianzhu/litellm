@@ -535,9 +535,8 @@ def autorouter_savings_for_request(
         selected_model=model,
         selected_provider=custom_llm_provider,
         usage=usage,
-        # Absent means the router never recorded a shape, which is the conservative
-        # reading: charge the cache write rather than claim a first turn's saving.
-        conversation_continuing=decision.get("conversation_continuing") is not False,
+        # Conversation history proves neither a model switch nor a warm baseline cache.
+        conversation_continuing=False,
         selected_info=_effective_model_info(router_instance, model_id, model or ""),
         baseline_info=_effective_model_info(router_instance, baseline_id, baseline_model or ""),
         cost_breakdown=cost_breakdown,
@@ -630,9 +629,10 @@ def compute_savings_spend(
     savings, and dropping such a request from the attributed figure can lift it above
     the total. Auto-router savings compare the
     served ``model`` against the counterfactual baseline the router recorded on
-    its ``routing_decision``, and are zero unless the two differ. That record
-    also says whether the conversation was already underway, which is what tells
-    a mid-conversation switch from a first turn.
+    its ``routing_decision``, and are zero unless the two differ. Both models are
+    priced with the cache buckets the provider actually reported: conversation
+    history alone does not prove that the selected model changed or that the
+    baseline model had a warm cache.
 
     ``llm_router`` is passed as a provider rather than a router because every spend write
     calls this and only auto-routed ones need one, so looking it up eagerly at the call

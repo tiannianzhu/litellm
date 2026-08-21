@@ -543,18 +543,21 @@ def test_autorouter_savings_zero_without_baseline():
     assert result.autorouter == 0.0
 
 
-def test_compute_savings_spend_carries_a_losing_switch_through():
-    """The signed value must survive into SavingsSpend; clamping it here would put the
-    dashboard back to only ever showing gains."""
+def test_compute_savings_spend_does_not_infer_a_cache_switch_from_history():
+    """Conversation history proves neither a model switch nor a warm baseline cache."""
+    usage_object = _cached_usage_object()
     result = compute_savings_spend(
         model="claude-haiku-4-5",
         custom_llm_provider="anthropic",
         compression_saved_tokens=0,
         gateway_injected_cache=True,
         routing_decision={"conversation_continuing": True, "savings_baseline_model": "anthropic/claude-sonnet-5"},
-        usage_object=_cached_usage_object(),
+        usage_object=usage_object,
     )
-    assert result.autorouter < 0
+
+    expected = _cost_on("claude-sonnet-5", usage_object) - _cost_on("claude-haiku-4-5", usage_object)
+    assert result.autorouter == pytest.approx(expected)
+    assert result.autorouter > 0
 
 
 def test_the_driver_is_off_until_a_baseline_is_configured():
@@ -962,6 +965,7 @@ def test_a_leftover_configured_baseline_does_not_override_the_recorded_one(monke
         selected_model="claude-haiku-4-5",
         selected_provider="anthropic",
         usage=Usage(**_cached_usage_object()),
+        conversation_continuing=False,
     )
     assert result.autorouter == against_opus
 
