@@ -2418,6 +2418,13 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     admission_queue_timeout_seconds: float = Field(
         1.0, gt=0, description="maximum time a request waits for a worker slot"
     )
+    infer_session_id: bool = Field(
+        False,
+        description=(
+            "Infer an internal session ID from growing message prefixes when the client does not provide one. "
+            "This groups conversation logs without pinning the routed model."
+        ),
+    )
     plugins: list[PluginConfig] | None = Field(
         None, description="external services registered as embeddable UI plugins"
     )

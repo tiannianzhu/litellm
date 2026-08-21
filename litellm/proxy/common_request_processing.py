@@ -63,6 +63,7 @@ from litellm.proxy.common_utils.sse_keepalive import (
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.guardrails.auto_router_compression import arm_pre_call as _arm_auto_router_compression
 from litellm.proxy.route_llm_request import route_request
+from litellm.proxy.session_identity import apply_inferred_session_id
 from litellm.proxy.utils import ProxyLogging, _check_and_merge_model_level_guardrails
 from litellm.router import Router
 from litellm.router_utils.add_retry_fallback_headers import get_hidden_params_dict
@@ -1956,6 +1957,22 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if alias_target is not None:
                     self.data["model"] = alias_target
+
+        if (
+            llm_router is not None
+            and general_settings.get("infer_session_id") is True
+            and route_type
+            in (
+                "acompletion",
+                "aresponses",
+                "_aresponses_websocket",
+                "anthropic_messages",
+            )
+        ):
+            await apply_inferred_session_id(
+                request_data=self.data,  # pyright: ignore[reportUnknownArgumentType]  # request payload is assembled dynamically
+                cache=llm_router.cache,
+            )
 
         self.data["litellm_call_id"] = request.headers.get("x-litellm-call-id", str(uuid.uuid4()))
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))

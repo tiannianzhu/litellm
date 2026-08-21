@@ -25848,6 +25848,12 @@ export interface components {
              * @description for `/models` endpoint, infers available model based on environment keys (e.g. OPENAI_API_KEY)
              */
             infer_model_from_keys?: boolean | null;
+            /**
+             * Infer Session Id
+             * @description Infer an internal session ID from growing message prefixes when the client does not provide one. This groups conversation logs without pinning the routed model.
+             * @default false
+             */
+            infer_session_id: boolean;
             /** @description key manager to load keys from / decrypt keys with */
             key_management_system?: components["schemas"]["KeyManagementSystem"] | null;
             /**

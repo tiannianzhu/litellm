@@ -6954,6 +6954,62 @@ class TestPerRequestModelGroupAlias:
 
         assert merged_for == ["group-b"]
 
+class TestSessionIdentityFallback:
+    @pytest.mark.asyncio
+    async def test_direct_model_call_applies_global_prefix_fallback_before_hooks(self, monkeypatch):
+        processing = ProxyBaseLLMRequestProcessing(
+            data={
+                "model": "deepseek-v4-flash",
+                "messages": [{"role": "user", "content": "Review this repository."}],
+                "metadata": {"user_api_key_hash": "shared-key"},
+            }
+        )
+        request = MagicMock(spec=Request)
+        request.headers = {}
+
+        async def preserve_request_data(*args, **kwargs):
+            return kwargs["data"]
+
+        async def preserve_hook_data(user_api_key_dict, data, call_type):
+            return data
+
+        async def stamp_session(*, request_data, cache):
+            request_data["metadata"]["session_id"] = "prefix-direct"
+            return "prefix-direct"
+
+        proxy_logging = MagicMock(spec=ProxyLogging)
+        proxy_logging.pre_call_hook = AsyncMock(side_effect=preserve_hook_data)
+        proxy_config = MagicMock(spec=ProxyConfig)
+        proxy_config._get_hierarchical_router_settings = AsyncMock(return_value=None)
+        router = MagicMock(spec=litellm.Router)
+        router.cache = MagicMock()
+
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "add_litellm_data_to_request",
+            preserve_request_data,
+        )
+        monkeypatch.setattr(
+            litellm.proxy.common_request_processing,
+            "apply_inferred_session_id",
+            AsyncMock(side_effect=stamp_session),
+        )
+        monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", MagicMock())
+
+        returned_data, _ = await processing.common_processing_pre_call_logic(
+            request=request,
+            general_settings={"infer_session_id": True},
+            user_api_key_dict=ProxyUserAPIKeyAuth(api_key="hash", models=[]),
+            proxy_logging_obj=proxy_logging,
+            proxy_config=proxy_config,
+            route_type="acompletion",
+            llm_router=router,
+        )
+
+        assert returned_data["model"] == "deepseek-v4-flash"
+        assert returned_data["metadata"]["session_id"] == "prefix-direct"
+        assert proxy_logging.pre_call_hook.call_args.kwargs["data"]["metadata"]["session_id"] == "prefix-direct"
+
 
 class TestInjectCostIntoUsageDict:
     @staticmethod

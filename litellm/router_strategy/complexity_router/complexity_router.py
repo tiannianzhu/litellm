@@ -3267,8 +3267,12 @@ class ComplexityRouter(CustomLogger):
         conversation_continuing: Final = _conversation_is_continuing(resolved_messages)
 
         use_session_affinity: Final = self._uses_tier_pin
-        session_id: Final = self._get_session_id_from_request_kwargs(request_kwargs) if use_session_affinity else None
-        cache_key = self._get_session_affinity_cache_key(session_id, request_kwargs) if session_id is not None else None
+        session_id: Final = self._get_session_id_from_request_kwargs(request_kwargs)
+        cache_key = (  # rebind-ok: later routing branches may replace the affinity key
+            self._get_session_affinity_cache_key(session_id, request_kwargs)
+            if use_session_affinity and session_id is not None
+            else None
+        )
 
         # In 'user_turn' mode a held pin is replayed only on continuation turns; a new human
         # ask falls through and re-classifies. session_affinity restores pin-first for asks too.
