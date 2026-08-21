@@ -18,7 +18,6 @@ from openai.types.responses.response_function_web_search import (
 from pydantic import TypeAdapter, ValidationError
 
 import litellm
-from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import message_field
 from litellm.constants import CALLER_SESSION_ID_METADATA_KEY
 from litellm.integrations.anthropic_cache_control_hook import MAX_CACHE_CONTROL_BLOCKS, AnthropicCacheControlHook
 from litellm.litellm_core_utils.hidden_params import HIDDEN_PARAMS_ATTR
@@ -26,6 +25,7 @@ from litellm.litellm_core_utils.prompt_templates.factory import (
     _bedrock_converse_messages_pt,
     anthropic_messages_pt,
 )
+from litellm.litellm_core_utils.prompt_templates.mid_conversation_system import message_field
 from litellm.responses.litellm_completion_transformation.reasoning_items import encode_thinking_blocks
 from litellm.responses.litellm_completion_transformation.tool_search import tool_search_routing
 from litellm.responses.litellm_completion_transformation.transformation import (
@@ -7884,7 +7884,7 @@ def _continued_chain_request(request_kwargs: Mapping[str, object]) -> Mapping[st
 
 
 @pytest.mark.parametrize(
-    ("request_kwargs", "logged_metadata_key"),
+    ("request_kwargs", "logged_metadata_key", "session_id"),
     [
         (
             {
@@ -7892,38 +7892,45 @@ def _continued_chain_request(request_kwargs: Mapping[str, object]) -> Mapping[st
                 "litellm_metadata": {CALLER_SESSION_ID_METADATA_KEY: "turn-session", "user_api_key": "hashed"},
             },
             "litellm_metadata",
+            "turn-session",
         ),
-        ({"metadata": {"user_api_key": "hashed"}}, "metadata"),
+        ({"metadata": {"user_api_key": "hashed"}}, "metadata", "chain-session"),
     ],
 )
-def test_a_continued_chain_logs_its_spend_under_the_chain_session_with_request_correlation(
-    monkeypatch: pytest.MonkeyPatch, request_kwargs: Mapping[str, object], logged_metadata_key: str
+@pytest.mark.parametrize("correlation_enabled", [False, True])
+def test_a_continued_chain_keeps_its_session_and_current_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    request_kwargs: Mapping[str, object],
+    logged_metadata_key: str,
+    session_id: str,
+    correlation_enabled: bool,
 ):
-    monkeypatch.setattr(litellm, "request_correlation_in_logs", True)
-    sent_kwargs: Final = deepcopy(request_kwargs)
+    monkeypatch.setattr(litellm, "request_correlation_in_logs", correlation_enabled)
+    sent_kwargs: Final = deepcopy({**request_kwargs, "litellm_trace_id": "turn-trace"})
 
-    request: Final = _continued_chain_request(request_kwargs)
+    request: Final = _continued_chain_request(sent_kwargs)
+    forwarded: Final = {**sent_kwargs, **request}
 
-    assert request["litellm_trace_id"] == "chain-session"
-    assert "litellm_session_id" not in request
-    assert request[logged_metadata_key] == {
+    assert forwarded["litellm_trace_id"] == "turn-trace"
+    assert forwarded["litellm_session_id"] == session_id
+    assert forwarded[logged_metadata_key] == {
         **TypeAdapter(dict[str, object]).validate_python(request_kwargs[logged_metadata_key]),
-        CALLER_SESSION_ID_METADATA_KEY: "chain-session",
+        **({"session_id": session_id} if session_id == "chain-session" else {}),
     }
-    assert request_kwargs == sent_kwargs
+    assert sent_kwargs == {**request_kwargs, "litellm_trace_id": "turn-trace"}
 
 
-def test_a_continued_chain_leaves_the_turns_metadata_alone_without_request_correlation(
+def test_a_continued_chain_preserves_the_callers_explicit_session_without_request_correlation(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(litellm, "request_correlation_in_logs", False)
-    caller_metadata: Final = {CALLER_SESSION_ID_METADATA_KEY: "turn-session", "user_api_key": "hashed"}
+    caller_metadata: Final = {"session_id": "turn-session", "user_api_key": "hashed"}
 
     request: Final = _continued_chain_request({"metadata": caller_metadata, "litellm_metadata": caller_metadata})
 
-    assert request["litellm_trace_id"] == "chain-session"
+    assert request["litellm_session_id"] == "turn-session"
     assert "litellm_metadata" not in request
-    assert request["metadata"] == {CALLER_SESSION_ID_METADATA_KEY: "turn-session", "user_api_key": "hashed"}
+    assert request["metadata"] == caller_metadata
 
 
 @pytest.mark.asyncio

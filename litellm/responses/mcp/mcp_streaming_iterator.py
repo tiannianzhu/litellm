@@ -921,6 +921,9 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
                     self.tool_execution_events.extend(call_events[:-1])
 
             # Execute the tools
+            parent_session_id, session_id_omitted = LiteLLM_Proxy_MCP_Handler.get_parent_session_context(
+                self.original_request_params
+            )
             tool_results: Final = await LiteLLM_Proxy_MCP_Handler.execute_tool_calls(
                 tool_server_map=self.tool_server_map,
                 served_tools=self.served_tools,
@@ -932,6 +935,8 @@ class MCPEnhancedStreamingIterator(BaseResponsesAPIStreamingIterator):
                 raw_headers=self.raw_headers,
                 litellm_call_id=self.litellm_call_id,
                 litellm_trace_id=self.litellm_trace_id,
+                litellm_session_id=parent_session_id,
+                session_id_omitted=session_id_omitted,
                 request_tags=LiteLLM_Proxy_MCP_Handler.get_parent_request_tags(self.original_request_params),
                 guardrail_context=MCPRequestContext.resolve_guardrail_context(self.original_request_params),
             )

@@ -12,7 +12,7 @@ from typing_extensions import TypedDict as ExtraItemsTypedDict
 from typing_extensions import Unpack
 
 from litellm._logging import verbose_logger
-from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG
+from litellm.constants import MAXIMUM_TRACEBACK_LINES_TO_LOG, SESSION_ID_OMITTED_METADATA_KEY
 from litellm.litellm_core_utils.allowed_tools_tool_choice import (
     NO_GATEWAY_TOOLS,
     GatewayTool,
@@ -21,8 +21,9 @@ from litellm.litellm_core_utils.allowed_tools_tool_choice import (
     parse_allowed_tools_tool_choice,
     tool_calls_the_choice_excludes,
 )
-from litellm.litellm_core_utils.core_helpers import attribute_or_none
+from litellm.litellm_core_utils.core_helpers import as_str_mapping, attribute_or_none
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
 from litellm.proxy.mcp_server.catalog import catalog_operation, global_manager
 from litellm.proxy.mcp_server.utils import (
     iter_known_server_prefixes,
@@ -213,6 +214,50 @@ class LiteLLM_Proxy_MCP_Handler:
     _get_parent_request_tags = get_parent_request_tags
 
     @staticmethod
+    def get_parent_session_context(request_kwargs: Mapping[str, object]) -> tuple[str | None, bool]:
+        logging_obj: Final = request_kwargs.get("litellm_logging_obj")
+        logged_params: Final[Mapping[str, object]] = (
+            as_str_mapping(attribute_or_none(logging_obj, "litellm_params")) or dict[str, object]()
+            if isinstance(logging_obj, LiteLLMLoggingObj)
+            else dict[str, object]()
+        )
+        parent_params: Final = {**logged_params, **request_kwargs}
+        metadata_buckets: Final = tuple(
+            bucket
+            for bucket in (
+                as_str_mapping(parent_params.get("litellm_metadata")),
+                as_str_mapping(parent_params.get("metadata")),
+                as_str_mapping(logged_params.get("litellm_metadata")),
+                as_str_mapping(logged_params.get("metadata")),
+            )
+            if bucket is not None
+        )
+        session_id_omitted: Final = any(bucket.get(SESSION_ID_OMITTED_METADATA_KEY) for bucket in metadata_buckets)
+        metadata: Final[Mapping[str, object]] = next(
+            (bucket for bucket in metadata_buckets if bucket.get("session_id")), dict[str, object]()
+        )
+        logging_session_id: Final = (
+            StandardLoggingPayloadSetup.get_standard_logging_payload_session_id(
+                logging_obj, {**parent_params, "metadata": metadata}
+            )
+            if isinstance(logging_obj, LiteLLMLoggingObj)
+            else None
+        )
+        session_id: Final = logging_session_id or next(
+            (
+                value
+                for value in (
+                    request_kwargs.get("litellm_session_id"),
+                    request_kwargs.get("session_id"),
+                    metadata.get("session_id"),
+                )
+                if isinstance(value, str) and value
+            ),
+            None,
+        )
+        return session_id, session_id_omitted
+
+    @staticmethod
     def should_use_litellm_mcp_gateway(tools: Iterable[ToolParam] | None) -> bool:
         return may_name_litellm_mcp_gateway(tools)
 
@@ -365,6 +410,8 @@ class LiteLLM_Proxy_MCP_Handler:
         raw_headers: dict[str, str] | None = None,
         granted_toolsets: "GrantedToolsetIds | None" = None,
         request_trace_id: str | None = None,
+        litellm_session_id: str | None = None,
+        session_id_omitted: bool = False,
     ) -> tuple[list[MCPTool], list[str]]:
         """
         Get available tools from the MCP server manager.
@@ -433,6 +480,8 @@ class LiteLLM_Proxy_MCP_Handler:
             log_list_tools_to_spendlogs=True,
             list_tools_log_source="responses",
             litellm_trace_id=litellm_trace_id,
+            litellm_session_id=litellm_session_id,
+            session_id_omitted=session_id_omitted,
             request_trace_id=request_trace_id,
             request_tags=request_tags,
             raw_headers=raw_headers,
@@ -527,6 +576,8 @@ class LiteLLM_Proxy_MCP_Handler:
         mcp_tools_with_litellm_proxy: Sequence[Mapping[str, object]],
         litellm_trace_id: str | None = None,
         request_tags: list[str] | None = None,
+        litellm_session_id: str | None = None,
+        session_id_omitted: bool = False,
     ) -> tuple[list[FunctionToolParam], dict[str, str]]:
         """
         Centralized method to process MCP tools through the complete pipeline.
@@ -548,6 +599,8 @@ class LiteLLM_Proxy_MCP_Handler:
             mcp_tools_with_litellm_proxy,
             litellm_trace_id=litellm_trace_id,
             request_tags=request_tags,
+            litellm_session_id=litellm_session_id,
+            session_id_omitted=session_id_omitted,
         )
 
         openai_tools: Final = LiteLLM_Proxy_MCP_Handler.transform_mcp_tools_to_openai(deduplicated_mcp_tools)
@@ -566,6 +619,8 @@ class LiteLLM_Proxy_MCP_Handler:
         request_tags: list[str] | None = None,
         raw_headers: dict[str, str] | None = None,
         request_trace_id: str | None = None,
+        litellm_session_id: str | None = None,
+        session_id_omitted: bool = False,
     ) -> tuple[list[MCPTool], dict[str, str]]:
         """
         Process MCP tools through filtering and deduplication pipeline without OpenAI transformation.
@@ -598,6 +653,8 @@ class LiteLLM_Proxy_MCP_Handler:
             request_tags=request_tags,
             raw_headers=raw_headers,
             request_trace_id=request_trace_id,
+            litellm_session_id=litellm_session_id,
+            session_id_omitted=session_id_omitted,
         )
 
         # Step 2: Filter tools based on allowed_tools parameter
@@ -894,6 +951,8 @@ class LiteLLM_Proxy_MCP_Handler:
         guardrail_context: Mapping[str, object] | None = None,
         served_tools: Sequence[MCPTool] | None = None,
         request_trace_id: str | None = None,
+        litellm_session_id: str | None = None,
+        session_id_omitted: bool = False,
     ) -> list[MCPToolResult]:
         """Execute tool calls and return results."""
         from fastapi import HTTPException
@@ -951,6 +1010,8 @@ class LiteLLM_Proxy_MCP_Handler:
                     "tool_name": sanitized_tool_name,
                     "server_name": server_name,
                     "headers": logging_safe_headers,
+                    **({"session_id": litellm_session_id} if litellm_session_id else {}),
+                    **({SESSION_ID_OMITTED_METADATA_KEY: True} if session_id_omitted else {}),
                 }
                 logging_request_data = {
                     "model": f"MCP: {tool_name}",
@@ -958,6 +1019,7 @@ class LiteLLM_Proxy_MCP_Handler:
                     "input": logging_input,
                     "call_type": CallTypes.call_mcp_tool.value,
                     "litellm_call_id": tool_logging_call_id,
+                    **({"litellm_session_id": litellm_session_id} if litellm_session_id else {}),
                     # Add proxy_server_request with arguments for callback logging
                     "proxy_server_request": {
                         "url": "/mcp/tools/call",

@@ -400,6 +400,21 @@ class TestMetadataFallsBackToLitellmMetadata:
         assert result["litellm_session_id"] == "session-1"
         assert result["litellm_trace_id"] == "trace-1"
 
+    @pytest.mark.parametrize(
+        ("litellm_metadata", "session_id", "trace_id"),
+        [
+            ({"trace_id": "trace-1"}, None, "trace-1"),
+            ({"session_id": "session-1"}, "session-1", None),
+        ],
+    )
+    def test_metadata_does_not_cross_fill_session_and_trace_ids(
+        self, litellm_metadata: dict[str, str], session_id: str | None, trace_id: str | None
+    ):
+        result = get_litellm_params(litellm_metadata=litellm_metadata)
+
+        assert result["litellm_session_id"] == session_id
+        assert result["litellm_trace_id"] == trace_id
+
     def test_explicit_session_and_trace_id_are_not_overridden(self):
         result = get_litellm_params(
             litellm_session_id="explicit-session",
@@ -419,13 +434,11 @@ class TestMetadataFallsBackToLitellmMetadata:
         result["metadata"].pop("trace_id")
         assert litellm_metadata == {"trace_id": "trace-1"}
 
-    def test_session_id_derived_from_trace_id_adds_no_provider_params(self):
+    def test_trace_metadata_adds_no_session_or_provider_params(self):
         from_trace_id: Final = get_litellm_params(metadata={"trace_id": "trace-1"})
         from_session_id: Final = get_litellm_params(metadata={"session_id": "session-1"})
-        added_by_trace_id: Final = from_trace_id.keys() - from_session_id.keys()
-
-        assert added_by_trace_id
-        assert not added_by_trace_id & get_non_default_completion_params(from_trace_id).keys()
+        assert from_trace_id["litellm_session_id"] is None
+        assert get_non_default_completion_params(from_trace_id) == get_non_default_completion_params(from_session_id)
 
 
 @pytest.mark.parametrize(

@@ -55,6 +55,7 @@ from litellm._logging import verbose_logger
 from litellm.constants import (
     MAXIMUM_TRACEBACK_LINES_TO_LOG,
     MCP_TOOL_LISTING_TIMEOUT,
+    SESSION_ID_OMITTED_METADATA_KEY,
 )
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.proxy._types import (
@@ -1293,6 +1294,16 @@ async def find_mcp_proxy_tool(
             lookup.cancel()
 
 
+def _logging_ids_from_headers(raw_headers: Mapping[str, str] | None) -> tuple[str | None, str | None]:
+    if not raw_headers:
+        return None, None
+    trace_headers: Final = {name: value for name, value in raw_headers.items() if name.lower() == "x-litellm-trace-id"}
+    session_headers: Final = {
+        name: value for name, value in raw_headers.items() if name.lower() != "x-litellm-trace-id"
+    }
+    return get_chain_id_from_headers(trace_headers), get_chain_id_from_headers(session_headers)
+
+
 @catalog_operation(lambda: global_mcp_server_manager)
 async def _get_tools_from_mcp_servers(
     user_api_key_auth: UserAPIKeyAuth | None,
@@ -1314,6 +1325,8 @@ async def _get_tools_from_mcp_servers(
     request_trace_id: str | None = None,
     enforce_rate_limits: bool = True,
     use_tool_list_cache: bool = True,
+    litellm_session_id: str | None = None,
+    session_id_omitted: bool = False,
 ) -> AggregateToolListing:
     """
     Helper method to fetch tools from MCP servers based on server filtering criteria.
@@ -1340,8 +1353,9 @@ async def _get_tools_from_mcp_servers(
         # This is intentionally minimal: only async_success_handler / post_call_failure_hook
         rules_obj: Final = Rules()
         list_tools_call_id: Final = str(uuid.uuid4())
-        # Derive trace_id from raw_headers when not explicitly passed (same as A2A / MCP call_tool)
-        effective_litellm_trace_id: Final = litellm_trace_id or get_chain_id_from_headers(raw_headers)
+        header_trace_id, header_session_id = _logging_ids_from_headers(raw_headers)
+        effective_litellm_trace_id: Final = litellm_trace_id or header_trace_id
+        effective_session_id: Final = litellm_session_id or (None if session_id_omitted else header_session_id)
         spend_logs_metadata: Final[dict[str, object]] = {
             "mcp_operation": "list_tools",
         }
@@ -1355,11 +1369,14 @@ async def _get_tools_from_mcp_servers(
             "call_type": CallTypes.list_mcp_tools.value,
             "litellm_call_id": list_tools_call_id,
             "litellm_trace_id": effective_litellm_trace_id,
+            **({"litellm_session_id": effective_session_id} if effective_session_id else {}),
             "metadata": {
                 "spend_logs_metadata": spend_logs_metadata,
                 "headers": logging_safe_mcp_headers(raw_headers),
+                **({"session_id": effective_session_id} if effective_session_id else {}),
                 **({"tags": request_tags} if request_tags else {}),
                 **({"existing_trace_id": request_trace_id} if request_trace_id else {}),
+                **({SESSION_ID_OMITTED_METADATA_KEY: True} if session_id_omitted else {}),
             },
             # Provide a small input payload for standard logging
             "input": [
@@ -3535,13 +3552,13 @@ async def _execute_mcp_server_tool_call(
         if virtual_tool_result is not None:
             return virtual_tool_result
 
-        # Create a body date for logging
-        body_data: Final = {"name": params.name, "arguments": params.arguments}
-        # Set trace/session id from raw_headers so spend logs and logging_obj stay consistent (same as A2A)
-        chain_id: Final = get_chain_id_from_headers(raw_headers)
-        if chain_id:
-            body_data["litellm_trace_id"] = chain_id
-            body_data["litellm_session_id"] = chain_id
+        header_trace_id, header_session_id = _logging_ids_from_headers(raw_headers)
+        body_data: Final = {
+            "name": params.name,
+            "arguments": params.arguments,
+            **({"litellm_trace_id": header_trace_id} if header_trace_id else {}),
+            **({"litellm_session_id": header_session_id} if header_session_id else {}),
+        }
 
         request: Final = build_synthetic_mcp_request(
             path="/mcp/tools/call",

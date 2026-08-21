@@ -2611,6 +2611,13 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     admission_queue_timeout_seconds: float = Field(
         1.0, gt=0, description="maximum time a request waits for a worker slot"
     )
+    infer_session_id: bool = Field(
+        False,
+        description=(
+            "Infer an internal session ID from growing message prefixes when the client does not provide one. "
+            "This groups conversation logs without pinning the routed model."
+        ),
+    )
     plugins: list[PluginConfig] | None = Field(
         None, description="external services registered as embeddable UI plugins"
     )
@@ -2911,7 +2918,14 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     )
     missing_session_id: Literal["generate", "reject", "omit"] | None = Field(
         None,
-        description="What to do with LLM API requests that carry no session id (x-litellm-session-id header, metadata.session_id, etc.). 'generate' stamps one id into litellm_session_id, litellm_trace_id and metadata.session_id so SpendLogs and logging callbacks agree; 'reject' returns 400; 'omit' leaves SpendLogs.session_id null, matching callbacks such as Langfuse that only record a client-established metadata.session_id. Unset keeps the legacy behavior where SpendLogs falls back to the trace id while callbacks get no session id.",
+        description=(
+            "Controls missing-session handling during LLM request preprocessing. "
+            "'generate' creates litellm_session_id and the matching metadata.session_id or litellm_metadata.session_id. "
+            "'reject' returns 400. 'omit' preserves a supplied session ID and otherwise leaves it absent. "
+            "Unset does not generate a session ID or copy a trace ID. Supplied session IDs stay on the request. "
+            "Trace IDs remain independent. Batch lifecycle spend logs retain batch-ID grouping ahead of caller "
+            "session IDs unless the request's missing-session omission policy applies"
+        ),
     )
     enable_public_model_hub: bool = Field(
         default=False,

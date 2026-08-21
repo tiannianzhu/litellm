@@ -1223,7 +1223,31 @@ async def test_tool_operation_preserves_failure_messages_and_request_trace(failu
     assert "private-test-header" not in result.content[0].text
     dispatch.assert_awaited_once()
     assert dispatch.await_args.kwargs["litellm_trace_id"] == "operation-trace"
-    assert dispatch.await_args.kwargs["litellm_session_id"] == "operation-trace"
+    assert dispatch.await_args.kwargs.get("litellm_session_id") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trace_id", (None, "operation-trace"))
+async def test_tool_operation_keeps_header_session_independent_of_trace(trace_id: str | None) -> None:
+    from mcp.types import CallToolRequest, CallToolRequestParams, CallToolResult
+
+    dispatch: Final = AsyncMock(return_value=CallToolResult(content=[]))
+    context: Final = prepare_context(
+        raw_headers={
+            "X-LiteLLM-Session-Id": "operation-session",
+            **({"x-litellm-trace-id": trace_id} if trace_id is not None else {}),
+        }
+    )
+    with patch.object(operations, "call_mcp_tool", dispatch):
+        result: Final = await GatewayOperations().execute(
+            CallToolRequest(params=CallToolRequestParams(name="catalog-tool", arguments={})), context
+        )
+
+    assert result.is_error is False
+    assert result.content == []
+    dispatch.assert_awaited_once()
+    assert dispatch.await_args.kwargs.get("litellm_trace_id") == trace_id
+    assert dispatch.await_args.kwargs["litellm_session_id"] == "operation-session"
 
 
 @pytest.mark.asyncio

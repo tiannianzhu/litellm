@@ -69,6 +69,7 @@ from litellm.responses.litellm_completion_transformation.handler import (
     LiteLLMCompletionTransformationHandler,
 )
 from litellm.responses.litellm_completion_transformation.transformation import (
+    resolve_bridge_session,
     with_compaction_items_as_params,
 )
 from litellm.responses.mcp.request_context import MCPRequestContext
@@ -326,9 +327,9 @@ async def aresponses_api_with_mcp(
         LiteLLM_Proxy_MCP_Handler,
     )
 
-    request_kwargs: Final = _STR_MAPPING.validate_python(kwargs)
+    initial_request_kwargs: Final = _STR_MAPPING.validate_python({**kwargs, "metadata": metadata})
     tool_choice_in_effect: Final = allowed_tools_tool_choice_in_effect(
-        tool_choice, model, drops_unsupported_params(request_kwargs.get("drop_params"))
+        tool_choice, model, drops_unsupported_params(initial_request_kwargs.get("drop_params"))
     )
 
     # Parse MCP tools and separate from other tools
@@ -349,7 +350,18 @@ async def aresponses_api_with_mcp(
         else (None, None, None, None)
     )
 
+    bridge_session: Final = (
+        await resolve_bridge_session(
+            previous_response_id,
+            initial_request_kwargs,
+            previous_response_client_ids(previous_response_id, initial_request_kwargs),
+        )
+        if not provider_stores_the_conversation(model, custom_llm_provider, initial_request_kwargs)
+        else MappingProxyType(dict[str, object]())
+    )
+    request_kwargs: Final = {**initial_request_kwargs, **bridge_session}
     logging_obj: Final = request_kwargs.get("litellm_logging_obj")
+    parent_session_id, session_id_omitted = LiteLLM_Proxy_MCP_Handler.get_parent_session_context(request_kwargs)
     joins_request_trace: Final = isinstance(logging_obj, LiteLLMLoggingObj)
     bridged_first_turn: Final = (
         joins_request_trace
@@ -372,10 +384,12 @@ async def aresponses_api_with_mcp(
         user_api_key_auth=user_api_key_auth,
         mcp_tools_with_litellm_proxy=mcp_tools_with_litellm_proxy,
         litellm_trace_id=listing_trace_id,
+        litellm_session_id=parent_session_id,
+        session_id_omitted=session_id_omitted,
         request_trace_id=None if stream else _langfuse_request_trace_id(request_kwargs, listing_trace_id),
         mcp_auth_header=mcp_auth_header,
         mcp_server_auth_headers=mcp_server_auth_headers,
-        request_tags=LiteLLM_Proxy_MCP_Handler.get_parent_request_tags(kwargs),
+        request_tags=LiteLLM_Proxy_MCP_Handler.get_parent_request_tags(request_kwargs),
         raw_headers=discovery_raw_headers,
     )
     openai_tools: Final = LiteLLM_Proxy_MCP_Handler.transform_mcp_tools_to_openai(original_mcp_tools)
@@ -409,7 +423,7 @@ async def aresponses_api_with_mcp(
         "extra_body": extra_body,
         "timeout": timeout,
         "custom_llm_provider": custom_llm_provider,
-        **kwargs,
+        **request_kwargs,
         "_skip_mcp_handler": True,
     }
 
@@ -441,7 +455,7 @@ async def aresponses_api_with_mcp(
             served_tools=original_mcp_tools,
             tool_choice=tool_choice_in_effect,
             gateway=gateway,
-            **kwargs,
+            **request_kwargs,
         )
         await mcp_streaming_response.start_initial_response()
         return mcp_streaming_response
@@ -511,9 +525,11 @@ async def aresponses_api_with_mcp(
                     raw_headers=raw_headers_from_request,
                     litellm_call_id=_request_call_id(request_kwargs),
                     litellm_trace_id=tool_trace_id,
-                    request_tags=LiteLLM_Proxy_MCP_Handler.get_parent_request_tags(kwargs),
+                    litellm_session_id=parent_session_id,
+                    session_id_omitted=session_id_omitted,
+                    request_tags=LiteLLM_Proxy_MCP_Handler.get_parent_request_tags(request_kwargs),
                     guardrail_context=MCPRequestContext.resolve_guardrail_context(
-                        MappingProxyType({**kwargs, "metadata": metadata, "model": model})
+                        MappingProxyType({**request_kwargs, "model": model})
                     ),
                     request_trace_id=_langfuse_request_trace_id(request_kwargs, tool_trace_id),
                 )

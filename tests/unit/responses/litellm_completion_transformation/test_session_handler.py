@@ -1,22 +1,36 @@
 import json
 import sqlite3
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from itertools import chain
 from types import SimpleNamespace
-from typing import Final
+from typing import Final, cast
 from unittest.mock import AsyncMock, patch
 
-import pytest
 import httpx
+import pytest
 import respx
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 
 import litellm
+from litellm.caching.caching import DualCache
+from litellm.constants import (
+    SESSION_ID_GENERATED_METADATA_KEY,
+    SESSION_ID_INFERRED_METADATA_KEY,
+    SESSION_ID_OMITTED_METADATA_KEY,
+)
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.llms.openai.responses.guardrail_translation.handler import OpenAIResponsesHandler
+from litellm.proxy.session_identity import apply_inferred_session_id
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _get_proxy_server_request_for_spend_logs_payload,
+    get_logging_payload,
 )
 from litellm.responses.litellm_completion_transformation import session_handler
+from litellm.responses.litellm_completion_transformation import transformation as bridge_transformation
 from litellm.responses.litellm_completion_transformation.session_handler import (
     ResponsesSessionHandler,
     _normalize_redacted_tool_call_arguments,
@@ -25,7 +39,7 @@ from litellm.responses.litellm_completion_transformation.transformation import C
 from litellm.responses.mcp.litellm_proxy_mcp_handler import LiteLLM_Proxy_MCP_Handler
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import ResponsesAPIResponse
-from litellm.types.utils import Message
+from litellm.types.utils import CallTypes, Message
 
 
 @pytest.mark.asyncio
@@ -461,7 +475,7 @@ class _FakePrismaClient:
         self.db = _FakePrismaDB(results)
 
 
-def _spend_log(request_id: str, session_id: str, prompt: str, answer: str) -> dict:
+def _spend_log(request_id: str, session_id: str | None, prompt: str, answer: str) -> dict:
     return {
         "request_id": request_id,
         "call_type": "aresponses",
@@ -1345,7 +1359,7 @@ async def test_a_compacted_session_replays_no_turn_sent_after_the_referenced_res
 
 
 class _SqliteBackedPrismaDB:
-    def __init__(self, rows: list[tuple[str, str, str, str, str | None, str | None]]) -> None:
+    def __init__(self, rows: list[tuple[str, str, str | None, str, str | None, str | None]]) -> None:
         self._connection = sqlite3.connect(":memory:")
         self._connection.row_factory = sqlite3.Row
         self._connection.execute(
@@ -1360,6 +1374,364 @@ class _SqliteBackedPrismaDB:
         )
         sqlite_args: Final = tuple(json.dumps(arg) if isinstance(arg, list) else arg for arg in args)
         return [dict(row) for row in self._connection.execute(sqlite_query, sqlite_args)]
+
+
+@pytest.mark.asyncio
+async def test_session_lookup_returns_only_the_referenced_null_session_row():
+    sqlite_db: Final = _SqliteBackedPrismaDB(
+        [
+            ("response-1", "fixture-key", None, "2026-01-01T00:00:01", "", ""),
+            ("unrelated", "fixture-key", None, "2026-01-01T00:00:02", "", ""),
+        ]
+    )
+    with patch("litellm.proxy.proxy_server.disable_spend_logs", True):
+        assert await _history_request_ids(sqlite_db, "response-1") == ["response-1"]
+
+
+class _BridgeSpendLogDB:
+    def __init__(self) -> None:
+        self.connection: Final = sqlite3.connect(":memory:")
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute(
+            'CREATE TABLE "LiteLLM_SpendLogs" '
+            '(request_id TEXT, api_key TEXT, session_id TEXT, "endTime" TEXT, "user" TEXT, team_id TEXT)'
+        )
+        self.rows: dict[str, dict] = {}
+
+    def record(self, row: dict) -> None:
+        request_id: Final = row["request_id"]
+        row["endTime"] = f"2026-01-01T00:00:{len(self.rows) + 1:02d}+00:00"
+        self.rows[request_id] = row
+        self.connection.execute(
+            'INSERT INTO "LiteLLM_SpendLogs" VALUES (?, ?, ?, ?, ?, ?)',
+            (request_id, row["api_key"], row["session_id"], row["endTime"], row["user"], row["team_id"]),
+        )
+
+    async def query_raw(self, query: str, *args: object) -> list[dict]:
+        sql: Final = query.replace("= ANY($1::text[])", "IN (SELECT value FROM json_each(?))").replace("$1", "?")
+        values: Final = tuple(json.dumps(value) if isinstance(value, list) else value for value in args)
+        return [self.rows[row["request_id"]] for row in self.connection.execute(sql, values)]
+
+
+class _BridgeSpendRecorder(CustomLogger):
+    def __init__(self, database: _BridgeSpendLogDB) -> None:
+        super().__init__()
+        self.database: Final = database
+        self.standard_logs: list[dict] = []
+
+    @property
+    def requires_success_await(self) -> bool:
+        return True
+
+    async def async_log_success_event(
+        self, kwargs: dict, response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        row: Final = get_logging_payload(kwargs, response_obj, start_time, end_time)
+        response: Final = row.get("response")
+        if isinstance(response, str):
+            row["response"] = json.loads(response)
+        self.database.record(row)
+        self.standard_logs.append(kwargs["standard_logging_object"])
+
+
+@pytest.mark.asyncio
+async def test_reference_only_session_lookup_does_not_read_other_turns() -> None:
+    database: Final = _SqliteBackedPrismaDB(
+        [
+            ("response-1", "fixture-key", "session-a", "2026-01-01T00:00:01", "", ""),
+            ("response-2", "fixture-key", "session-a", "2026-01-01T00:00:02", "", ""),
+            ("other-owner", "other-key", "session-a", "2026-01-01T00:00:03", "", ""),
+        ]
+    )
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
+    ):
+        exact: Final = await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id(
+            "response-1", include_session_history=False
+        )
+        history: Final = await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id("response-1")
+
+    assert [row["request_id"] for row in exact] == ["response-1"]
+    assert [row["request_id"] for row in history] == ["response-1", "response-2"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_resolver_creates_a_session_before_the_first_model_call() -> None:
+    logging_obj: Final = Logging(
+        model="fixture-model",
+        messages=[],
+        stream=False,
+        call_type="aresponses",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="fixture-call",
+        litellm_trace_id="fixture-trace",
+        function_id="fixture-call",
+    )
+    resolved: Final = await bridge_transformation.resolve_bridge_session(
+        None, {"litellm_logging_obj": logging_obj, "litellm_trace_id": "fixture-trace"}
+    )
+    assert isinstance(resolved.get("litellm_session_id"), str)
+    assert resolved["litellm_session_id"] != "fixture-trace"
+    assert "litellm_trace_id" not in resolved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["explicit", "omit", "inferred", "generated", "alternate-id"])
+async def test_bridge_resolver_obeys_session_policy_without_loading_history(policy: str) -> None:
+    database: Final = _BridgeSpendLogDB()
+    for index in (1, 2):
+        database.record(
+            {
+                **_spend_log(f"response-{index}", "prior-session", f"prompt {index}", f"answer {index}"),
+                "api_key": "fixture-key",
+                "user": "",
+                "team_id": "",
+                "metadata": {"cold_storage_object_key": f"fixture/cold-request-{index}"},
+                "proxy_server_request": {},
+            }
+        )
+    metadata: Final = {
+        "explicit": {"session_id": "caller-session"},
+        "omit": {SESSION_ID_OMITTED_METADATA_KEY: True},
+        "inferred": {"session_id": "inferred-session", SESSION_ID_INFERRED_METADATA_KEY: True},
+        "generated": {"session_id": "generated-session", SESSION_ID_GENERATED_METADATA_KEY: True},
+        "alternate-id": {},
+    }[policy]
+    failed_query: Final = AsyncMock(side_effect=AssertionError("explicit and omitted sessions must not query"))
+    selected_database: Final = SimpleNamespace(query_raw=failed_query) if policy in ("explicit", "omit") else database
+    cold_fetch: Final = AsyncMock(side_effect=AssertionError("session lookup must not read cold storage"))
+    kwargs: Final = {"litellm_metadata": metadata, "litellm_trace_id": "fixture-trace"}
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=selected_database)),
+        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
+        patch("litellm.cold_storage_custom_logger", object()),
+        patch.object(
+            session_handler.COLD_STORAGE_HANDLER,
+            "get_proxy_server_request_from_cold_storage_with_object_key",
+            cold_fetch,
+        ),
+    ):
+        resolved: Final = await bridge_transformation.resolve_bridge_session(
+            "unmatched-id" if policy == "alternate-id" else "response-1",
+            kwargs,
+            ("response-1",) if policy == "alternate-id" else (),
+        )
+
+    assert resolved.get("litellm_session_id") == (
+        "caller-session" if policy == "explicit" else None if policy == "omit" else "prior-session"
+    )
+    assert "litellm_trace_id" not in resolved
+    cold_fetch.assert_not_awaited()
+    failed_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_previous_response_history_keeps_turns_between_reused_sessions() -> None:
+    database: Final = _BridgeSpendLogDB()
+    for index, session in ((1, "session-a"), (2, "session-b"), (3, "session-a")):
+        row: Final = {
+            **_spend_log(f"response-{index}", session, f"prompt {index}", f"answer {index}"),
+            "api_key": "fixture-key",
+            "user": "",
+            "team_id": "",
+        }
+        if index > 1:
+            row["proxy_server_request"]["previous_response_id"] = f"response-{index - 1}"
+        database.record(row)
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
+    ):
+        history: Final = await ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id(
+            "response-3"
+        )
+
+    assert [(message.get("role"), _text_of(message.get("content"))) for message in history["messages"]] == [
+        ("user", "prompt 1"),
+        ("assistant", "answer 1"),
+        ("user", "prompt 2"),
+        ("assistant", "answer 2"),
+        ("user", "prompt 3"),
+        ("assistant", "answer 3"),
+    ]
+    assert history["litellm_session_id"] == "session-a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_owner", [False, True])
+async def test_legacy_null_session_history_follows_cold_stored_previous_ids_within_the_owner(same_owner: bool) -> None:
+    database: Final = _BridgeSpendLogDB()
+    for index, session in ((1, None), (2, None), (3, "continued-session")):
+        row: Final = {
+            **_spend_log(f"response-{index}", session, f"prompt {index}", f"answer {index}"),
+            "api_key": "other-key" if index == 1 and not same_owner else "fixture-key",
+            "user": "",
+            "team_id": "",
+        }
+        if index in (1, 2):
+            row["metadata"] = {"cold_storage_object_key": f"fixture/cold-request-{index}"}
+            row["proxy_server_request"] = {}
+        elif index == 3:
+            row["proxy_server_request"]["previous_response_id"] = "response-2"
+        database.record(row)
+
+    cold_requests: Final = {
+        "fixture/cold-request-1": {"input": "prompt 1"},
+        "fixture/cold-request-2": {"input": "prompt 2", "previous_response_id": "response-1"},
+    }
+    cold_fetch: Final = AsyncMock(side_effect=lambda object_key: cold_requests[object_key])
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database)),
+        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
+        patch("litellm.cold_storage_custom_logger", object()),
+        patch.object(
+            session_handler.COLD_STORAGE_HANDLER,
+            "get_proxy_server_request_from_cold_storage_with_object_key",
+            cold_fetch,
+        ),
+    ):
+        history: Final = await ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id(
+            "response-3"
+        )
+
+    messages: Final = [(message.get("role"), _text_of(message.get("content"))) for message in history["messages"]]
+    assert messages == ([("user", "prompt 1"), ("assistant", "answer 1")] if same_owner else []) + [
+        ("user", "prompt 2"),
+        ("assistant", "answer 2"),
+        ("user", "prompt 3"),
+        ("assistant", "answer 3"),
+    ]
+    assert {call.kwargs["object_key"] for call in cold_fetch.await_args_list} == (
+        {"fixture/cold-request-1", "fixture/cold-request-2"} if same_owner else {"fixture/cold-request-2"}
+    )
+    assert history["litellm_session_id"] == "continued-session"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["default", "inferred", "omit"])
+@pytest.mark.parametrize("correlation_enabled", [False, True])
+async def test_incremental_responses_bridge_preserves_history_session_and_trace(
+    policy: str, correlation_enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database: Final = _BridgeSpendLogDB()
+    recorder: Final = _BridgeSpendRecorder(database)
+    cache: Final = DualCache()
+    sent: list[dict] = []
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": f"chatcmpl-fixture-{len(sent)}",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": f"answer {len(sent)}"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client: Final = AsyncOpenAI(
+        api_key="fixture-key",
+        base_url="https://fixture.invalid/v1",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider)),
+    )
+    monkeypatch.setattr(litellm, "request_correlation_in_logs", correlation_enabled)
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=database))
+    monkeypatch.setattr("litellm.proxy.proxy_server.disable_spend_logs", True)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.general_settings",
+        {"store_prompts_in_spend_logs": True, **({"missing_session_id": "omit"} if policy == "omit" else {})},
+    )
+    monkeypatch.setattr(
+        litellm.llms, "load_guardrail_translation_mappings", lambda: {CallTypes.responses: OpenAIResponsesHandler}
+    )
+
+    previous_id: str | None = None
+    for index in range(1, 4):
+        user_input: Final = [{"role": "user", "content": f"prompt {index}"}]
+        metadata: Final = {
+            "user_api_key_hash": "fixture-key",
+            "user_api_key_end_user_id": "fixture-user",
+            "user_api_key_request_route": "/v1/responses",
+            **({SESSION_ID_OMITTED_METADATA_KEY: True} if policy == "omit" else {}),
+        }
+        request_data: Final = {"model": "openai/fixture-model", "input": user_input, "litellm_metadata": metadata}
+        if policy in ("inferred", "omit"):
+            await apply_inferred_session_id(request_data=request_data, cache=cache)
+        request_body: Final = {"input": user_input, **({"previous_response_id": previous_id} if previous_id else {})}
+        trace_id: Final = f"request-trace-{index}"
+        call_id: Final = f"fixture-call-{index}"
+        logging_obj: Final = Logging(
+            model="openai/fixture-model",
+            messages=user_input,
+            stream=False,
+            call_type="aresponses",
+            start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            litellm_call_id=call_id,
+            litellm_trace_id=trace_id,
+            function_id=call_id,
+            dynamic_async_success_callbacks=[recorder],
+        )
+        response: Final = await litellm.aresponses(
+            model="openai/fixture-model",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture-key",
+            input=user_input,
+            previous_response_id=previous_id,
+            client=client,
+            use_chat_completions_api=True,
+            litellm_call_id=call_id,
+            litellm_trace_id=trace_id,
+            litellm_logging_obj=logging_obj,
+            litellm_metadata=metadata,
+            proxy_server_request={"body": request_body, "headers": {}},
+        )
+        if logging_obj.success_accounting_task is not None:
+            await logging_obj.success_accounting_task
+        previous_id = response.id
+
+    await client.close()
+    assert [log["trace_id"] for log in recorder.standard_logs] == [f"request-trace-{i}" for i in range(1, 4)]
+    sessions: Final = [row["session_id"] for row in database.rows.values()]
+    assert len(sessions) == 3
+    assert (
+        sessions == [None, None, None]
+        if policy == "omit"
+        else sessions[0] and sessions[0] == sessions[1] == sessions[2]
+    )
+    assert [message["role"] for message in sent[-1]["messages"]] == ["user", "assistant", "user", "assistant", "user"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omit_session", [False, True])
+async def test_bridge_follow_up_keeps_current_trace_and_respects_session_policy(omit_session: bool) -> None:
+    async def lookup(_: str) -> ChatCompletionSession:
+        return {"messages": [{"role": "user", "content": "earlier"}], "litellm_session_id": "prior-session"}
+
+    metadata: Final = {SESSION_ID_OMITTED_METADATA_KEY: True} if omit_session else {"session_id": "explicit-session"}
+    kwargs: Final = {"metadata": metadata, "litellm_trace_id": "current-trace"}
+    request: Final = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+        previous_response_id="response-1",
+        litellm_completion_request={"model": "", "messages": [{"role": "user", "content": "new"}]},
+        instructions=None,
+        request_kwargs=kwargs,
+        session_lookup=lookup,
+    )
+    forwarded: Final = {**kwargs, **request}
+    assert forwarded["litellm_trace_id"] == "current-trace"
+    assert forwarded.get("litellm_session_id") in (None, "explicit-session")
+    assert cast(dict, forwarded["metadata"]).get("session_id") == (None if omit_session else "explicit-session")
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,9 @@
 import asyncio
 import json
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections import deque
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Protocol, cast
@@ -196,6 +198,77 @@ class StoredTurns:
     proxy_server_requests: tuple[Mapping[str, object] | None, ...]
 
 
+def _same_spend_log_owner(first: Mapping[str, object], second: Mapping[str, object]) -> bool:
+    user: Final = first.get("user")
+    team_id: Final = first.get("team_id")
+    if user != second.get("user") or team_id != second.get("team_id"):
+        return False
+    api_key: Final = first.get("api_key")
+    return bool(user or team_id) or (api_key is not None and api_key == second.get("api_key"))
+
+
+def stored_request_id(row: Mapping[str, object]) -> str | None:
+    request_id: Final = row.get("request_id")
+    return request_id if isinstance(request_id, str) else None
+
+
+def stored_session_id(row: Mapping[str, object]) -> str | None:
+    session_id: Final = row.get("session_id")
+    return session_id if isinstance(session_id, str) else None
+
+
+def _stored_request_ids(turns: StoredTurns) -> tuple[str, ...]:
+    return tuple(request_id for row in turns.spend_logs if (request_id := stored_request_id(row)) is not None)
+
+
+def _previous_stored_response(request: Mapping[str, object] | None) -> str | None:
+    previous: Final = request.get("previous_response_id") if request is not None else None
+    return previous if isinstance(previous, str) and previous else None
+
+
+def _previous_stored_responses(turns: StoredTurns) -> tuple[str, ...]:
+    return tuple(
+        previous
+        for request in turns.proxy_server_requests
+        if (previous := _previous_stored_response(request)) is not None
+    )
+
+
+def _normalized_end_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    if not isinstance(value, str):
+        return None
+    try:
+        return _normalized_end_time(
+            datetime.fromisoformat(value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value)
+        )
+    except ValueError:
+        return None
+
+
+def _stored_end_time(row: Mapping[str, object]) -> tuple[int, datetime]:
+    end_time: Final = _normalized_end_time(row.get("endTime"))
+    return (0, end_time) if end_time is not None else (1, datetime.max.replace(tzinfo=timezone.utc))
+
+
+def _ordered_stored_turns(batches: Sequence[StoredTurns]) -> StoredTurns:
+    if len(batches) == 1:
+        return batches[0]
+    pairs: Final = tuple(
+        chain.from_iterable(zip(batch.spend_logs, batch.proxy_server_requests, strict=True) for batch in batches)
+    )
+    unique: Final = {
+        (stored_request_id(row), index if stored_request_id(row) is None else 0): (row, request)
+        for index, (row, request) in enumerate(pairs)
+    }
+    ordered: Final = sorted(unique.values(), key=lambda pair: _stored_end_time(pair[0]))
+    return StoredTurns(
+        spend_logs=tuple(row for row, _ in ordered),
+        proxy_server_requests=tuple(request for _, request in ordered),
+    )
+
+
 def _compaction_point(
     index: int, spend_log: "SpendLogsPayload", proxy_server_request: Mapping[str, object] | None
 ) -> _ReplayStart | None:
@@ -228,7 +301,7 @@ def _holds_compaction_point(
     )
 
 
-def _referenced_request_ids(previous_response_id: str, client_response_ids: tuple[str, ...]) -> tuple[str, ...]:
+def referenced_request_ids(previous_response_id: str, client_response_ids: tuple[str, ...]) -> tuple[str, ...]:
     decoded_response_id: Final = ResponsesAPIRequestUtils.decode_responses_api_response_id(previous_response_id)
     response_id: Final = decoded_response_id.get("response_id", previous_response_id)
     return tuple(dict.fromkeys((response_id, previous_response_id, *client_response_ids)))
@@ -325,14 +398,14 @@ class ResponsesSessionHandler:
         all_spend_logs: Final = turns.spend_logs
         verbose_proxy_logger.debug("found %s spend logs for this response id", len(all_spend_logs))
 
-        litellm_session_id: str | None = None
-        if len(all_spend_logs) > 0:
-            litellm_session_id = all_spend_logs[0].get("session_id")
-
-        proxy_server_requests: Final = turns.proxy_server_requests
-        replayable_turns: Final = _turns_through_referenced_response(
-            all_spend_logs, _referenced_request_ids(previous_response_id, client_response_ids)
+        referenced_ids: Final = referenced_request_ids(previous_response_id, client_response_ids)
+        referenced_log: Final = next(
+            (row for row in reversed(all_spend_logs) if stored_request_id(row) in referenced_ids),
+            all_spend_logs[0] if all_spend_logs else None,
         )
+        litellm_session_id: Final = stored_session_id(referenced_log) if referenced_log is not None else None
+        proxy_server_requests: Final = turns.proxy_server_requests
+        replayable_turns: Final = _turns_through_referenced_response(all_spend_logs, referenced_ids)
         start: Final = _replay_start(all_spend_logs[:replayable_turns], proxy_server_requests[:replayable_turns])
         replayed_turns: Final = (
             replayable_turns if _holds_compaction_point(all_spend_logs, proxy_server_requests) else len(all_spend_logs)
@@ -374,9 +447,58 @@ class ResponsesSessionHandler:
         previous_response_id: str,
         client_response_ids: tuple[str, ...] = (),
     ) -> StoredTurns:
+        current: Final = await ResponsesSessionHandler._load_stored_turns(previous_response_id, client_response_ids)
+        if not current.spend_logs:
+            return current
+
+        anchor_ids: Final = referenced_request_ids(previous_response_id, client_response_ids)
+        anchor: Final = next(
+            (row for row in current.spend_logs if stored_request_id(row) in anchor_ids), current.spend_logs[-1]
+        )
+        batches: Final[list[StoredTurns]] = [current]  # mutable-ok: append independently loaded ancestor groups
+        visited: Final[set[str]] = set(_stored_request_ids(current))  # mutable-ok: bound cycles in stored links
+        pending: Final[deque[str]] = deque(_previous_stored_responses(current))  # mutable-ok: queue ancestor lookups
+        previous: str = ""  # rebind-ok: process each pending response id
+        earlier: StoredTurns | None = None  # rebind-ok: successive ancestors arrive asynchronously
+        while pending:
+            previous = pending.popleft()
+            earlier = await ResponsesSessionHandler._earlier_stored_turns(previous, visited, anchor)
+            visited.update(referenced_request_ids(previous, ()))
+            if earlier is None:
+                continue
+            batches.append(earlier)
+            visited.update(_stored_request_ids(earlier))
+            pending.extend(_previous_stored_responses(earlier))
+
+        return _ordered_stored_turns(batches)
+
+    @staticmethod
+    async def _earlier_stored_turns(
+        previous_response_id: str, visited: Set[str], owner: Mapping[str, object]
+    ) -> StoredTurns | None:
+        referenced: Final = referenced_request_ids(previous_response_id, ())
+        if any(request_id in visited for request_id in referenced):
+            return None
+        prior: Final = await ResponsesSessionHandler._load_stored_turns(previous_response_id, (), owner=owner)
+        if not any(stored_request_id(row) in referenced for row in prior.spend_logs):
+            return None
+        end: Final = _turns_through_referenced_response(prior.spend_logs, referenced)
+        return StoredTurns(prior.spend_logs[:end], prior.proxy_server_requests[:end])
+
+    @staticmethod
+    async def _load_stored_turns(
+        previous_response_id: str,
+        client_response_ids: tuple[str, ...],
+        *,
+        owner: Mapping[str, object] | None = None,
+    ) -> StoredTurns:
         spend_logs: Final = _conversation_turns(
-            await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id(
-                previous_response_id, client_response_ids
+            tuple(
+                spend_log
+                for spend_log in await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id(
+                    previous_response_id, client_response_ids
+                )
+                if owner is None or _same_spend_log_owner(owner, spend_log)
             )
         )
         return StoredTurns(
@@ -396,7 +518,7 @@ class ResponsesSessionHandler:
         client_response_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]:
         turns: Final = _turns_through_referenced_response(
-            stored_turns.spend_logs, _referenced_request_ids(previous_response_id, client_response_ids)
+            stored_turns.spend_logs, referenced_request_ids(previous_response_id, client_response_ids)
         )
         return tuple(
             chain.from_iterable(
@@ -610,6 +732,8 @@ class ResponsesSessionHandler:
     async def get_all_spend_logs_for_previous_response_id(
         previous_response_id: str,
         client_response_ids: tuple[str, ...] = (),
+        *,
+        include_session_history: bool = True,
     ) -> "list[SpendLogsPayload]":
         """
         Get all spend logs for a previous response id
@@ -638,14 +762,20 @@ class ResponsesSessionHandler:
 
         verbose_proxy_logger.debug("decoding response id=%s", previous_response_id)
 
-        request_ids: Final = list(_referenced_request_ids(previous_response_id, client_response_ids))
+        request_ids: Final = list(referenced_request_ids(previous_response_id, client_response_ids))
         response_id: Final = request_ids[0]
         if prisma_client is None:
             return []
 
-        query: Final = """
+        matching_rows: Final = (
+            "matching_session.session_id = logs.session_id "
+            "OR (matching_session.session_id IS NULL AND matching_session.request_id = logs.request_id)"
+            if include_session_history
+            else "matching_session.request_id = logs.request_id"
+        )
+        query: Final = f"""
             WITH matching_session AS (
-                SELECT session_id, api_key, "user", team_id
+                SELECT request_id, session_id, api_key, "user", team_id
                 FROM "LiteLLM_SpendLogs"
                 WHERE request_id = ANY($1::text[])
             )
@@ -654,7 +784,7 @@ class ResponsesSessionHandler:
             WHERE EXISTS (
                 SELECT 1
                 FROM matching_session
-                WHERE matching_session.session_id = logs.session_id
+                WHERE ({matching_rows})
                   AND (
                       matching_session."user" = logs."user"
                       OR (matching_session."user" IS NULL AND logs."user" IS NULL)

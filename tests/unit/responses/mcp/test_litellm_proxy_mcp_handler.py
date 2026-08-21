@@ -1548,6 +1548,7 @@ async def test_responses_discovery_logs_sanitized_caller_headers(monkeypatch: py
     result: Final = await responses_main.aresponses_api_with_mcp(
         input="hi",
         model="test-model",
+        custom_llm_provider="openai",
         tools=[{"type": "mcp", "server_url": "litellm_proxy"}],
         secret_fields={"raw_headers": headers},
     )

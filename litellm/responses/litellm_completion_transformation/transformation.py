@@ -37,6 +37,9 @@ from litellm.constants import (
     CALLER_SESSION_ID_METADATA_KEY,
     REDACTED_BY_LITELLM,
     REDACTED_TOOL_CALL_ARGUMENTS_PLACEHOLDER,
+    SESSION_ID_GENERATED_METADATA_KEY,
+    SESSION_ID_INFERRED_METADATA_KEY,
+    SESSION_ID_OMITTED_METADATA_KEY,
 )
 from litellm.exceptions import BadRequestError
 from litellm.integrations.anthropic_cache_control_hook import (
@@ -92,6 +95,9 @@ from litellm.responses.bridge_check import chat_target_accepts_reasoning_summary
 from litellm.responses.litellm_completion_transformation.session_handler import (
     ResponsesSessionHandler,
     StoredTurns,
+    referenced_request_ids,
+    stored_request_id,
+    stored_session_id,
 )
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.anthropic import AnthropicToolSearchToolRegex, claude_hosted_web_tool_call
@@ -291,7 +297,7 @@ if TYPE_CHECKING:
 TOOL_CALLS_CACHE: Final = InMemoryCache()
 
 _ANY_KEY_DICT_ADAPTER: Final = TypeAdapter(dict[object, object])
-_STR_KEY_DICT_ADAPTER: Final = TypeAdapter(dict[str, object])
+_STR_KEY_DICT_ADAPTER: Final = TypeAdapter[dict[str, object]](dict[str, object])
 _OBJECT_LIST_ADAPTER: Final = TypeAdapter(list[object])
 
 
@@ -1030,12 +1036,93 @@ class ChatCompletionSession(TypedDict, total=False):
 ########### End of Initialize Classes used for Responses API  ###########
 
 
-def _chain_session_metadata(chain_session: str, request_kwargs: Mapping[str, object]) -> Mapping[str, object]:
-    key: Final = "litellm_metadata" if request_kwargs.get("litellm_metadata") else "metadata"
-    metadata: Final = request_kwargs.get(key)
-    if not isinstance(metadata, dict):
+def _session_metadata(request_kwargs: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
+    return tuple(
+        metadata
+        for key in ("litellm_metadata", "metadata")
+        if (metadata := as_str_mapping(request_kwargs.get(key))) is not None
+    )
+
+
+def _caller_session(request_kwargs: Mapping[str, object]) -> str | None:
+    metadata_values: Final = _session_metadata(request_kwargs)
+    root_session: Final = request_kwargs.get("litellm_session_id")
+    if (
+        isinstance(root_session, str)
+        and root_session
+        and not any(
+            metadata.get("session_id") == root_session
+            and (metadata.get(SESSION_ID_INFERRED_METADATA_KEY) or metadata.get(SESSION_ID_GENERATED_METADATA_KEY))
+            for metadata in metadata_values
+        )
+    ):
+        return root_session
+    preserved_session: Final = next(
+        (
+            value
+            for metadata in metadata_values
+            if isinstance(value := metadata.get(CALLER_SESSION_ID_METADATA_KEY), str) and value
+        ),
+        None,
+    )
+    if preserved_session:
+        return preserved_session
+    return next(
+        (
+            session_value
+            for metadata in metadata_values
+            if isinstance(session_value := metadata.get("session_id"), str)
+            and session_value
+            and not (metadata.get(SESSION_ID_INFERRED_METADATA_KEY) or metadata.get(SESSION_ID_GENERATED_METADATA_KEY))
+        ),
+        None,
+    )
+
+
+def _initial_bridge_session(request_kwargs: Mapping[str, object], previous_response_id: object) -> Mapping[str, str]:
+    if previous_response_id or not isinstance(request_kwargs.get("litellm_logging_obj"), LiteLLMLoggingObj):
         return MappingProxyType({})
-    return {key: {**_STR_KEY_DICT_ADAPTER.validate_python(metadata), CALLER_SESSION_ID_METADATA_KEY: chain_session}}
+    if caller_session := _caller_session(request_kwargs):
+        return {"litellm_session_id": caller_session}
+    metadata_values: Final = _session_metadata(request_kwargs)
+    if request_kwargs.get("litellm_session_id") or any(
+        metadata.get("session_id") or metadata.get(SESSION_ID_OMITTED_METADATA_KEY) for metadata in metadata_values
+    ):
+        return MappingProxyType({})
+    return {"litellm_session_id": str(uuid.uuid4())}
+
+
+def _continued_bridge_session(chain_session: str | None, request_kwargs: Mapping[str, object]) -> Mapping[str, object]:
+    if caller_session := _caller_session(request_kwargs):
+        return {"litellm_session_id": caller_session}
+    if not chain_session or any(
+        metadata.get(SESSION_ID_OMITTED_METADATA_KEY) for metadata in _session_metadata(request_kwargs)
+    ):
+        return MappingProxyType({})
+    key: Final = "litellm_metadata" if isinstance(request_kwargs.get("litellm_metadata"), Mapping) else "metadata"
+    metadata: Final = as_str_mapping(request_kwargs.get(key)) or MappingProxyType({})
+    return {"litellm_session_id": chain_session, key: {**metadata, "session_id": chain_session}}
+
+
+async def resolve_bridge_session(
+    previous_response_id: str | None,
+    request_kwargs: Mapping[str, object],
+    client_response_ids: tuple[str, ...] = (),
+) -> Mapping[str, object]:
+    if not previous_response_id:
+        return _initial_bridge_session(request_kwargs, previous_response_id)
+    if _caller_session(request_kwargs) or any(
+        metadata.get(SESSION_ID_OMITTED_METADATA_KEY) for metadata in _session_metadata(request_kwargs)
+    ):
+        return _continued_bridge_session(None, request_kwargs)
+
+    referenced: Final = referenced_request_ids(previous_response_id, client_response_ids)
+    rows: Final = await ResponsesSessionHandler.get_all_spend_logs_for_previous_response_id(
+        previous_response_id, client_response_ids, include_session_history=False
+    )
+    rows_by_id: Final = {request_id: row for row in rows if (request_id := stored_request_id(row)) is not None}
+    matched: Final = next((row for request_id in referenced if (row := rows_by_id.get(request_id)) is not None), None)
+    return _continued_bridge_session(stored_session_id(matched) if matched is not None else None, request_kwargs)
 
 
 def claude_web_search_call_tool_call(search: ResponseFunctionWebSearch) -> ChatCompletionAssistantToolCall | None:
@@ -1350,7 +1437,9 @@ class LiteLLMCompletionResponsesConfig:
             api_base=kwargs.get("api_base"),
         )
 
-        request_kwargs: Final = _STR_KEY_DICT_ADAPTER.validate_python({**kwargs, "drop_params": drop_params})
+        request_kwargs: Final[Mapping[str, object]] = _STR_KEY_DICT_ADAPTER.validate_python(
+            {**kwargs, "drop_params": drop_params}
+        )
         context_management: Final = responses_api_request.get("context_management")
         keeps_item_marks: Final = _target_keeps_item_marks(
             model,
@@ -1447,7 +1536,13 @@ class LiteLLMCompletionResponsesConfig:
 
         # only pass non-None values
         litellm_completion_request = {k: v for k, v in litellm_completion_request.items() if v is not None}
-        return litellm_completion_request
+        request_options: Final = as_str_mapping(responses_api_request) or MappingProxyType({})
+        return _STR_KEY_DICT_ADAPTER.validate_python(
+            {
+                **litellm_completion_request,
+                **_initial_bridge_session(request_kwargs, request_options.get("previous_response_id")),
+            }
+        )
 
     @staticmethod
     def transform_responses_api_input_to_messages(
@@ -1696,13 +1791,7 @@ class LiteLLMCompletionResponsesConfig:
 
         litellm_completion_request["messages"] = combined_messages
         chain_session: Final = chat_completion_session.get("litellm_session_id")
-        litellm_completion_request["litellm_trace_id"] = chain_session
-        chain_session_metadata: Final[Mapping[str, object]] = (
-            _chain_session_metadata(chain_session, request_kwargs)
-            if chain_session and litellm.request_correlation_in_logs
-            else MappingProxyType({})
-        )
-        return {**litellm_completion_request, **chain_session_metadata}
+        return {**litellm_completion_request, **_continued_bridge_session(chain_session, request_kwargs)}
 
     @staticmethod
     def _transform_response_input_param_to_chat_completion_message(

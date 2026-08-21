@@ -197,6 +197,14 @@ class InMemoryCache(BaseCache):
     async def async_set_cache(self, key, value, **kwargs):
         self.set_cache(key=key, value=value, **kwargs)
 
+    def get_or_set_cache(self, key: str, value: object, *, ttl: float | None) -> object:
+        with self._increment_lock:
+            cached_value: Final[object] = self.get_cache(key=key)
+            if cached_value is not None:
+                return cached_value
+            self.set_cache(key=key, value=value, ttl=ttl)
+            return value
+
     async def async_set_cache_pipeline(self, cache_list, ttl=None, **kwargs):
         for cache_key, cache_value in cache_list:
             if ttl is not None:
