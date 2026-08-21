@@ -145,17 +145,18 @@ class TurnCacheFacts(NamedTuple):
     touched: bool
 
 
-def turn_cache_facts(usage_object: Mapping[str, object] | None) -> TurnCacheFacts:
-    from litellm.proxy.spend_tracking.savings import extract_cache_read_tokens
+def turn_cache_facts(usage_object: Mapping[str, object] | None, custom_llm_provider: str | None) -> TurnCacheFacts:
+    from litellm.proxy.spend_tracking.savings import extract_cache_creation_tokens, extract_cache_read_tokens
 
     covered: Final = bool(usage_object)
     read_tokens: Final = extract_cache_read_tokens(usage_object)
-    write_ttl_seconds: Final = _write_ttl_seconds(usage_object)
+    write_tokens: Final = extract_cache_creation_tokens(usage_object)
+    write_ttl_seconds: Final = _write_ttl_seconds(usage_object, custom_llm_provider, write_tokens)
     return TurnCacheFacts(
         covered=covered,
         read_tokens=read_tokens,
         write_ttl_seconds=write_ttl_seconds,
-        touched=not covered or read_tokens > 0 or write_ttl_seconds is not None,
+        touched=not covered or read_tokens > 0 or write_tokens > 0 or write_ttl_seconds is not None,
     )
 
 
@@ -169,14 +170,17 @@ def _turn_time_utc(start_time_iso: str) -> datetime | None:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def _write_ttl_seconds(usage_object: Mapping[str, object] | None) -> int | None:
+def _write_ttl_seconds(
+    usage_object: Mapping[str, object] | None,
+    custom_llm_provider: str | None,
+    write_tokens: int,
+) -> int | None:
     """The TTL this turn's cache write used, or None when nothing was written.
 
     Providers that report a TTL split do so under prompt_tokens_details; a write with no
-    split is the provider's default five-minute cache.
+    split uses the provider's default five-minute cache, except hosted_vllm whose
+    expiration is not known from its token count alone.
     """
-    from litellm.proxy.spend_tracking.savings import extract_cache_creation_tokens
-
     if not usage_object:
         return None
     details: Final = usage_object.get("prompt_tokens_details")
@@ -186,7 +190,7 @@ def _write_ttl_seconds(usage_object: Mapping[str, object] | None) -> int | None:
             return CACHE_TTL_1H_SECONDS
         if creation.get("ephemeral_5m_input_tokens"):
             return CACHE_TTL_5M_SECONDS
-    if extract_cache_creation_tokens(usage_object) > 0:
+    if write_tokens > 0 and custom_llm_provider != "hosted_vllm":
         return CACHE_TTL_5M_SECONDS
     return None
 
@@ -247,7 +251,10 @@ def build_autorouter_turn_transaction(
     )
 
     usage_object_raw: Final = metadata.get("usage_object")
-    cache: Final = turn_cache_facts(usage_object_raw if isinstance(usage_object_raw, Mapping) else None)
+    cache: Final = turn_cache_facts(
+        usage_object_raw if isinstance(usage_object_raw, Mapping) else None,
+        payload.get("custom_llm_provider"),
+    )
     tier_raw: Final = routing_decision.get("tier")
     baseline_raw: Final = routing_decision.get("savings_baseline_model")
     classifier_cost: Final = classifier_cost_from_decision(routing_decision)
