@@ -537,6 +537,13 @@ _PINNED_SESSION: Final = "2f1c9d4e-7b3a-4c61-9e0f-5d8a2b6c4e17"
     [
         ("deployment_affinity", None, {}, {}),
         ("session_affinity", _PINNED_SESSION, {"x-claude-code-session-id": _PINNED_SESSION}, {}),
+        pytest.param(
+            "session_affinity",
+            _PINNED_SESSION,
+            {"x-litellm-trace-id": "separate-trace", "x-litellm-session-id": _PINNED_SESSION},
+            {},
+            id="trace-does-not-override-session",
+        ),
         ("session_affinity", _PINNED_SESSION, {"baggage": f"user.id=42,session.id={_PINNED_SESSION}"}, {}),
         ("session_affinity", _PINNED_SESSION, {}, {"litellm_session_id": _PINNED_SESSION}),
         ("session_affinity", _PINNED_SESSION, {}, {"metadata": {"user_id": f"user_abc_account__session_{_PINNED_SESSION}"}}),

@@ -4,10 +4,8 @@ from typing import Final
 
 from litellm.constants import (
     CALLER_SESSION_ID_METADATA_KEY,
-    SESSION_ID_FROM_TRACE_ID_PARAM_KEY,
     SESSION_ID_GENERATED_METADATA_KEY,
 )
-from litellm.litellm_core_utils.core_helpers import as_str_mapping
 
 _HTTP_HEADER_NAME_PATTERN: Final = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _FORBIDDEN_AFFINITY_HEADERS: Final = frozenset(
@@ -82,7 +80,7 @@ def _metadata_session_id(litellm_params: object) -> str | None:
 
 
 def get_caller_litellm_session_id(litellm_params: object | None) -> str | None:
-    if litellm_params is None or _get_value(litellm_params, SESSION_ID_FROM_TRACE_ID_PARAM_KEY):
+    if litellm_params is None:
         return None
     return _non_generated_litellm_session_id(litellm_params)
 
@@ -104,7 +102,7 @@ def get_stable_session_id(litellm_params: object | None) -> str | None:
 
 
 def get_caller_session_id(litellm_params: object | None) -> str | None:
-    """Resolve a caller conversation without accepting a generated session or a promoted trace id."""
+    """Resolve a caller conversation without accepting a generated session."""
     if litellm_params is None:
         return None
     metadata_values: Final = _metadata_values(litellm_params)
@@ -122,11 +120,6 @@ def get_caller_session_id(litellm_params: object | None) -> str | None:
     if isinstance(direct_session, str) and direct_session:
         return direct_session
 
-    proxy_request: Final = _get_value(litellm_params, "proxy_server_request")
-    headers: Final = as_str_mapping(_get_value(proxy_request, "headers"))
-    trace_header: Final = next(
-        (value for key, value in (headers or {}).items() if key.lower() == "x-litellm-trace-id"), None
-    )
     candidates: Final = (
         get_caller_litellm_session_id(litellm_params),
         *(
@@ -135,7 +128,7 @@ def get_caller_session_id(litellm_params: object | None) -> str | None:
             if not _get_value(metadata, SESSION_ID_GENERATED_METADATA_KEY)
         ),
     )
-    return next((value for value in candidates if isinstance(value, str) and value and value != trace_header), None)
+    return next((value for value in candidates if isinstance(value, str) and value), None)
 
 
 def add_provider_affinity_header(

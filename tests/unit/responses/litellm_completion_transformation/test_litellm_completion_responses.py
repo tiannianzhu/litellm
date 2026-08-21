@@ -8470,7 +8470,7 @@ def _continued_chain_request(request_kwargs: Mapping[str, object]) -> Mapping[st
 
 
 @pytest.mark.parametrize(
-    ("request_kwargs", "logged_metadata_key"),
+    ("request_kwargs", "logged_metadata_key", "session_id"),
     [
         (
             {
@@ -8478,36 +8478,45 @@ def _continued_chain_request(request_kwargs: Mapping[str, object]) -> Mapping[st
                 "litellm_metadata": {CALLER_SESSION_ID_METADATA_KEY: "turn-session", "user_api_key": "hashed"},
             },
             "litellm_metadata",
+            "turn-session",
         ),
-        ({"metadata": {"user_api_key": "hashed"}}, "metadata"),
+        ({"metadata": {"user_api_key": "hashed"}}, "metadata", "chain-session"),
     ],
 )
-def test_a_continued_chain_logs_its_spend_under_the_chain_session_with_request_correlation(
-    monkeypatch: pytest.MonkeyPatch, request_kwargs: Mapping[str, object], logged_metadata_key: str
+@pytest.mark.parametrize("correlation_enabled", [False, True])
+def test_a_continued_chain_keeps_its_session_and_current_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    request_kwargs: Mapping[str, object],
+    logged_metadata_key: str,
+    session_id: str,
+    correlation_enabled: bool,
 ):
-    monkeypatch.setattr(litellm, "request_correlation_in_logs", True)
-    request: Final = _continued_chain_request(request_kwargs)
+    monkeypatch.setattr(litellm, "request_correlation_in_logs", correlation_enabled)
+    sent_kwargs: Final = deepcopy({**request_kwargs, "litellm_trace_id": "turn-trace"})
 
-    assert request["litellm_trace_id"] == "chain-session"
-    assert "litellm_session_id" not in request
-    assert request[logged_metadata_key] == {
+    request: Final = _continued_chain_request(sent_kwargs)
+    forwarded: Final = {**sent_kwargs, **request}
+
+    assert forwarded["litellm_trace_id"] == "turn-trace"
+    assert forwarded["litellm_session_id"] == session_id
+    assert forwarded[logged_metadata_key] == {
         **TypeAdapter(dict[str, object]).validate_python(request_kwargs[logged_metadata_key]),
-        CALLER_SESSION_ID_METADATA_KEY: "chain-session",
+        **({"session_id": session_id} if session_id == "chain-session" else {}),
     }
-    assert request[logged_metadata_key] is request_kwargs[logged_metadata_key]
+    assert sent_kwargs == {**request_kwargs, "litellm_trace_id": "turn-trace"}
 
 
-def test_a_continued_chain_leaves_the_turns_metadata_alone_without_request_correlation(
+def test_a_continued_chain_preserves_the_callers_explicit_session_without_request_correlation(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(litellm, "request_correlation_in_logs", False)
-    caller_metadata: Final = {CALLER_SESSION_ID_METADATA_KEY: "turn-session", "user_api_key": "hashed"}
+    caller_metadata: Final = {"session_id": "turn-session", "user_api_key": "hashed"}
 
     request: Final = _continued_chain_request({"metadata": caller_metadata, "litellm_metadata": caller_metadata})
 
-    assert request["litellm_trace_id"] == "chain-session"
+    assert request["litellm_session_id"] == "turn-session"
     assert "litellm_metadata" not in request
-    assert request["metadata"] == {CALLER_SESSION_ID_METADATA_KEY: "turn-session", "user_api_key": "hashed"}
+    assert request["metadata"] == caller_metadata
 
 
 @pytest.mark.parametrize("request_correlation_in_logs", [True, False])
@@ -8524,6 +8533,7 @@ def test_a_continued_chain_stores_the_replayed_turns_as_its_path_to_the_root(
             previous_response_ids=("chatcmpl-root", "chatcmpl-turn-1"),
         )
 
+    internal_metadata: Final = {"user_api_key": "hashed"}
     request: Final = asyncio.run(
         LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
             previous_response_id="resp_turn_1",
@@ -8534,13 +8544,14 @@ def test_a_continued_chain_stores_the_replayed_turns_as_its_path_to_the_root(
             },
             instructions=None,
             session_lookup=session_lookup,
-            request_kwargs={"litellm_metadata": {"user_api_key": "hashed"}, "metadata": {"tag": "client"}},
+            request_kwargs={"litellm_metadata": internal_metadata, "metadata": {"tag": "client"}},
         )
     )
 
+    assert request["litellm_metadata"] is internal_metadata
     assert request["litellm_metadata"] == {
         "user_api_key": "hashed",
-        **({CALLER_SESSION_ID_METADATA_KEY: "chain-session"} if request_correlation_in_logs else {}),
+        "session_id": "chain-session",
         PREVIOUS_RESPONSE_IDS_METADATA_KEY: ["chatcmpl-root", "chatcmpl-turn-1"],
     }
     assert "metadata" not in request
