@@ -19,6 +19,17 @@ from unittest.mock import AsyncMock
 from litellm.caching.in_memory_cache import InMemoryCache
 
 
+def test_get_or_set_cache_preserves_winner_until_expiry() -> None:
+    clock: Final = MagicMock(return_value=100.0)
+    cache: Final = InMemoryCache(clock=clock)
+
+    assert cache.get_or_set_cache("session-prefix", "first", ttl=5) == "first"
+    assert cache.get_or_set_cache("session-prefix", "second", ttl=5) == "first"
+    clock.return_value = 106.0
+    assert cache.get_or_set_cache("session-prefix", "third", ttl=5) == "third"
+    assert cache.get_cache("session-prefix") == "third"
+
+
 class _SlowInt(int):
     def __add__(self, value: int) -> "_SlowInt":
         time.sleep(0.05)

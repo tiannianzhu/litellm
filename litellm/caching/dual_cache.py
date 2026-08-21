@@ -466,6 +466,15 @@ class DualCache(BaseCache):
                 verbose_logger, logging.ERROR, "LiteLLM Cache: exception in async add_cache", e, with_traceback=True
             )
 
+    async def async_get_or_set_cache(self, key: str, value: object, *, ttl: int) -> object:
+        if self.redis_cache is None:
+            return self.in_memory_cache.get_or_set_cache(key=key, value=value, ttl=ttl)
+        await self.redis_cache.async_set_cache(key=key, value=value, ttl=ttl, nx=True)
+        cached_value: Final[object] = await self.redis_cache.async_get_cache(key=key, raise_on_error=True)
+        if cached_value is not None:
+            self.in_memory_cache.set_cache(key=key, value=cached_value, ttl=ttl)
+        return cached_value
+
     # async_batch_set_cache
     async def async_set_cache_pipeline(
         self, cache_list: Sequence[tuple[str, object]], local_only: bool = False, **kwargs

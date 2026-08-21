@@ -32885,6 +32885,12 @@ export interface components {
              */
             infer_model_from_keys?: boolean | null;
             /**
+             * Infer Session Id
+             * @description Infer an internal session ID from growing message prefixes when the client does not provide one. This groups conversation logs without pinning the routed model.
+             * @default false
+             */
+            infer_session_id: boolean;
+            /**
              * Key Expiry Alert Days
              * @description Email a key's owner once when the key has this many days or fewer left before it expires. Applies to every key with an expiry date and an owner email, including existing keys. A key's metadata.key_expiry_alert_days overrides it. Off unless set.
              */
@@ -33066,7 +33072,7 @@ export interface components {
             mcp_xff_num_trusted_hops?: number | null;
             /**
              * Missing Session Id
-             * @description What to do with LLM API requests that carry no session id (x-litellm-session-id header, metadata.session_id, etc.). 'generate' stamps one id into litellm_session_id, litellm_trace_id and metadata.session_id so SpendLogs and logging callbacks agree; 'reject' returns 400; 'omit' leaves SpendLogs.session_id null, matching callbacks such as Langfuse that only record a client-established metadata.session_id. Unset keeps the legacy behavior where SpendLogs falls back to the trace id while callbacks get no session id.
+             * @description Controls missing-session handling during LLM request preprocessing. 'generate' creates litellm_session_id and the matching metadata.session_id or litellm_metadata.session_id. 'reject' returns 400. 'omit' preserves a supplied session ID and otherwise leaves it absent. Unset does not generate a session ID or copy a trace ID. Supplied session IDs stay on the request. Trace IDs remain independent. Batch lifecycle spend logs retain batch-ID grouping ahead of caller session IDs unless the request's missing-session omission policy applies
              */
             missing_session_id?: ("generate" | "reject" | "omit") | null;
             /**

@@ -19,6 +19,7 @@ from mcp.types import Tool as MCPTool
 
 # Import required modules
 import litellm
+from litellm.constants import SESSION_ID_GENERATED_METADATA_KEY, SESSION_ID_OMITTED_METADATA_KEY
 from litellm.exceptions import GuardrailRaisedException, MidStreamFallbackError
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.langfuse.langfuse import langfuse_trace_id, langfuse_trace_metadata
@@ -2513,6 +2514,147 @@ async def test_auto_execute_mcp_logs_join_the_langfuse_trace_of_a_session_header
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize(
+    ("session_kwargs", "logged_session", "expected_session"),
+    (
+        (
+            {"litellm_session_id": "explicit-session", "metadata": {"session_id": "body-session"}},
+            "old-session",
+            "explicit-session",
+        ),
+        ({"litellm_metadata": {"session_id": "metadata-session"}}, "", "metadata-session"),
+        ({}, "logged-session", "logged-session"),
+        ({"litellm_metadata": {SESSION_ID_GENERATED_METADATA_KEY: True}}, "generated-parent", "generated-parent"),
+        (
+            {"litellm_session_id": "kept-explicit", "litellm_metadata": {SESSION_ID_OMITTED_METADATA_KEY: True}},
+            "old-session",
+            "kept-explicit",
+        ),
+        (
+            {"litellm_metadata": {SESSION_ID_OMITTED_METADATA_KEY: True, "session_id": "kept-metadata"}},
+            "",
+            "kept-metadata",
+        ),
+        ({"litellm_metadata": {SESSION_ID_OMITTED_METADATA_KEY: True}}, "", None),
+        ({"litellm_session_id": "parent-trace"}, "", "parent-trace"),
+        ({}, "", None),
+    ),
+    ids=(
+        "explicit", "metadata", "logged", "generated", "omitted-explicit", "omitted-metadata", "omitted",
+        "same-as-trace", "trace-only",
+    ),
+)
+async def test_mcp_children_keep_parent_session_separate_from_trace(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    session_kwargs: dict[str, object],
+    logged_session: str,
+    expected_session: str | None,
+) -> None:
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    _serve_responses(
+        respx_mock,
+        monkeypatch,
+        tuple(_streamed(body) if stream else _ok(body) for body in (_ROUND_ONE_BODY, _ROUND_TWO_BODY)),
+    )
+    listing_recorder: Final = _serve_the_demo_mcp_listing(monkeypatch)
+    call_recorder: Final = _CallRecorder()
+    monkeypatch.setattr(litellm, "_async_success_callback", [listing_recorder, call_recorder])
+    monkeypatch.setattr(sys.modules["litellm.proxy.proxy_server"], "general_settings", {}, raising=False)
+    monkeypatch.setattr(
+        sys.modules["litellm.proxy.proxy_server"], "general_settings_view", lambda: MappingProxyType({}), raising=False
+    )
+    logging_obj: Final = _rounds_logging_obj(_RoundRecorder(), "mcp-parent-call")
+    logging_obj.litellm_session_id = logged_session
+    logging_obj.litellm_trace_id = "parent-trace"
+
+    response: Final = await litellm.aresponses(
+        model="openai/gpt-5.6",
+        input="Call echo with PING",
+        tools=[dict(_ECHO_MCP_TOOL)],
+        api_key="sk-mcp-rounds",
+        api_base="https://mcp-rounds.example.com/v1",
+        stream=stream,
+        litellm_call_id="mcp-parent-call",
+        litellm_trace_id="parent-trace",
+        litellm_logging_obj=logging_obj,
+        **session_kwargs,
+    )
+    if stream:
+        await _drain(response)
+    await _settle(lambda: len(call_recorder.of("aresponses")) > 0 and len(call_recorder.of("call_mcp_tool")) == 1)
+
+    assert len(listing_recorder.listings) == 1
+    assert len(call_recorder.of("call_mcp_tool")) == 1
+    children: Final = (listing_recorder.listings[0], call_recorder.of("call_mcp_tool")[0])
+    timestamp: Final = datetime(2026, 1, 1)
+    rows: Final = tuple(
+        get_logging_payload(kwargs=dict(child), response_obj=None, start_time=timestamp, end_time=timestamp)
+        for child in children
+    )
+    assert tuple(row["session_id"] for row in rows) == (expected_session, expected_session)
+    assert tuple(cast(StandardLoggingPayload, child["standard_logging_object"])["trace_id"] for child in children) == (
+        "parent-trace",
+        "parent-trace",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+async def test_bridged_mcp_children_share_the_session_prepared_before_discovery(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    tool_block: Final = {"type": "tool_use", "id": "call_echo", "name": "echo", "input": {"value": "PING"}}
+    upstream: Final = _serve_responses(
+        respx_mock,
+        monkeypatch,
+        (_bridged_echo_call_round(), _bridged_echo_answer_round())
+        if stream
+        else (
+            httpx.Response(200, json=_anthropic_message("msg_echo_call", (tool_block,), "tool_use")),
+            httpx.Response(200, json=_anthropic_message("msg_echo_answer", ({"type": "text", "text": "PING"},), "end_turn")),
+        ),
+        url_regex=r"https://mcp-rounds\.example\.com/.*messages",
+    )
+    listing_recorder: Final = _serve_the_demo_mcp_listing(monkeypatch)
+    call_recorder: Final = _CallRecorder()
+    monkeypatch.setattr(litellm, "_async_success_callback", [listing_recorder, call_recorder])
+    logging_obj: Final = _rounds_logging_obj(_RoundRecorder(), "mcp-bridge-session")
+    logging_obj.litellm_trace_id = "parent-trace"
+
+    response: Final = await litellm.aresponses(
+        model="anthropic/claude-haiku-5-5",
+        input="Call echo with PING",
+        tools=[dict(_ECHO_MCP_TOOL)],
+        api_key="sk-mcp-rounds",
+        api_base="https://mcp-rounds.example.com",
+        stream=stream,
+        litellm_call_id="mcp-bridge-session",
+        litellm_trace_id="parent-trace",
+        litellm_logging_obj=logging_obj,
+    )
+    if stream:
+        await _drain(response)
+    await _settle(lambda: len(call_recorder.of("aresponses")) > 0 and len(call_recorder.of("call_mcp_tool")) == 1)
+
+    assert upstream.call_count == 2
+    rows: Final = (
+        listing_recorder.listings[0],
+        call_recorder.of("call_mcp_tool")[0],
+        call_recorder.of("aresponses")[0],
+    )
+    session_ids: Final = tuple(cast(StandardLoggingPayload, row["standard_logging_object"])["session_id"] for row in rows)
+    assert session_ids[0]
+    assert session_ids == (session_ids[0],) * 3
+    assert tuple(cast(StandardLoggingPayload, row["standard_logging_object"])["trace_id"] for row in rows) == (
+        "parent-trace",
+    ) * 3
+
+
+@pytest.mark.asyncio
 async def test_non_stream_auto_execute_bills_the_paid_first_round_when_the_client_disconnects_during_a_tool_call(
     respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ):
@@ -2617,11 +2759,17 @@ class _SpendLogs:
 async def test_bridged_auto_execute_follow_up_continues_the_client_conversation_in_its_session(
     respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
 ):
+    listing_recorder: Final = _serve_the_demo_mcp_listing(monkeypatch)
     spend_logs: Final = _SpendLogs((_PRIOR_TURN,))
     monkeypatch.setitem(
         sys.modules,
         "litellm.proxy.proxy_server",
-        SimpleNamespace(proxy_logging_obj=None, prisma_client=SimpleNamespace(db=spend_logs), disable_spend_logs=False),
+        SimpleNamespace(
+            proxy_logging_obj=None,
+            prisma_client=SimpleNamespace(db=spend_logs),
+            disable_spend_logs=False,
+            should_load_db_object=lambda resource: False,
+        ),
     )
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
     monkeypatch.setenv("DISABLE_AIOHTTP_TRANSPORT", "True")
@@ -2640,21 +2788,11 @@ async def test_bridged_auto_execute_follow_up_continues_the_client_conversation_
             httpx.Response(200, json=_anthropic_message("msg_answer", ({"type": "text", "text": "PING"},), "end_turn")),
         ]
     )
-    echo_tool: Final = MCPTool.model_validate(
-        {"name": "echo", "inputSchema": {"type": "object", "properties": {"value": {"type": "string"}}}},
-        by_name=False,
-    )
     execute: Final = AsyncMock(return_value=[{"tool_call_id": "toolu_echo", "result": "PING", "name": "echo"}])
     recorder: Final = _RoundRecorder()
+    logging_obj: Final = _rounds_logging_obj(recorder, "mcp-rounds-bridged")
 
-    with (
-        patch.object(
-            LiteLLM_Proxy_MCP_Handler,
-            "process_mcp_tools_without_openai_transform",
-            AsyncMock(return_value=([echo_tool], {"echo": "demo"})),
-        ),
-        patch.object(LiteLLM_Proxy_MCP_Handler, "execute_tool_calls", execute),
-    ):
+    with patch.object(LiteLLM_Proxy_MCP_Handler, "execute_tool_calls", execute):
         await litellm.aresponses(
             model="anthropic/claude-haiku-4-5",
             input="Call echo with PING",
@@ -2662,19 +2800,25 @@ async def test_bridged_auto_execute_follow_up_continues_the_client_conversation_
             tools=[dict(_ECHO_MCP_TOOL)],
             api_key="sk-mcp-rounds",
             api_base="https://mcp-rounds.example.com",
-            litellm_logging_obj=_rounds_logging_obj(recorder, "mcp-rounds-bridged"),
+            litellm_logging_obj=logging_obj,
         )
     await _settle(lambda: len(recorder.logged) > 0)
 
     follow_up: Final = json.loads(provider.calls[1].request.content)["messages"]
-    assert spend_logs.asked == (frozenset({"chatcmpl-prior-turn"}),) * 2
+    assert spend_logs.asked == (frozenset({"chatcmpl-prior-turn"}),) * 3
     assert [message["role"] for message in follow_up] == ["user", "assistant", "user", "assistant", "user"]
     assert json.dumps(follow_up).count("My favorite color is teal.") == 1
     assert [block["type"] for block in follow_up[3]["content"]] == ["thinking", "tool_use"]
     assert follow_up[3]["content"][0]["signature"] == "sig-round-one"
     assert execute.await_args is not None
-    assert execute.await_args.kwargs["litellm_trace_id"] == "prior-session"
-    assert recorder.logged[0]["trace_id"] == "prior-session"
+    assert execute.await_args.kwargs["litellm_session_id"] == "prior-session"
+    assert recorder.logged[0]["session_id"] == "prior-session"
+    listing_session: Final = cast(StandardLoggingPayload, listing_recorder.listings[0]["standard_logging_object"])[
+        "session_id"
+    ]
+    assert listing_session == "prior-session"
+    assert execute.await_args.kwargs["litellm_trace_id"] == logging_obj.litellm_trace_id
+    assert recorder.logged[0]["trace_id"] == logging_obj.litellm_trace_id
 
 
 def _event_type(event: object) -> str:
