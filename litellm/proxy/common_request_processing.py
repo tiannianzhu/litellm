@@ -136,6 +136,7 @@ from litellm.proxy.route_llm_request import (
     endpoint_unsupported_by_model,
     route_request,
 )
+from litellm.proxy.session_identity import apply_inferred_session_id
 from litellm.proxy.spend_tracking.cost_finalization import finalize_proxy_response_cost, prepare_response_cost
 from litellm.proxy.telemetry.request_context import bind_call_id as bind_telemetry_call_id
 from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
@@ -2545,6 +2546,22 @@ class ProxyBaseLLMRequestProcessing:
                 llm_router.priority_header_update(
                     model=aliased_model, kwargs=self.data, header=request.headers.get(SCHEDULER_PRIORITY_HEADER)
                 )
+            )
+
+        if (
+            llm_router is not None
+            and general_settings.get("infer_session_id") is True
+            and route_type
+            in (
+                "acompletion",
+                "aresponses",
+                "_aresponses_websocket",
+                "anthropic_messages",
+            )
+        ):
+            await apply_inferred_session_id(
+                request_data=self.data,  # pyright: ignore[reportUnknownArgumentType]  # request payload is assembled dynamically
+                cache=llm_router.health().store,
             )
 
         litellm_call_id: Final = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
