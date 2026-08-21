@@ -224,8 +224,8 @@ const CachingCard: React.FC<{ cache: AutoRouterCacheStats }> = ({ cache }) => {
                   <span className="font-medium tabular-nums text-foreground">{pctLabel(expiredMissPct)}</span>
                 </TooltipTrigger>
                 <TooltipContent className="max-w-64">
-                  share of all measured turns that missed cache because a return to an earlier tier came after its TTL
-                  lapsed
+                  share of all measured turns that missed cache when returning to an earlier tier after its reported TTL
+                  elapsed; misses without a known TTL are excluded
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
@@ -244,7 +244,7 @@ const CachingCard: React.FC<{ cache: AutoRouterCacheStats }> = ({ cache }) => {
           <BucketTable buckets={buckets} />
           {cache.unordered_turns > 0 && (
             <p className="text-xs text-muted-foreground">
-              {cache.unordered_turns.toLocaleString()} turns arrived out of order across pods and are not bucketed
+              {cache.unordered_turns.toLocaleString()} turns arrived out of order and are not bucketed
             </p>
           )}
         </div>

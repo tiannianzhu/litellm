@@ -320,7 +320,7 @@ describe("AutoRouterBenchmarksTab", () => {
     expect(trigger).toHaveTextContent("0.0%");
   });
 
-  it("hides the expired-miss row only when no turns were measured at all", () => {
+  it("hides the expired-miss row when no turns were measured", () => {
     const empty = { turns: 0, hits: 0, hit_rate_pct: 0 };
     const nothingMeasured = {
       same_model: empty,
@@ -335,12 +335,23 @@ describe("AutoRouterBenchmarksTab", () => {
     expect(screen.queryByText("Expired-miss")).not.toBeInTheDocument();
   });
 
+  it("hides expired-miss when cache TTL is unknown even though turns were measured", () => {
+    const unknownTtl = totals({
+      cache: cache({ ttl_5m_turns: 0, ttl_1h_turns: 0, return_misses_expired: 0 }),
+    });
+    mockHook({ data: response([group(unknownTtl)], unknownTtl) });
+    renderTab();
+
+    expect(screen.getByText("818")).toBeInTheDocument();
+    expect(screen.queryByText("Expired-miss")).not.toBeInTheDocument();
+  });
+
   it("mentions out-of-order turns only when there are any", () => {
     const unordered = totals({ cache: cache({ unordered_turns: 12 }) });
     mockHook({ data: response([group(unordered)], unordered) });
     renderTab();
 
-    expect(screen.getByText(/12 turns arrived out of order across pods and are not bucketed/)).toBeInTheDocument();
+    expect(screen.getByText(/12 turns arrived out of order and are not bucketed/)).toBeInTheDocument();
   });
 
   it("labels the default selection instead of leaking the __all__ sentinel", () => {
