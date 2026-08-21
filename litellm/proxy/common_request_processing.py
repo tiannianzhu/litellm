@@ -121,6 +121,7 @@ from litellm.proxy.native_compaction import with_proxy_compaction_executor
 from litellm.proxy.route_llm_request import (
     route_request,
 )
+from litellm.proxy.session_identity import apply_inferred_session_id
 from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
     ProxyLogging,
     _check_and_merge_model_level_guardrails,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
@@ -2173,6 +2174,22 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if alias_target is not None:
                     self.data["model"] = alias_target
+
+        if (
+            llm_router is not None
+            and general_settings.get("infer_session_id") is True
+            and route_type
+            in (
+                "acompletion",
+                "aresponses",
+                "_aresponses_websocket",
+                "anthropic_messages",
+            )
+        ):
+            await apply_inferred_session_id(
+                request_data=self.data,  # pyright: ignore[reportUnknownArgumentType]  # request payload is assembled dynamically
+                cache=llm_router.cache,
+            )
 
         self.data["litellm_call_id"] = resolve_litellm_call_id(request.headers.get("x-litellm-call-id"))
         DDSpanTagger.tag_call_id(self.data.get("litellm_call_id"))
