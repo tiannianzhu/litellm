@@ -152,6 +152,12 @@ fn llm_route(path: &str) -> Option<&'static str> {
         .into_iter()
         .find(|route| path == *route)
         .or_else(|| {
+            ["/search", "/v1/search"]
+                .into_iter()
+                .any(|prefix| below(path, prefix).is_some_and(is_segment))
+                .then_some("/search")
+        })
+        .or_else(|| {
             LLM_ROUTE_SUFFIXES
                 .into_iter()
                 .find(|suffix| path.ends_with(suffix))

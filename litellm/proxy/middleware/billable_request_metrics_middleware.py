@@ -23,6 +23,7 @@ from typing import Final, Literal, Protocol, runtime_checkable
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.rust_bridge._native import classify_billable_route
 
 
@@ -185,13 +186,25 @@ class BillableRequestMetricsMiddleware:
                 model_id = _extract_model_id(response_start.get("headers", []))
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
-
-        if sink is not None:
+        def record_gateway_request(response_status: int) -> None:
+            if sink is None:
+                return
             try:
-                sink.record(category=category, route=route, status_code=status_code)
+                sink.record(category=category, route=route, status_code=response_status)
             except Exception:  # noqa: BLE001 -- metering must never fail a request that was already served
                 verbose_proxy_logger.warning("gateway request metering failed for %s", route, exc_info=True)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as error:
+            if sink is not None:
+                record_gateway_request(
+                    status_code
+                    or (503 if PrismaDBExceptionHandler.is_database_service_unavailable_error_in_chain(error) else 500)
+                )
+            raise
+
+        record_gateway_request(status_code)
 
         if recorder is not None and 200 <= status_code < 300:
             try:
