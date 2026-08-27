@@ -7,8 +7,10 @@ from typing import Final, TypeVar
 from pydantic import BaseModel, TypeAdapter
 from pydantic_core import to_jsonable_python
 
+from litellm.litellm_core_utils.core_helpers import finite_cost
 from litellm.litellm_core_utils.hidden_params import get_hidden_params, served_from_cache, set_hidden_params
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.litellm_logging import UncachedPrice
 from litellm.responses.utils import ResponseAPILoggingUtils
 from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.utils import CostBreakdown, ModelResponse, Usage
@@ -17,8 +19,16 @@ _PER_REQUEST_KEYS: Final = frozenset({"discount_percent", "margin_percent", "mar
 _TOTALS_WITH_FIXED_MARGIN: Final = ("total_cost", "margin_total_amount")
 _COST_BREAKDOWN: Final = TypeAdapter(CostBreakdown)
 _STR_KEYED: Final = TypeAdapter(Mapping[str, object])
+PRICE_OF_EVERY_ROUND: Final = "agentic_loop_price_of_every_round"
 
 _Round = TypeVar("_Round", ResponsesAPIResponse, ModelResponse)
+
+
+def price_of_every_round(hidden_params: Mapping[str, object]) -> UncachedPrice | None:
+    price: Final = hidden_params.get(PRICE_OF_EVERY_ROUND)
+    if not isinstance(price, UncachedPrice):
+        return None
+    return price if finite_cost(price.cost) is not None else UncachedPrice(cost=None, cost_breakdown=None)
 
 
 def _summed(first: object, final: object) -> object:
@@ -121,9 +131,11 @@ def summed_cost_breakdown(
     first_breakdown: CostBreakdown | None,
     final: ResponsesAPIResponse | ModelResponse,
     final_breakdown: CostBreakdown | None,
+    *,
+    independently_billed: bool = False,
 ) -> CostBreakdown | None:
     """The breakdown of the charged rounds, or None when a charged round was priced without its own breakdown, since a
-    partial one would disagree with the billed cost. The fixed margin is charged once per request, not once per round."""
+    partial one would disagree with the billed cost. Independent bills keep each round's fixed margin."""
     if served_from_cache(final):
         return None if served_from_cache(first) else first_breakdown
     if first_breakdown is final_breakdown:
@@ -132,9 +144,24 @@ def summed_cost_breakdown(
         return final_breakdown
     if first_breakdown is None or final_breakdown is None:
         return None
+    summed: Final = _summed_mapping(first_breakdown, final_breakdown)
+    if independently_billed:
+        return _COST_BREAKDOWN.validate_python(
+            {
+                **summed,
+                **(
+                    {
+                        "margin_fixed_amount": first_breakdown.get("margin_fixed_amount", 0.0)
+                        + final_breakdown.get("margin_fixed_amount", 0.0)
+                    }
+                    if "margin_fixed_amount" in first_breakdown or "margin_fixed_amount" in final_breakdown
+                    else {}
+                ),
+            }
+        )
     return _COST_BREAKDOWN.validate_python(
         _less_repeated_fixed_margin(
-            _summed_mapping(first_breakdown, final_breakdown),
+            summed,
             _repeated_fixed_margin(first, first_breakdown, final, final_breakdown),
         )
     )
@@ -145,17 +172,22 @@ def billed_for_every_round(
     first_breakdown: CostBreakdown | None,
     final: _Round,
     final_breakdown: CostBreakdown | None,
+    *,
+    independently_billed: bool = False,
 ) -> _Round:
-    """The final round's response carrying the usage and cost of both rounds, so the one logged row bills the request.
+    """The final round's response carrying the usage and cost of both rounds.
 
     Costs are summed per round rather than repriced from the summed usage, because a round's price can depend on its
     own size (tiered rates) or on charges the usage does not show (built-in tools, provider-reported costs). The fixed
-    margin both rounds added is charged once, since it is a per-request fee.
+    margin is charged once per request unless the rounds were billed independently.
     """
     first_cost: Final = _response_cost(first)
     final_cost: Final = _response_cost(final)
+    repeated_fixed_margin: Final = (
+        0.0 if independently_billed else _repeated_fixed_margin(first, first_breakdown, final, final_breakdown)
+    )
     total_cost: Final = (
-        first_cost + final_cost - _repeated_fixed_margin(first, first_breakdown, final, final_breakdown)
+        first_cost + final_cost - repeated_fixed_margin
         if isinstance(first_cost, (int, float)) and isinstance(final_cost, (int, float))
         else None
     )

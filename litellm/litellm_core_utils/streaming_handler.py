@@ -85,7 +85,7 @@ from .llm_response_utils.get_api_base import get_api_base
 from .rules import Rules
 
 if TYPE_CHECKING:
-    from .litellm_logging import BilledRoundsSpend
+    from .litellm_logging import BilledRoundsSpend, UncachedPrice
 
 # Constants for special delta attribute names
 AUDIO_ATTRIBUTE: Final = "audio"
@@ -534,7 +534,11 @@ class CustomStreamWrapper:
         count_prompt_tokens: Callable[[], int] | None = None,
         is_mock: bool = False,
         response_cost: float | None = None,
+        response_price: "UncachedPrice | None" = None,
     ):
+        from litellm.responses.mcp.round_billing import PRICE_OF_EVERY_ROUND
+
+        reported_cost: Final = response_price.cost if response_price is not None else response_cost
         self.model = model
         self.make_call = make_call
         self.count_prompt_tokens = count_prompt_tokens
@@ -589,7 +593,8 @@ class CustomStreamWrapper:
         self._hidden_params: dict[str, object] = {
             "model_id": (_model_info.get("id", None)),
             "api_base": _api_base,
-            **({} if response_cost is None else {"response_cost": response_cost}),
+            **({} if reported_cost is None else {"response_cost": reported_cost}),
+            **({} if response_price is None else {PRICE_OF_EVERY_ROUND: response_price}),
         }  # returned as x-litellm-model-id response header in proxy
 
         self._hidden_params["additional_headers"] = process_response_headers(
@@ -630,7 +635,7 @@ class CustomStreamWrapper:
         # this cache must be removed.
         self._base_hidden_params: dict[str, object] = {
             **self._hidden_params,
-            "response_cost": response_cost,
+            "response_cost": reported_cost,
         }
 
         self._post_streaming_hooks: list | None = None
