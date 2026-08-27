@@ -3860,6 +3860,13 @@ class Logging(LiteLLMLoggingBaseClass):
         """
         import httpx
 
+        from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+            FakeAnthropicMessagesStreamIterator,
+        )
+
+        if isinstance(result, FakeAnthropicMessagesStreamIterator):
+            return self._handle_anthropic_messages_response_logging(result=result.response)
+
         if self.stream and isinstance(result, ModelResponse) or isinstance(result, ModelResponse):
             return result
 
