@@ -701,7 +701,13 @@ def get_logging_payload(
         response_obj = {"result": str(response_obj)}
     # standardize this function to be used across, s3, dynamoDB, langfuse logging
     litellm_params: Final = kwargs.get("litellm_params", {})
-    metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
+    request_metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
+    agentic_depth: Final = request_metadata.get("_agentic_loop_depth")
+    metadata: Final = (
+        {**request_metadata, "internal_call_origin": request_metadata.get("internal_call_origin") or "agentic_loop"}
+        if type(agentic_depth) is int and agentic_depth > 0
+        else request_metadata
+    )
     routing_litellm_params: Final[Mapping[str, object] | None] = (
         litellm_params if isinstance(litellm_params, Mapping) else None
     )
@@ -797,7 +803,8 @@ def get_logging_payload(
     ):  # use 'tags' from standard logging payload instead
         request_tags = safe_dumps(standard_logging_payload["request_tags"])
 
-    _model_id: Final = metadata.get("model_info", {}).get("id", "") or _sl_attribution_fallback(
+    model_info: Final = as_str_mapping(metadata.get("model_info"))
+    _model_id: Final = (model_info.get("id", "") if model_info is not None else "") or _sl_attribution_fallback(
         standard_logging_payload, "model_id"
     )
     _model_group: Final = _string_or_empty(metadata.get("model_group")) or _sl_attribution_fallback(

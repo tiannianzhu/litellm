@@ -1,6 +1,7 @@
 # this is a patch to allow for agentic loops covering llm_http_handler.py and openai sdk based calling flows for the .completion() api
 
 import json
+import time
 from collections.abc import Awaitable, Iterable, Iterator, Mapping, Sequence
 from itertools import chain
 from types import MappingProxyType
@@ -8,7 +9,7 @@ from typing import Final, TypeVar
 
 from pydantic import TypeAdapter, ValidationError
 
-from litellm._internal_context import internal_sub_call
+from litellm._internal_context import billed_separately
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.agentic_followup_failure import mark_agentic_followup_failure, rounds_served_before
@@ -158,6 +159,7 @@ def _converted_stream_replay(
     model: str,
     custom_llm_provider: str,
     logging_obj: object,
+    record_completed_round: bool = False,
 ) -> CustomStreamWrapper | None:
     if depth or not converted_stream_requested(kwargs):
         return None
@@ -166,6 +168,8 @@ def _converted_stream_replay(
     if not isinstance(response, ModelResponse) or not isinstance(logging_obj, LiteLLMLoggingObject):
         return None
 
+    if record_completed_round:
+        logging_obj.record_agentic_loop_response(response, time.time())
     return CustomStreamWrapper(
         completion_stream=MockResponseIterator(model_response=response),
         model=model,
@@ -392,7 +396,7 @@ async def _execute_chat_completion_agentic_plan(
     )
 
     try:
-        with internal_sub_call(logging_obj.litellm_call_id if isinstance(logging_obj, LiteLLMLoggingObject) else None):
+        with billed_separately():
             response_followup = await litellm.acompletion(
                 model=full_model_name,
                 messages=patch.messages,
@@ -423,6 +427,7 @@ async def _execute_chat_completion_agentic_plan(
             model=model,
             custom_llm_provider=custom_llm_provider,
             logging_obj=logging_obj,
+            record_completed_round=kwargs.get("_websearch_interception_converted_stream") is True,
         )
         return response_followup if replay is None else replay
     finally:
@@ -454,6 +459,7 @@ async def maybe_run_chat_completion_agentic_loop(
     depth, max_loops, fingerprints = _agentic_loop_settings(request_kwargs)
     tools: Final = _request_tools(optional_params)
 
+    completed_at: Final = time.time()
     for callback in callbacks:
         if not _gate_overridden(callback):
             continue
@@ -515,6 +521,8 @@ async def maybe_run_chat_completion_agentic_loop(
             )
 
         if not _build_plan_overridden(callback):
+            if isinstance(logging_obj, LiteLLMLoggingObject):
+                logging_obj.record_agentic_loop_response(response, completed_at)
             return await callback.async_run_agentic_loop(
                 tools=tool_calls,
                 model=model,
@@ -546,6 +554,8 @@ async def maybe_run_chat_completion_agentic_loop(
         if not plan.run_agentic_loop:
             continue
 
+        if isinstance(logging_obj, LiteLLMLoggingObject):
+            logging_obj.record_agentic_loop_response(response, completed_at)
         return await _execute_chat_completion_agentic_plan(
             plan=plan,
             callback=callback,
@@ -567,6 +577,7 @@ async def maybe_run_chat_completion_agentic_loop(
         model=model,
         custom_llm_provider=custom_llm_provider,
         logging_obj=logging_obj,
+        record_completed_round=kwargs.get("_websearch_interception_converted_stream") is True,
     )
 
 
@@ -581,6 +592,7 @@ async def run_chat_completion_agentic_hooks(
     custom_llm_provider: str,
     stream: bool,
 ) -> object | None:
+    completed_at: Final = time.time()
     callbacks: Final = _custom_loggers(logging_obj)
     depth, max_loops, fingerprints = _agentic_loop_settings(kwargs)
     tools: Final = _request_tools(optional_params)
@@ -631,6 +643,7 @@ async def run_chat_completion_agentic_hooks(
             )
 
         if not _chat_build_plan_overridden(callback):
+            logging_obj.record_agentic_loop_response(response, completed_at)
             return await callback.async_run_chat_completion_agentic_loop(
                 tools=tool_calls,
                 model=model,
@@ -663,6 +676,7 @@ async def run_chat_completion_agentic_hooks(
         if not plan.run_agentic_loop:
             continue
 
+        logging_obj.record_agentic_loop_response(response, completed_at)
         return await _execute_chat_completion_agentic_plan(
             plan=plan,
             callback=callback,

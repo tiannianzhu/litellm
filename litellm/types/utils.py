@@ -3381,6 +3381,7 @@ ClassifierFailureReason = Literal[
 
 
 InternalCallOrigin = Literal[
+    "agentic_loop",
     "autorouter_classifier",
     "autorouter_compaction",
     "shadow_eval_router",

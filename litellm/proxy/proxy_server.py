@@ -4173,6 +4173,9 @@ async def _increment_spend_counters_batched(
     # as orphaned tasks that race the caller's reservation-counter invalidation;
     # all scopes settle, then the first error propagates as before.
     scope_items: Final = tuple(_flatten_spend_scopes(await asyncio.gather(*scope_coros, return_exceptions=True)))
+    prepared_scope_errors: Final = tuple(item for item in scope_items if isinstance(item, BaseException))
+    if prepared_scope_errors and prisma_client is None:
+        raise prepared_scope_errors[0]
     uncached_windows: Final = tuple(item for item in scope_items if isinstance(item, _UncachedBudgetWindows))
     await _apply_spend_counter_increments(
         pending=reservation_update.pending

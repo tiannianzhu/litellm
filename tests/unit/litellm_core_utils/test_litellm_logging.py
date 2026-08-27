@@ -3,6 +3,7 @@ import contextlib
 import copy
 import datetime
 import importlib.abc
+import inspect
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator, Mappin
 from datetime import datetime as datetime_standard_logging, datetime as datetime_unit_test, datetime as dt_object
 from importlib.machinery import ModuleSpec
 from types import MappingProxyType, ModuleType
-from typing import Final, Literal, TypeAlias
+from typing import Final, List, Literal, Optional, TypeAlias
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -25,7 +26,7 @@ import pytest_asyncio
 from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
 from openai import AsyncOpenAI
 from openai._legacy_response import HttpxBinaryResponseContent
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 import litellm
 from litellm._internal_context import current_request_parent_otel_span, in_post_response_phase
@@ -83,7 +84,9 @@ from litellm.types.rerank import RerankResponse
 from litellm.types.utils import (
     CallTypes,
     CostBreakdown,
+    GenericStreamingChunk,
     ImageResponse,
+    LiteLLMCommonStrings,
     LiteLLMRealtimeStreamLoggingObject,
     ModelResponse,
     StandardCallbackDynamicParams,
@@ -95,9 +98,6 @@ from litellm.types.utils import (
     Usage,
 )
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
-import inspect
-from typing import List, Optional
-from litellm.types.utils import GenericStreamingChunk, LiteLLMCommonStrings
 
 
 @pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
@@ -7834,6 +7834,32 @@ def test_anthropic_messages_logged_response_tolerates_a_stream_that_assembled_no
     assert result.model == "openai/my-local"
 
 
+def test_handle_anthropic_messages_response_logging_unwraps_fake_stream_iterator():
+    from litellm.llms.anthropic.messages.native.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
+
+    logging_obj = _anthropic_messages_logging_obj()
+    logging_obj.optional_params = {}
+    response = {
+        "id": "msg-search",
+        "type": "message",
+        "role": "assistant",
+        "model": "openai/my-local",
+        "content": [{"type": "text", "text": "search results"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+
+    result = logging_obj._handle_anthropic_messages_response_logging(
+        result=FakeAnthropicMessagesStreamIterator(response=response)
+    )
+
+    assert isinstance(result, ModelResponse)
+    assert result.choices[0].message.content == "search results"  # type: ignore[union-attr]
+
+
 def test_handle_anthropic_messages_response_logging_degrades_on_unparseable_responses_payload():
     """If the Responses translation raises (eg. empty output on an incomplete response),
     the row must still land: a minimal ModelResponse with model + usage is returned."""
@@ -8806,8 +8832,8 @@ def test_restore_correlation_context_safe_to_call_repeatedly(monkeypatch):
 
 
 def test_restore_correlation_context_does_not_resanitize(monkeypatch):
-    from litellm.litellm_core_utils.litellm_logging import Logging
     from litellm._logging import _sanitize_correlation_id
+    from litellm.litellm_core_utils.litellm_logging import Logging
 
     monkeypatch.setattr(litellm, "request_correlation_in_logs", True)
     trace_id_var.set("outer-trace")
@@ -8954,11 +8980,11 @@ class TestNonInferenceCallTypesAreNotBilled:
         assert cost == 0.0
 
     def test_retrieved_usage_is_not_re_reported_in_standard_logging_payload(self):
+        from datetime import datetime
+
         from litellm.litellm_core_utils.litellm_logging import (
             get_standard_logging_object_payload,
         )
-
-        from datetime import datetime
 
         logging_obj = self._logging_obj("aget_responses")
         now = datetime.now()
@@ -12724,6 +12750,7 @@ def test_enterprise_alerting_loggers_resolves_real_classes():
     from litellm_enterprise.enterprise_callbacks.send_emails.resend_email import ResendEmailLogger
     from litellm_enterprise.enterprise_callbacks.send_emails.sendgrid_email import SendGridEmailLogger
     from litellm_enterprise.enterprise_callbacks.send_emails.smtp_email import SMTPEmailLogger
+
     from litellm.litellm_core_utils import litellm_logging as logging_module
 
     logging_module._enterprise_alerting_loggers.cache_clear()
@@ -12743,6 +12770,7 @@ def test_enterprise_alerting_loggers_falls_back_without_disabling_callback_contr
     from litellm_enterprise.enterprise_callbacks.callback_controls import (
         EnterpriseCallbackControls,
     )
+
     from litellm.integrations.custom_logger import CustomLogger
     from litellm.litellm_core_utils import litellm_logging as logging_module
 
@@ -12783,10 +12811,11 @@ def test_init_email_alerting_logger_reuses_instance(
     integration: Literal["smtp_email", "resend_email", "sendgrid_email"],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from litellm.litellm_core_utils import litellm_logging as logging_module
     from litellm_enterprise.enterprise_callbacks.send_emails.resend_email import ResendEmailLogger
     from litellm_enterprise.enterprise_callbacks.send_emails.sendgrid_email import SendGridEmailLogger
     from litellm_enterprise.enterprise_callbacks.send_emails.smtp_email import SMTPEmailLogger
+
+    from litellm.litellm_core_utils import litellm_logging as logging_module
 
     logger_class: Final = (
         SMTPEmailLogger
@@ -12821,9 +12850,10 @@ def test_init_email_alerting_logger_reuses_instance(
 
 
 def test_init_pagerduty_logger_reuses_instance(monkeypatch):
-    from litellm.types.integrations.pagerduty import AlertingConfig
     from litellm_enterprise.enterprise_callbacks.pagerduty.pagerduty import PagerDutyAlerting
+
     from litellm.litellm_core_utils import litellm_logging as logging_module
+    from litellm.types.integrations.pagerduty import AlertingConfig
 
     monkeypatch.setenv("PAGERDUTY_API_KEY", "test-pagerduty-key")
     logging_module._in_memory_loggers.clear()
@@ -13493,6 +13523,7 @@ def test_get_final_response_obj():
         # Reset litellm.turn_off_message_logging to its original value
         litellm.turn_off_message_logging = False
 
+
 def test_get_standard_logging_payload_trace_id():
     """Test get_standard_logging_payload_trace_id with different input scenarios"""
     # Test case 1: When litellm_trace_id is provided in litellm_params
@@ -13530,6 +13561,7 @@ def test_get_standard_logging_payload_trace_id():
     assert result == "12345"
     assert isinstance(result, str)
 
+
 def test_get_standard_logging_payload_trace_id_prioritizes_trace_id_when_flag_on(monkeypatch):
     """With request_correlation_in_logs on, an explicit litellm_trace_id wins over litellm_session_id."""
     from unittest.mock import MagicMock
@@ -13544,6 +13576,7 @@ def test_get_standard_logging_payload_trace_id_prioritizes_trace_id_when_flag_on
     )
     assert result == "the-trace-id"
 
+
 def test_get_standard_logging_payload_trace_id_keeps_trace_id_when_flag_off(monkeypatch):
     from unittest.mock import MagicMock
 
@@ -13556,6 +13589,7 @@ def test_get_standard_logging_payload_trace_id_keeps_trace_id_when_flag_off(monk
         logging_obj=mock_logging_obj, litellm_params=litellm_params
     )
     assert result == "the-trace-id"
+
 
 def test_get_standard_logging_payload_session_id_when_flag_on(monkeypatch):
     """Test get_standard_logging_payload_session_id with different input scenarios, flag enabled"""
@@ -13608,6 +13642,7 @@ def test_get_standard_logging_payload_session_id_when_flag_on(monkeypatch):
         logging_obj=mock_logging_obj, litellm_params=litellm_params
     )
     assert result == ""
+
 
 def test_get_standard_logging_payload_session_id_is_retained_when_flag_off(monkeypatch):
     from unittest.mock import MagicMock
@@ -13784,7 +13819,6 @@ def test_cost_breakdown_in_standard_logging_payload():
     Test that cost breakdown fields are properly included in StandardLoggingPayload.
     Tests input_cost, output_cost, tool_usage_cost, and total_cost fields.
     """
-    import time
 
     from datetime import datetime as datetime_standard_logging
 
@@ -13792,7 +13826,6 @@ def test_cost_breakdown_in_standard_logging_payload():
         Logging,
         get_standard_logging_object_payload,
     )
-    from litellm.types.utils import Usage
 
     # Create a mock logging object with cost breakdown
     logging_obj = Logging(
@@ -16492,3 +16525,239 @@ async def test_a_sync_failure_on_the_loop_alone_still_delivers_v2_attempt_ended_
 
     assert journal == [("sync", "failure", None), ("async", "failure", None)]
     assert submitted == ["RequestScope._deliver_off_path"]
+
+
+class _AgenticLoopSnapshotCaptureLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.responses: list[ModelResponse] = []
+        self.payloads: list[Mapping[str, object]] = []
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.responses.append(response_obj)
+        self.payloads.append(TypeAdapter(dict[str, object]).validate_python(kwargs["standard_logging_object"]))
+
+
+@pytest.mark.asyncio
+async def test_agentic_round_snapshot_keeps_its_own_usage_and_finalized_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.accounting.projection import project
+    from litellm.accounting.snapshot import build_accounting_payload
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.spend_tracking.cost_finalization import finalize_response_cost, prepare_response_cost
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+    from litellm.utils import dispatch_success_logging
+
+    pricing: Final = {"litellm_provider": "hosted_vllm", "input_cost_per_token": 0.01, "output_cost_per_token": 0.1}
+    monkeypatch.setitem(litellm.model_cost, "round-fixture", pricing)
+    monkeypatch.setitem(litellm.model_cost, "hosted_vllm/round-fixture", pricing)
+    monkeypatch.setattr(litellm, "apply_search_free_tier", False)
+    now: Final = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    callback: Final = _AgenticLoopSnapshotCaptureLogger()
+
+    def round_logging(depth: int) -> LitellmLogging:
+        result: Final = LitellmLogging(
+            model="hosted_vllm/round-fixture",
+            messages=[],
+            stream=False,
+            call_type=CallTypes.acompletion.value,
+            start_time=now + datetime.timedelta(seconds=depth),
+            litellm_call_id="shared-caller",
+            function_id=f"round-{depth}",
+            dynamic_async_success_callbacks=[callback],
+        )
+        result.update_environment_variables(
+            litellm_params={"acompletion": True, "litellm_metadata": {"_agentic_loop_depth": depth}},
+            optional_params={},
+            custom_llm_provider="hosted_vllm",
+        )
+        return result
+
+    first: Final = ModelResponse(
+        id="first-round", model="round-fixture", usage={"prompt_tokens": 13, "completion_tokens": 5, "total_tokens": 18}
+    )
+    final: Final = ModelResponse(
+        id="final-round", model="round-fixture", usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+    )
+    parent: Final = round_logging(0)
+    parent.defer_async_logging = True
+    parent.record_agentic_loop_response(first, now.timestamp())
+    child: Final = round_logging(1)
+    finished: Final = now + datetime.timedelta(seconds=2)
+    await finalize_response_cost(child, final, None, finished)
+    await child.async_success_handler(final, child.start_time, finished)
+
+    dispatch_success_logging(parent, final, now, finished, False, False)
+    prepare_response_cost(parent, final, finished)
+    await finalize_response_cost(parent, final, None, finished)
+    ProxyBaseLLMRequestProcessing._flush_deferred_async_logging(parent, exception_raised=False)
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    assert {
+        payload["id"]: (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"])
+        for payload in callback.payloads
+    } == {"first-round": (13, 5, 18), "final-round": (2, 3, 5)}
+    assert {payload["id"]: payload["response_cost"] for payload in callback.payloads} == pytest.approx(
+        {"first-round": 0.63, "final-round": 0.32}
+    )
+    assert parent.finalized_cost is not None and child.finalized_cost is not None
+    assert (parent.finalized_cost.amount, child.finalized_cost.amount) == pytest.approx((0.63, 0.32))
+    rows: Final = tuple(
+        get_logging_payload(
+            kwargs=logging_obj.model_call_details,
+            response_obj=response,
+            start_time=logging_obj.start_time,
+            end_time=finished,
+        )
+        for logging_obj, response in ((parent, first), (child, final))
+    )
+    assert {row["request_id"]: (row["prompt_tokens"], row["completion_tokens"]) for row in rows} == {
+        "first-round": (13, 5),
+        "final-round": (2, 3),
+    }
+    assert {row["request_id"]: row["spend"] for row in rows} == pytest.approx(
+        {"first-round": 0.63, "final-round": 0.32}
+    )
+    accounting: Final = tuple(
+        build_accounting_payload(
+            row,
+            entities={"api_key": row["api_key"], "user": row["user"]},
+            model_access_groups=(),
+            windows=(),
+            router=lambda: None,
+        )
+        for row in rows
+    )
+    counters: Final = tuple(
+        dict(next(item for item in project(row) if item.table == "LiteLLM_DailyUserSpend").increments)
+        for row in accounting
+    )
+    assert tuple((row["prompt_tokens"], row["completion_tokens"]) for row in counters) == ((13, 5), (2, 3))
+    assert sum(row["spend"] for row in counters) == pytest.approx(0.95)
+    assert sum(row["api_requests"] for row in counters) == 1
+    assert sum(row["successful_requests"] for row in counters) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exception_raised", [False, True])
+async def test_agentic_loop_snapshot_deferred_logging(exception_raised: bool):
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.utils import dispatch_success_logging
+
+    callback = _AgenticLoopSnapshotCaptureLogger()
+    start_time = datetime.datetime.now()
+    logging_obj = LitellmLogging(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Use the tool"}],
+        stream=True,
+        call_type=CallTypes.acompletion.value,
+        start_time=start_time,
+        litellm_call_id="agentic-loop-snapshot-call",
+        function_id="agentic-loop-snapshot-function",
+        dynamic_async_success_callbacks=[callback],
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"acompletion": True},
+        optional_params={},
+        custom_llm_provider="openai",
+    )
+    raw_response = ModelResponse(
+        id="raw-tool-call",
+        model="gpt-4o-mini",
+        usage={"prompt_tokens": 13, "completion_tokens": 5, "total_tokens": 18},
+    )
+    outer_final_response = ModelResponse(id="outer-final", model="gpt-4o-mini")
+    logging_obj._defer_async_logging = True
+    logging_obj.record_agentic_loop_response(raw_response, start_time.timestamp())
+    raw_response.usage.prompt_tokens = 999
+
+    await logging_obj.async_success_handler(
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+    )
+    assert callback.responses == []
+
+    dispatch_success_logging(
+        logging_obj=logging_obj,
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+        is_completion_with_fallbacks=False,
+        is_litellm_internal_call=False,
+    )
+    ProxyBaseLLMRequestProcessing._flush_deferred_async_logging(logging_obj, exception_raised)
+    await asyncio.sleep(0)
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    if exception_raised:
+        assert logging_obj._enqueue_deferred_logging is None
+        assert callback.responses == []
+        return
+
+    assert [
+        (response.id, response.usage.prompt_tokens, response.usage.completion_tokens) for response in callback.responses
+    ] == [("raw-tool-call", 13, 5)]
+    assert logging_obj.model_call_details["standard_logging_object"]["response"]["id"] == "raw-tool-call"
+
+    await logging_obj.async_success_handler(
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+    )
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    assert len(callback.responses) == 1
+
+
+class _BlockedSuccessLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.responses: list[str] = []
+
+    async def async_logging_hook(self, kwargs, result, call_type):
+        self.entered.set()
+        await self.release.wait()
+        return kwargs, result
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.responses.append(response_obj.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_concurrent_success_logs_once_and_cancelled_attempt_can_retry(cancel_first: bool):
+    callback = _BlockedSuccessLogger()
+    logging_obj = LitellmLogging(
+        model="hosted_vllm/logging-fixture",
+        messages=[],
+        stream=False,
+        call_type=CallTypes.acompletion.value,
+        start_time=datetime.datetime.now(),
+        litellm_call_id="concurrent-success",
+        function_id="concurrent-success",
+        dynamic_async_success_callbacks=[callback],
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="hosted_vllm")
+    response = ModelResponse(
+        id="one-response",
+        model="hosted_vllm/logging-fixture",
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    response._hidden_params["response_cost"] = 0.01
+    first = asyncio.create_task(logging_obj.async_success_handler(result=response))
+    await asyncio.wait_for(callback.entered.wait(), timeout=5)
+    if cancel_first:
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+    rivals = tuple(asyncio.create_task(logging_obj.async_success_handler(result=response)) for _ in range(2))
+    await asyncio.sleep(0)
+    callback.release.set()
+    await asyncio.wait_for(asyncio.gather(*rivals), timeout=5)
+    if not cancel_first:
+        await asyncio.wait_for(first, timeout=5)
+    await logging_obj.async_success_handler(result=response)
+    assert callback.responses == ["one-response"]

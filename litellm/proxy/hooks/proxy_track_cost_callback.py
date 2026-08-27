@@ -1445,6 +1445,55 @@ async def _update_database_and_spend_counters_in_batch(
     committed_spend_scope: EntitySpendCounterKeys | None = None,
     customer_counters: "Sequence[BudgetCounter]" = (),
 ) -> bool:
+    from litellm.proxy.proxy_server import prisma_client, spend_counter_store
+
+    async def update_counters() -> None:
+        try:
+            await settle_customer_spend(
+                _OBJECT_MAPPING.validate_python(get_litellm_metadata_from_kwargs(kwargs=kwargs)),
+                response_cost,
+                spend_counter_store,
+            )
+            await increment_spend_counters(
+                token=user_api_key,
+                team_id=team_id,
+                user_id=user_id,
+                response_cost=response_cost,
+                org_id=org_id,
+                budget_reservation=budget_reservation,
+                end_user_id=end_user_id,
+                tags=request_tags,
+                request_started_at=start_time,
+                model_access_groups=model_access_groups,
+                project_id=project_id,
+                committed_spend_scope=(
+                    committed_spend_scope
+                    if committed_spend_scope is not None
+                    else await _committed_spend_scope_of_row(
+                        kwargs=kwargs,
+                        response_cost=response_cost,
+                        token=user_api_key,
+                        team_id=team_id,
+                        user_id=user_id,
+                        org_id=org_id,
+                        end_user_id=end_user_id,
+                    )
+                ),
+                **_ledger_counter_options(_BATCH_CALLBACK_FIELDS.validate_python(kwargs).get(ACCOUNTING_LEDGER_KWARG)),
+                **_customer_counter_options(customer_counters),
+            )
+        except Exception:
+            if budget_reservation is not None:
+                try:
+                    await _invalidate_budget_reservation_counters(budget_reservation=budget_reservation)
+                except Exception:
+                    verbose_proxy_logger.exception(
+                        "Failed to invalidate budget reservation counters after spend counter update failed"
+                    )
+                finally:
+                    budget_reservation["finalized"] = True
+            raise
+
     try:
         writer: Final = spend_writer if spend_writer is not None else proxy_logging_obj.db_spend_update_writer
         accounting: Final = (
@@ -1467,6 +1516,7 @@ async def _update_database_and_spend_counters_in_batch(
             org_id=org_id,
             project_id=project_id,
             **_customer_counter_options(customer_counters),
+            on_accounting_admitted=update_counters if prisma_client is None else None,
         )
     except Exception:
         if budget_reservation is not None:
@@ -1485,53 +1535,8 @@ async def _update_database_and_spend_counters_in_batch(
         await _release_budget_reservation(budget_reservation=budget_reservation)
         return False
 
-    from litellm.proxy.proxy_server import spend_counter_store
-
-    try:
-        await settle_customer_spend(
-            _OBJECT_MAPPING.validate_python(get_litellm_metadata_from_kwargs(kwargs=kwargs)),
-            response_cost,
-            spend_counter_store,
-        )
-        await increment_spend_counters(
-            token=user_api_key,
-            team_id=team_id,
-            user_id=user_id,
-            response_cost=response_cost,
-            org_id=org_id,
-            budget_reservation=budget_reservation,
-            end_user_id=end_user_id,
-            tags=request_tags,
-            request_started_at=start_time,
-            model_access_groups=model_access_groups,
-            project_id=project_id,
-            committed_spend_scope=(
-                committed_spend_scope
-                if committed_spend_scope is not None
-                else await _committed_spend_scope_of_row(
-                    kwargs=kwargs,
-                    response_cost=response_cost,
-                    token=user_api_key,
-                    team_id=team_id,
-                    user_id=user_id,
-                    org_id=org_id,
-                    end_user_id=end_user_id,
-                )
-            ),
-            **_ledger_counter_options(_BATCH_CALLBACK_FIELDS.validate_python(kwargs).get(ACCOUNTING_LEDGER_KWARG)),
-            **_customer_counter_options(customer_counters),
-        )
-    except Exception:
-        if budget_reservation is not None:
-            try:
-                await _invalidate_budget_reservation_counters(budget_reservation=budget_reservation)
-            except Exception:
-                verbose_proxy_logger.exception(
-                    "Failed to invalidate budget reservation counters after spend counter update failed"
-                )
-            finally:
-                budget_reservation["finalized"] = True
-        raise
+    if prisma_client is not None:
+        await update_counters()
     return True
 
 

@@ -3,6 +3,7 @@ import copy
 import inspect
 import json
 import ssl
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache, partial, reduce
@@ -37,7 +38,7 @@ import litellm
 import litellm.litellm_core_utils
 import litellm.types
 import litellm.types.utils
-from litellm._internal_context import internal_sub_call
+from litellm._internal_context import billed_separately
 from litellm._logging import redact_string, verbose_logger
 from litellm.anthropic_beta_headers_manager import (
     aload_beta_headers_config,
@@ -3453,6 +3454,8 @@ class BaseLLMHTTPHandler:
 
         result: Final = final_response if final_response is not None else initial_response
         if converted_stream_requested(agentic_kwargs) and not agentic_kwargs.get("_agentic_loop_depth"):
+            if agentic_kwargs.get("_websearch_interception_converted_stream") is True:
+                logging_obj.record_agentic_loop_response(initial_response, time.time())
             return self._wrap_responses_response_as_fake_stream(
                 result=result,
                 model=model,
@@ -6263,7 +6266,7 @@ class BaseLLMHTTPHandler:
         )
 
         try:
-            with internal_sub_call(logging_obj.litellm_call_id):
+            with billed_separately():
                 response: Final[ResponsesAPIResponse | BaseResponsesAPIStreamingIterator] = await litellm.aresponses(
                     model=patch.model or model,
                     input=patch.messages,  # pyright: ignore[reportArgumentType]  # pre-existing mismatch surfaced by the Router import; patch messages are valid response input at runtime
@@ -6385,6 +6388,11 @@ class BaseLLMHTTPHandler:
             return FakeAnthropicMessagesStreamIterator(response=cast(AnthropicMessagesResponse, response))
         return response
 
+    @staticmethod
+    def _record_responses_agentic_round(response: object, logging_obj: LiteLLMLoggingObj, completed_at: float) -> None:
+        if isinstance(response, ResponsesAPIResponse):
+            logging_obj.record_agentic_loop_response(response, completed_at)
+
     async def _call_agentic_completion_hooks(
         self,
         response: object,
@@ -6420,6 +6428,7 @@ class BaseLLMHTTPHandler:
             ),
             "_agentic_loop_api_surface": api_surface,
         }
+        completed_at: Final = time.time()
 
         for callback in callbacks:
             if not isinstance(callback, CustomLogger):
@@ -6502,6 +6511,7 @@ class BaseLLMHTTPHandler:
                 callback.__class__.async_build_agentic_loop_plan is not CustomLogger.async_build_agentic_loop_plan
             )
             if not build_plan_overridden:
+                self._record_responses_agentic_round(response, logging_obj, completed_at)
                 agentic_result: object = _AGENTIC_HOOK_RESULT.validate_python(
                     await bill_first_round_on_failure(
                         callback.async_run_agentic_loop(
@@ -6563,6 +6573,7 @@ class BaseLLMHTTPHandler:
                 continue
 
             if api_surface == "responses":
+                self._record_responses_agentic_round(response, logging_obj, completed_at)
                 return await bill_first_round_on_failure(
                     self._execute_responses_agentic_plan(
                         plan=plan,

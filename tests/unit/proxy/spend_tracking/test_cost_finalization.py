@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Final, Literal
 
@@ -10,9 +11,9 @@ from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.spend_tracking.cost_finalization import finalize_response_cost
-from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
 from litellm.redis.stores.connection import connect
 from litellm.redis.stores.spend_counters import SpendCounterStore
+from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
 
 NOW: Final = datetime(2026, 10, 20, 12, 30, tzinfo=timezone.utc)
 MODEL: Final = "gemini-finalization-test"
@@ -111,7 +112,6 @@ async def test_header_and_logging_share_one_allowance_allocation(
     assert float(headers["x-litellm-response-cost"]) == pytest.approx(payload["response_cost"])
     assert payload["cost_finalized"] is True
     assert payload["cost_breakdown"] == costs[0].logging_breakdown()
-
 
 
 @pytest.mark.asyncio
@@ -300,8 +300,8 @@ async def test_guardrail_json_response_uses_finalized_header_when_cost_is_known(
     logging_obj: Logging, monkeypatch: pytest.MonkeyPatch, known_cost: bool
 ) -> None:
     import httpx
-
     from fastapi import Response
+
     from litellm.caching.dual_cache import DualCache
     from litellm.integrations.custom_guardrail import CustomGuardrail
     from litellm.proxy.utils import ProxyLogging
@@ -347,6 +347,7 @@ async def test_malformed_passthrough_logging_preserves_response_dispatch_contrac
 ) -> None:
 
     import httpx
+
     from litellm.llms.anthropic.common_utils import AnthropicError
     from litellm.proxy.pass_through_endpoints.success_handler import PassThroughEndpointLogging
     from litellm.types.passthrough_endpoints.pass_through_endpoints import PassthroughStandardLoggingPayload
@@ -465,6 +466,13 @@ async def test_completed_call_keeps_its_charge_when_post_call_processing_fails(
         },
     )
     writer: Final = create_autospec(DBSpendUpdateWriter, instance=True)
+
+    async def admit(*, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **_: object) -> bool:
+        if on_accounting_admitted is not None:
+            await on_accounting_admitted()
+        return True
+
+    writer.update_database.side_effect = admit
     monkeypatch.setattr(litellm, "callbacks", [RejectCompletedCall(), ProxyDBLogger(spend_writer=lambda: writer)])
     monkeypatch.setattr(litellm, "apply_search_free_tier", False)
     data: Final = {

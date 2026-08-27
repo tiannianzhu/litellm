@@ -13,8 +13,8 @@ import os
 import random
 import time
 import uuid
-from collections.abc import AsyncGenerator, Callable, Coroutine, Iterable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from functools import reduce
@@ -30,6 +30,7 @@ from litellm._internal_context import service_target, with_service_target
 from litellm._logging import verbose_proxy_logger
 from litellm.accounting.metrics import Cadence
 from litellm.caching import RedisCache
+from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import (
     BILLED_RETRY_ATTEMPT_METADATA_KEY,
     DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
@@ -176,6 +177,20 @@ def _org_member_transaction_key(org_id: str, user_id: str) -> str:
 
 
 ACCOUNTING_LEDGER_KWARG: Final = "accounting_ledger"
+
+
+def _spend_log_admission_identity(
+    kwargs: Mapping[str, object], response: object, request_id: str
+) -> str | None:
+    internal_request_id: Final = kwargs.get("_accounting_request_id")
+    if isinstance(internal_request_id, str) and internal_request_id:
+        return json.dumps(("request", internal_request_id, request_id))
+    response_id: Final = (
+        _SPEND_METADATA_ADAPTER.validate_python(response).get("id")
+        if isinstance(response, Mapping)
+        else _CALL_KWARG_VALUE.validate_python(getattr(response, "id", None))
+    )
+    return json.dumps(("response", request_id)) if isinstance(response_id, str) and response_id else None
 
 
 def _persistable_api_key(token: str | None, logged_api_key: str) -> str | None:
@@ -783,6 +798,8 @@ class DBSpendUpdateWriter:
         self.daily_tag_spend_update_queue = DailySpendUpdateQueue()
         self.window_spend_update_queue = WindowSpendUpdateQueue()
         self.interrupted_tag_commits: set[asyncio.Task[None]] = set()
+        self._spend_log_admission_lock = asyncio.Lock()
+        self._recent_spend_log_admissions = InMemoryCache(max_size_in_memory=10_000, default_ttl=600)
 
     async def update_database(
         # LiteLLM management object fields
@@ -800,11 +817,12 @@ class DBSpendUpdateWriter:
         response_cost: float | None,
         project_id: str | None = None,
         customer_counters: "Sequence[BudgetCounter] | None" = None,
+        on_accounting_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
         """Record the request's spend, answering whether its cost still needs charging.
 
-        False only for a batch or video poll whose cost row another poll already wrote,
-        so the caller leaves the key, team, and user counters alone (LIT-7048).
+        False for duplicate ordinary callbacks retained by this writer, or a batch
+        or video poll whose cost row another poll already wrote (LIT-7048).
         """
         from litellm.proxy.proxy_server import (
             accounting_window_keys,
@@ -825,6 +843,13 @@ class DBSpendUpdateWriter:
         if kwargs is not None:
             kwargs[ACCOUNTING_LEDGER_KWARG] = use_ledger  # rebind-ok: spend counters leave ledger windows to the worker
         try:
+            if (
+                kwargs is not None
+                and kwargs.get("websearch_short_circuit") is True
+                and kwargs.get("call_type") in (CallTypes.anthropic_messages.value, CallTypes.aanthropic_messages.value)
+                and response_cost == 0
+            ):
+                return False
             verbose_proxy_logger.debug(
                 "Enters prisma db call, response_cost: %s, token: %s; user_id: %s; team_id: %s",
                 response_cost,
@@ -867,6 +892,9 @@ class DBSpendUpdateWriter:
                 payload["organization_id"] = org_id
             if team_id:
                 payload["team_id"] = team_id
+            admission_identity: Final = _spend_log_admission_identity(
+                request_fields, completion_response, payload["request_id"]
+            )
 
             if use_ledger:
                 from litellm.accounting.snapshot import build_accounting_payload
@@ -908,11 +936,33 @@ class DBSpendUpdateWriter:
                 and payload["status"] == "failure"
                 and proxy_settings.get("disable_error_logs") is True
             )
-            if not await self._record_spend_log(
+            if prisma_client is None:
+                admission_task: Final = asyncio.create_task(
+                    self._record_spend_log(
+                        payload=payload,
+                        prisma_client=prisma_client,
+                        disable_spend_logs=not keep_spend_logs,
+                        llm_router=llm_router,
+                        on_accounting_admitted=on_accounting_admitted,
+                        admission_identity=admission_identity,
+                    )
+                )
+                try:
+                    locally_admitted: Final = await asyncio.shield(admission_task)
+                except asyncio.CancelledError:
+                    settlement: Final = asyncio.gather(admission_task, return_exceptions=True)
+                    while not settlement.done():
+                        with suppress(asyncio.CancelledError):
+                            await asyncio.shield(settlement)
+                    raise
+                if not locally_admitted:
+                    return False
+            elif not await self._record_spend_log(
                 payload=payload,
                 prisma_client=prisma_client,
                 disable_spend_logs=not keep_spend_logs,
                 llm_router=llm_router,
+                admission_identity=admission_identity,
             ):
                 return False
 
@@ -978,6 +1028,8 @@ class DBSpendUpdateWriter:
                 org_id,
                 end_user_id,
             )
+            if on_accounting_admitted is not None:
+                raise
             return True
 
     async def _record_session_spend(
@@ -999,24 +1051,42 @@ class DBSpendUpdateWriter:
         prisma_client: "PrismaClient | None",
         disable_spend_logs: bool,
         llm_router: "Router | None" = None,
+        *,
+        on_accounting_admitted: Callable[[], Awaitable[None]] | None = None,
+        admission_identity: str | None = None,
     ) -> bool:
         if prisma_client is not None and _is_settle_once_cost_row(payload):
             return await self._claim_settle_once_cost_row(
                 payload=payload, prisma_client=prisma_client, disable_spend_logs=disable_spend_logs
             )
-        if "accounting_payload" in payload:
-            from litellm.proxy.utils import accounting_only_spend_log
+        admission_key: Final = json.dumps((admission_identity, payload.get("status")))
+        async with self._spend_log_admission_lock:
+            if (
+                admission_identity is not None
+                and payload.get("status") == "failure"
+                and payload.get("spend") == 0
+                and self._recent_spend_log_admissions.get_cache(json.dumps((admission_identity, "success"))) is True
+            ):
+                return False
+            if admission_identity is not None and self._recent_spend_log_admissions.get_cache(admission_key) is True:
+                return False
+            if "accounting_payload" in payload:
+                from litellm.proxy.utils import accounting_only_spend_log
 
-            await self._insert_spend_log_to_db(
-                payload=accounting_only_spend_log(payload)
-                if disable_spend_logs
-                else {**payload, "accounting_log_disabled": False},
-                prisma_client=prisma_client,
-                llm_router=llm_router,
-            )
-        elif disable_spend_logs is False:
-            await self._insert_spend_log_to_db(payload=payload, prisma_client=prisma_client, llm_router=llm_router)
-        return True
+                await self._insert_spend_log_to_db(
+                    payload=accounting_only_spend_log(payload)
+                    if disable_spend_logs
+                    else {**payload, "accounting_log_disabled": False},
+                    prisma_client=prisma_client,
+                    llm_router=llm_router,
+                )
+            elif disable_spend_logs is False:
+                await self._insert_spend_log_to_db(payload=payload, prisma_client=prisma_client, llm_router=llm_router)
+            if on_accounting_admitted is not None:
+                await on_accounting_admitted()
+            if admission_identity is not None:
+                self._recent_spend_log_admissions.set_cache(admission_key, True)
+            return True
 
     async def _claim_settle_once_cost_row(
         self, payload: SpendLogsPayload, prisma_client: "PrismaClient", disable_spend_logs: bool

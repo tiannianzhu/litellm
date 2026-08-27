@@ -2,41 +2,36 @@ import asyncio
 import copy
 import json
 import os
+import unittest.mock
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Final, List
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import openai
+import pytest
 import responses
 import respx
-import pytest
-from fastapi.testclient import TestClient
 from pydantic import TypeAdapter, ValidationError
 
-
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import litellm
-from litellm.llms.anthropic.messages.native import handler as python_messages
 from litellm.anthropic_interface import messages
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2 import CallContext, CustomLoggerV2, Field, Hook, on
 from litellm.llms.anthropic.messages.native.handler import _execute_pre_request_hooks
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.litellm_core_utils.model_cost_table import publish
+from litellm.llms.anthropic.messages.native import handler as python_messages
 from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.router import Router
 from litellm.types.utils import (
-    Delta,
     ModelResponse,
     StandardLoggingPayloadErrorInformation,
-    StreamingChoices,
 )
-from litellm.litellm_core_utils.model_cost_table import publish
-import unittest.mock
 
 
 @pytest.mark.asyncio
@@ -87,6 +82,54 @@ async def test_openai_messages_forwards_stop_sequences_to_chat_completions(
         body: Final = json.loads(chat.calls.last.request.content)
         assert body["stop"] == ["STOPPROBE", "ENDPROBE"]
         assert "stop_sequences" not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_search_short_circuit_marks_only_outer_logging(stream: bool):
+    from datetime import datetime
+
+    from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.llms.anthropic.messages.native.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
+    from litellm.llms.anthropic.messages.native.handler import anthropic_messages
+
+    logging_obj = Logging(
+        model="hosted_vllm/test-model",
+        messages=[],
+        stream=stream,
+        call_type="anthropic_messages",
+        start_time=datetime.now(),
+        litellm_call_id="search-wrapper",
+        function_id="search-wrapper",
+    )
+    callback = WebSearchInterceptionLogger(enabled_providers=["hosted_vllm"])
+    with (
+        patch("litellm.callbacks", [callback]),  # test-quality-ok: TQ008 configures the process callback registry
+        patch.object(callback, "_execute_search", AsyncMock(return_value=("search results", None))) as search,
+    ):
+        response = await anthropic_messages.__wrapped__(
+            max_tokens=100,
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Perform a web search for the query: test"}],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            stream=stream,
+            litellm_logging_obj=logging_obj,
+        )
+
+    assert logging_obj.model_call_details["websearch_short_circuit"] is True
+    search.assert_awaited_once()
+    assert "websearch_short_circuit" not in search.await_args.kwargs["kwargs"]
+    if stream:
+        assert isinstance(response, FakeAnthropicMessagesStreamIterator)
+        chunks = b"".join([chunk async for chunk in response])
+        assert b"search results" in chunks
+        assert b"event: message_stop" in chunks
+    else:
+        assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
+        assert response["content"][-1]["text"] == "search results"
 
 
 @pytest.mark.parametrize("stop_sequences", [None, []], ids=["no-stops", "empty-stops"])
@@ -1309,7 +1352,9 @@ async def test_bridged_messages_keep_the_deployments_entra_credential_over_the_e
     api_base: Final = {} if api_base_from_env else {"api_base": "https://example-resource.cognitiveservices.azure.com"}
 
     with (
-        patch("litellm.llms.azure.common_utils.get_azure_ad_token_from_entra_id", return_value=lambda: "entra-token"),  # test-quality-ok: stands in for the Entra token fetch so the test can see which credential reaches Azure
+        patch(
+            "litellm.llms.azure.common_utils.get_azure_ad_token_from_entra_id", return_value=lambda: "entra-token"
+        ),  # test-quality-ok: stands in for the Entra token fetch so the test can see which credential reaches Azure
         patch(
             "litellm.llms.azure.common_utils.get_azure_ad_token_from_username_password",
             return_value=lambda: "entra-token",
@@ -1356,7 +1401,9 @@ async def test_bridged_messages_keep_the_azure_env_credential_when_the_deploymen
     litellm.in_memory_llm_clients_cache.flush_cache()
 
     with (
-        patch("litellm.llms.azure.common_utils.get_azure_ad_token_from_entra_id", return_value=lambda: "entra-token"),  # test-quality-ok: stands in for the Entra token fetch so the test can see which credential reaches Azure
+        patch(
+            "litellm.llms.azure.common_utils.get_azure_ad_token_from_entra_id", return_value=lambda: "entra-token"
+        ),  # test-quality-ok: stands in for the Entra token fetch so the test can see which credential reaches Azure
         respx.mock(assert_all_called=True) as respx_mock,
     ):
         upstream: Final = respx_mock.route().mock(side_effect=httpx.ConnectError("cut at the wire"))

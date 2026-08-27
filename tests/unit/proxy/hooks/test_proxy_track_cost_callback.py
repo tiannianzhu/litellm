@@ -23,6 +23,7 @@ from litellm.litellm_core_utils.internal_call_metadata import MODEL_ACCESS_GROUP
 from litellm.litellm_core_utils.redact_messages import perform_redaction
 from litellm.proxy._types import ProxyException, SpendLogsPayload, UserAPIKeyAuth
 from litellm.proxy.collector import SpendEventConsumer
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
 from litellm.proxy.db.model_usage_rollup import build_model_usage_transaction
@@ -46,6 +47,7 @@ from litellm.proxy.utils import (
     REJECTED_BEFORE_REQUEST_SETUP,
     REJECTED_BEFORE_REQUEST_SETUP_KEY,
     BilledFailedAttempt,
+    ProxyLogging,
     ProxyUpdateSpend,
 )
 from litellm.types.proxy.carried_budget_state import CommittedBudgetSpend, EntitySpendCounterKeys
@@ -56,6 +58,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 )
 from litellm.types.utils import CallTypes, LiteLLMBatch, ModelResponse, PromptTokensDetailsWrapper, Usage
 from litellm.types.videos.main import VideoObject
+from tests.unit.redis.stores.spend_counters_double import FakeSpendCounters
 
 
 @pytest.mark.asyncio
@@ -1331,6 +1334,150 @@ async def test_update_database_and_spend_counters_releases_reservation_when_db_u
     increment_spend_counters.assert_not_awaited()
 
 
+async def _admit_accounting_update(
+    *, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **_: object
+) -> bool:
+    if on_accounting_admitted is not None:
+        await on_accounting_admitted()
+    return True
+
+
+async def _charge_without_database(
+    writer: DBSpendUpdateWriter,
+    counters: Callable[..., Awaitable[None]],
+    response_id: str = "counter-retry-response",
+    *,
+    token: str | None = None,
+    team_id: str | None = None,
+) -> bool:
+    timestamp: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return await _update_database_and_spend_counters(
+        proxy_logging_obj=ProxyLogging(UserApiKeyCache()),
+        spend_writer=writer,
+        increment_spend_counters=counters,
+        user_api_key=token,
+        user_id=None,
+        end_user_id=None,
+        team_id=team_id,
+        org_id=None,
+        kwargs={"model": "openai/fixture-model", "call_type": "acompletion", "litellm_params": {}},
+        completion_response=ModelResponse(
+            id=response_id,
+            model="fixture-model",
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+        start_time=timestamp,
+        end_time=timestamp,
+        response_cost=0.25,
+        budget_reservation=None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_no_database_spend_retries_failed_counters_without_double_charging(
+    monkeypatch: pytest.MonkeyPatch, cancel_first: bool
+) -> None:
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.disable_spend_logs", True)
+    writer: Final = DBSpendUpdateWriter()
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+
+    async def increment(**kwargs: object) -> None:
+        if counters.await_count == 1:
+            entered.set()
+            await release.wait()
+            raise RuntimeError("counter dependency unavailable")
+
+    counters: Final = AsyncMock(side_effect=increment)
+    first: Final = asyncio.create_task(_charge_without_database(writer, counters))
+    await entered.wait()
+    duplicate: Final = asyncio.create_task(_charge_without_database(writer, counters))
+    if cancel_first:
+        first.cancel()
+    release.set()
+    outcomes: Final = await asyncio.gather(first, duplicate, return_exceptions=True)
+
+    assert isinstance(outcomes[0], asyncio.CancelledError if cancel_first else RuntimeError)
+    assert outcomes[1] is True
+    assert await _charge_without_database(writer, counters) is False
+    assert await _charge_without_database(writer, counters, "next-model-round") is True
+    assert await _charge_without_database(writer, counters, "next-model-round") is False
+    assert counters.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+async def test_no_database_spend_retries_scope_preparation_without_reapplying_other_scopes(
+    monkeypatch: pytest.MonkeyPatch, failure_type: type[BaseException]
+) -> None:
+    from litellm.proxy import proxy_server
+
+    counters: Final = FakeSpendCounters(
+        redis=None, memory={"spend:key:retry-key": 0.0, "spend:team:retry-team": 0.0}
+    )
+    failed_read: Final = asyncio.Event()
+
+    async def read(key: str, **kwargs: object) -> None:
+        if key == "team_id:retry-team" and not failed_read.is_set():
+            failed_read.set()
+            raise failure_type("scope preparation unavailable")
+
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(proxy_server, "spend_counter_store", counters.store())
+    monkeypatch.setattr(
+        proxy_server, "user_api_key_cache", MagicMock(spec=UserApiKeyCache, async_get_cache=AsyncMock(side_effect=read))
+    )
+    writer: Final = DBSpendUpdateWriter()
+    with pytest.raises(failure_type):
+        await _charge_without_database(
+            writer, proxy_server.increment_spend_counters, token="retry-key", team_id="retry-team"
+        )
+    assert await _charge_without_database(
+        writer, proxy_server.increment_spend_counters, token="retry-key", team_id="retry-team"
+    ) is True
+    assert await _charge_without_database(
+        writer, proxy_server.increment_spend_counters, token="retry-key", team_id="retry-team"
+    ) is False
+    assert counters.memory == {"spend:key:retry-key": 0.25, "spend:team:retry-team": 0.25}
+
+
+@pytest.mark.asyncio
+async def test_no_database_spend_finishes_counter_application_before_propagating_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy import proxy_server
+
+    counters: Final = FakeSpendCounters(
+        redis=None, memory={"spend:key:cancel-key": 0.0, "spend:team:cancel-team": 0.0}
+    )
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(proxy_server, "spend_counter_store", counters.store())
+    monkeypatch.setattr(proxy_server, "user_api_key_cache", UserApiKeyCache())
+    writer: Final = DBSpendUpdateWriter()
+    team_lock: Final = await proxy_server.SpendCounterReseed._get_lock("spend:team:cancel-team")
+
+    async def wait_for_key_increment() -> None:
+        while counters.memory.get("spend:key:cancel-key") != 0.25:
+            await asyncio.sleep(0)
+
+    async with team_lock:
+        charging: Final = asyncio.create_task(
+            _charge_without_database(
+                writer, proxy_server.increment_spend_counters, token="cancel-key", team_id="cancel-team"
+            )
+        )
+        await asyncio.wait_for(wait_for_key_increment(), timeout=5)
+        charging.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await charging
+    assert await _charge_without_database(
+        writer, proxy_server.increment_spend_counters, token="cancel-key", team_id="cancel-team"
+    ) is False
+    assert counters.memory == {"spend:key:cancel-key": 0.25, "spend:team:cancel-team": 0.25}
+
+
 @pytest.mark.asyncio
 async def test_update_database_and_spend_counters_preserves_db_exception_when_release_fails():
     proxy_logging_obj = MagicMock()
@@ -1388,7 +1535,7 @@ async def test_update_database_and_spend_counters_preserves_db_exception_when_re
 @pytest.mark.asyncio
 async def test_update_database_and_spend_counters_updates_counters_after_db_update():
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
     increment_spend_counters = AsyncMock()
     budget_reservation = {"reserved_cost": 0.5, "entries": []}
     start_time = datetime.now()
@@ -1431,7 +1578,7 @@ async def test_update_database_and_spend_counters_updates_counters_after_db_upda
 @pytest.mark.asyncio
 async def test_update_database_and_spend_counters_invalidates_reservation_when_counter_update_fails():
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
     increment_spend_counters = AsyncMock(side_effect=Exception("counter unavailable"))
     budget_reservation = {
         "reserved_cost": 0.5,
@@ -1470,7 +1617,7 @@ async def test_update_database_and_spend_counters_invalidates_reservation_when_c
 @pytest.mark.asyncio
 async def test_update_database_and_spend_counters_preserves_counter_exception_when_invalidation_fails():
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
     counter_exception = RuntimeError("counter unavailable")
     increment_spend_counters = AsyncMock(side_effect=counter_exception)
     budget_reservation = {
@@ -1522,9 +1669,11 @@ async def test_update_database_and_spend_counters_reconciles_reservation_before_
     call_order: list[str] = []
     proxy_logging_obj = MagicMock()
 
-    async def _update_database(**kwargs):
+    async def _update_database(
+        *, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **kwargs: object
+    ) -> bool:
         call_order.append("update_database")
-        return True
+        return await _admit_accounting_update(on_accounting_admitted=on_accounting_admitted)
 
     proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_update_database)
     increment_spend_counters = AsyncMock()
@@ -1618,7 +1767,7 @@ async def test_update_database_and_spend_counters_releases_reservation_when_db_u
 @pytest.mark.asyncio
 async def test_update_database_and_spend_counters_invalidates_reservation_when_early_reconcile_fails():
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(return_value=True)
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
     increment_spend_counters = AsyncMock()
     budget_reservation = {
         "reserved_cost": 0.5,
@@ -1871,7 +2020,9 @@ async def test_track_cost_callback_charges_a_batch_once_and_only_when_final(  # 
         ) as mock_release_budget_reservation,
     ):
         mock_proxy_logging.failed_tracking_alert = AsyncMock()
-        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(return_value=row_claimed)
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(
+            return_value=row_claimed, side_effect=_admit_accounting_update if row_claimed else None
+        )
         mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
 
         await logger._PROXY_track_cost_callback(
@@ -3127,7 +3278,17 @@ async def test_a_completed_cost_failure_raises_the_live_spend_counters_once(live
         live_spend_counters.set_local(key, spend)
 
     await _fail_request(
-        ProxyDBLogger(), {"standard_logging_object": {"cost_finalized": True, "response_cost": 0.125}}
+        ProxyDBLogger(),
+        {
+            "standard_logging_object": {
+                "cost_finalized": True,
+                "response_cost": 0.125,
+                "metadata": {},
+                "request_tags": ["batch-jobs"],
+                "model_map_information": {},
+                "hidden_params": {},
+            }
+        },
     )
 
     assert await _counter_values(live_spend_counters) == pytest.approx(
@@ -3306,7 +3467,7 @@ async def test_track_cost_callback_enriches_user_id_for_mcp_style_metadata():
             "litellm.proxy.proxy_server.proxy_logging_obj",
         ) as mock_proxy_logging,
     ):
-        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
         mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
 
         await logger._PROXY_track_cost_callback(
@@ -3365,7 +3526,7 @@ async def test_track_cost_callback_keeps_guardrail_cost_on_cache_hit():
             "litellm.proxy.proxy_server.proxy_logging_obj"
         ) as mock_proxy_logging,  # test-quality-ok: same function-body import, no injection seam
     ):
-        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
         mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
 
         await logger._PROXY_track_cost_callback(
@@ -3861,7 +4022,7 @@ async def _spend_row_written_by(run) -> tuple[SpendLogsPayload, dict, tuple[str,
             "litellm.proxy.proxy_server.update_cache", new_callable=AsyncMock
         ),
     ):
-        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(return_value=True)
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
         mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
         await run()
         mock_proxy_logging.db_spend_update_writer.update_database.assert_awaited_once()
