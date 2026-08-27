@@ -1475,6 +1475,11 @@ def _logged_provider(logging_obj: Optional["Logging"]) -> object:
 def _stream_builder_response_cost(
     response: ModelResponse, logging_obj: Optional["Logging"], chunks: Sequence[object]
 ) -> float | None:
+    from litellm.responses.mcp.round_billing import price_of_every_round
+
+    every_round: Final = price_of_every_round(get_hidden_params(response) or {})
+    if every_round is not None:
+        return every_round.cost
     if _logged_provider(logging_obj) == LlmProviders.OPENCODE_GO.value:
         # usage.opencode only survives on the chunks, the assembled Usage keeps declared fields
         reported: Final = (
@@ -1526,6 +1531,26 @@ def _set_stream_builder_response_cost(
 
 
 def _carry_upstream_usage_cost(response: ModelResponse, chunks: Sequence[object]) -> None:
+    from litellm.responses.mcp.round_billing import PRICE_OF_EVERY_ROUND, price_of_every_round
+
+    every_round: Final = next(
+        (
+            price
+            for chunk in reversed(chunks)
+            if (price := price_of_every_round(get_hidden_params(chunk) or {})) is not None
+        ),
+        None,
+    )
+    if every_round is not None:
+        set_hidden_params(
+            response,
+            {
+                **(get_hidden_params(response) or {}),
+                PRICE_OF_EVERY_ROUND: every_round,
+                "response_cost": every_round.cost,
+            },
+        )
+        return
     chunk_hidden_params: Final = (get_hidden_params(chunk) for chunk in reversed(chunks))
     stamped: Final = (hidden for hidden in chunk_hidden_params if hidden is not None and UPSTREAM_USAGE_COST in hidden)
     for hidden in stamped:
@@ -1534,6 +1559,13 @@ def _carry_upstream_usage_cost(response: ModelResponse, chunks: Sequence[object]
 
 
 def _stamp_streaming_usage_cost(usage: Usage, response: ModelResponse, logging_obj: Optional["Logging"]) -> None:
+    from litellm.responses.mcp.round_billing import price_of_every_round
+
+    every_round: Final = price_of_every_round(get_hidden_params(response) or {})
+    if every_round is not None:
+        if every_round.cost is not None:
+            stamp_litellm_bill_on_usage(response, usage, every_round.cost)
+        return
     if logging_obj is None:
         return
     if _logged_provider(logging_obj) in PROVIDERS_BILLED_FROM_THEIR_OWN_USAGE_FIELDS and (

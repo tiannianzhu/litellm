@@ -17,12 +17,15 @@ from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import GuardrailCos
 from litellm.proxy.common_utils.customer_usage import CUSTOMER_USAGE_METADATA_KEY, CustomerUsageAttribution
 from litellm.proxy.db.daily_spend_bulk_upsert import DAILY_SPEND_TABLES, daily_spend_entity_ids
 from litellm.proxy.db.model_insights_tasks import load_model_insight_tasks
-from litellm.proxy.db.model_usage_rollup import date_from_start_time, utc_date_from_start_time
+from litellm.proxy.db.model_usage_rollup import (
+    INTERNAL_CALL_ORIGINS_WITH_MODEL_USAGE,
+    date_from_start_time,
+    utc_date_from_start_time,
+)
 from litellm.proxy.route_llm_request import spend_endpoint
 from litellm.proxy.spend_tracking.compression_savings import extract_compression_saved_tokens
 from litellm.proxy.spend_tracking.customer_cache_cost import recorded_customer_cache_cost
 from litellm.proxy.spend_tracking.savings import extract_cache_creation_tokens, extract_cache_read_tokens
-from litellm.types.utils import BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN
 
 _FIELDS: Final = TypeAdapter(dict[str, object])
 _STRINGS: Final = TypeAdapter(tuple[str, ...])
@@ -347,7 +350,7 @@ def _capped(contribution: Contribution) -> Contribution:
 def _model_contributions(row: Mapping[str, object], metadata: Mapping[str, object]) -> tuple[Contribution, ...]:
     date: Final = _date(row)
     origin: Final = metadata.get(INTERNAL_CALL_ORIGIN_METADATA_KEY)
-    if date is None or (origin and origin != BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN):
+    if date is None or (origin and origin not in INTERNAL_CALL_ORIGINS_WITH_MODEL_USAGE):
         return ()
     model: Final = _text(row.get("model")) or "unknown"
     caller: Final = not origin

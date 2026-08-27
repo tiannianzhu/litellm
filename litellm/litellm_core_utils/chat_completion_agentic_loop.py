@@ -1,15 +1,15 @@
 # this is a patch to allow for agentic loops covering llm_http_handler.py and openai sdk based calling flows for the .completion() api
 
 import json
+import time
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager
 from itertools import chain
 from types import MappingProxyType
 from typing import Final, TypeVar
 
 from pydantic import TypeAdapter, ValidationError
 
-from litellm._internal_context import billed_separately, internal_sub_call, is_internal_call
+from litellm._internal_context import billed_separately, is_internal_call
 from litellm._logging import verbose_logger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.agentic_followup_failure import mark_agentic_followup_failure, rounds_served_before
@@ -31,7 +31,12 @@ from litellm.litellm_core_utils.litellm_logging import UncachedPrice
 from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import is_str_keyed_dict, object_items
 from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
 from litellm.responses.mcp.parked_stream_dispatch import SERVED_FROM_CACHE
-from litellm.responses.mcp.round_billing import billed_for_every_round, summed_cost_breakdown
+from litellm.responses.mcp.round_billing import (
+    PRICE_OF_EVERY_ROUND,
+    billed_for_every_round,
+    price_of_every_round,
+    summed_cost_breakdown,
+)
 from litellm.types.integrations.custom_logger import (
     CHAT_COMPLETION_AGENTIC_SURFACE,
     NON_CODE_INTERPRETER_INTERCEPTION_INTERNAL_PREFIXES,
@@ -66,17 +71,15 @@ _FOLLOWUP_INTERNAL_PARAMS: Final = frozenset(
 
 
 def _first_round_bills_itself(logging_obj: object) -> bool:
-    return (
-        isinstance(logging_obj, LiteLLMLoggingObject)
-        and logging_obj.bridged_chat_request is not None
-        and logging_obj.stream is not True
-        and not is_internal_call.get()
-        and logging_obj.async_success_log_enqueued
+    return isinstance(logging_obj, LiteLLMLoggingObject) and (
+        logging_obj.agentic_loop_response_recorded
+        or (
+            logging_obj.bridged_chat_request is not None
+            and logging_obj.stream is not True
+            and not is_internal_call.get()
+            and logging_obj.async_success_log_enqueued
+        )
     )
-
-
-def _follow_ups_bill_themselves(logging_obj: object, request_kwargs: Mapping[str, object]) -> bool:
-    return _first_round_bills_itself(logging_obj) and not converted_stream_requested(request_kwargs)
 
 
 async def bill_first_round_on_failure(
@@ -85,6 +88,8 @@ async def bill_first_round_on_failure(
     try:
         return await dispatch
     except Exception as error:
+        if isinstance(logging_obj, LiteLLMLoggingObject):
+            logging_obj.release_agentic_loop_response()
         if stream or not isinstance(logging_obj, LiteLLMLoggingObject):
             mark_agentic_followup_failure(error, rounds_served_before(error))
             raise
@@ -122,7 +127,6 @@ def _post_hook_overridden(callback: CustomLogger) -> bool:
 
 _STREAM_OPTIONS_ADAPTER: Final[TypeAdapter[Mapping[str, object] | None]] = TypeAdapter(Mapping[str, object] | None)
 _HOOK_RESPONSE: Final = TypeAdapter(object)
-_PRICE_OF_EVERY_ROUND: Final = "agentic_loop_price_of_every_round"
 
 
 def _plan_response_override(plan: AgenticLoopPlan) -> object | None:
@@ -182,6 +186,7 @@ def _converted_stream_replay(
     model: str,
     custom_llm_provider: str,
     logging_obj: object,
+    record_completed_round: bool = False,
 ) -> CustomStreamWrapper | None:
     if depth or not converted_stream_requested(kwargs):
         return None
@@ -189,17 +194,19 @@ def _converted_stream_replay(
         return response
     if not isinstance(response, ModelResponse) or not isinstance(logging_obj, LiteLLMLoggingObject):
         return None
-    every_round: Final = _price_of_every_round(response)
-    if every_round is not None:
+    every_round: Final = price_of_every_round(get_hidden_params(response) or {})
+    if every_round is not None and not logging_obj.agentic_loop_response_recorded:
         logging_obj.record_every_round_breakdown(every_round.cost_breakdown)
 
+    if record_completed_round:
+        logging_obj.record_agentic_loop_response(response, time.time())
     return CustomStreamWrapper(
         completion_stream=MockResponseIterator(model_response=response),
         model=model,
         custom_llm_provider=custom_llm_provider,
         logging_obj=logging_obj,
         stream_options=_stashed_stream_options(kwargs),
-        response_cost=None if every_round is None else every_round.cost,
+        response_price=every_round,
     )
 
 
@@ -375,12 +382,6 @@ def _filter_followup_kwargs(source: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _followup_billing_scope(logging_obj: object, request_kwargs: Mapping[str, object]) -> AbstractContextManager[None]:
-    if _follow_ups_bill_themselves(logging_obj, request_kwargs):
-        return billed_separately()
-    return internal_sub_call(logging_obj.litellm_call_id if isinstance(logging_obj, LiteLLMLoggingObject) else None)
-
-
 def _billed_with_the_round_it_follows(round_served: object, follow_up: object, logging_obj: object) -> object:
     if not (
         isinstance(round_served, ModelResponse)
@@ -389,22 +390,25 @@ def _billed_with_the_round_it_follows(round_served: object, follow_up: object, l
         and logging_obj.bridged_chat_request is not None
     ):
         return follow_up
-    if not (is_internal_call.get() or logging_obj.unpark_success_log()):
-        return follow_up
     first_price: Final = _price_of_round(round_served, logging_obj)
     final_price: Final = _price_of_round(follow_up, logging_obj)
     first: Final = _priced(round_served, first_price)
     final: Final = _priced(follow_up, final_price)
-    breakdown: Final = summed_cost_breakdown(first, first_price.cost_breakdown, final, final_price.cost_breakdown)
-    logging_obj.record_every_round_breakdown(breakdown)
-    billed: Final = billed_for_every_round(first, first_price.cost_breakdown, final, final_price.cost_breakdown)
+    breakdown: Final = summed_cost_breakdown(
+        first, first_price.cost_breakdown, final, final_price.cost_breakdown, independently_billed=True
+    )
+    if not logging_obj.agentic_loop_response_recorded:
+        logging_obj.record_every_round_breakdown(breakdown)
+    billed: Final = billed_for_every_round(
+        first, first_price.cost_breakdown, final, final_price.cost_breakdown, independently_billed=True
+    )
     billed_hidden_params: Final = get_hidden_params(billed) or {}
     total_cost: Final = billed_hidden_params.get("response_cost")
     set_hidden_params(
         billed,
         {
             **billed_hidden_params,
-            _PRICE_OF_EVERY_ROUND: UncachedPrice(
+            PRICE_OF_EVERY_ROUND: UncachedPrice(
                 cost=float(total_cost) if isinstance(total_cost, (int, float)) else None, cost_breakdown=breakdown
             ),
         },
@@ -412,13 +416,8 @@ def _billed_with_the_round_it_follows(round_served: object, follow_up: object, l
     return billed
 
 
-def _price_of_every_round(response: ModelResponse) -> UncachedPrice | None:
-    every_round: Final = (get_hidden_params(response) or {}).get(_PRICE_OF_EVERY_ROUND)
-    return every_round if isinstance(every_round, UncachedPrice) else None
-
-
 def _price_of_round(round_response: ModelResponse, logging_obj: LiteLLMLoggingObject) -> UncachedPrice:
-    every_round: Final = _price_of_every_round(round_response)
+    every_round: Final = price_of_every_round(get_hidden_params(round_response) or {})
     if every_round is not None:
         return every_round
     return SERVED_FROM_CACHE if served_from_cache(round_response) else logging_obj.uncached_price(round_response)
@@ -478,7 +477,7 @@ async def _execute_chat_completion_agentic_plan(
     )
 
     try:
-        with _followup_billing_scope(logging_obj, kwargs):
+        with billed_separately():
             response_followup = await litellm.acompletion(
                 model=full_model_name,
                 messages=patch.messages,
@@ -510,6 +509,7 @@ async def _execute_chat_completion_agentic_plan(
             model=model,
             custom_llm_provider=custom_llm_provider,
             logging_obj=logging_obj,
+            record_completed_round=kwargs.get("_websearch_interception_converted_stream") is True,
         )
         return billed if replay is None else replay
     finally:
@@ -541,6 +541,7 @@ async def maybe_run_chat_completion_agentic_loop(
     depth, max_loops, fingerprints = _agentic_loop_settings(request_kwargs)
     tools: Final = _request_tools(optional_params)
 
+    completed_at: Final = time.time()
     for callback in callbacks:
         if not _gate_overridden(callback):
             continue
@@ -603,6 +604,8 @@ async def maybe_run_chat_completion_agentic_loop(
             )
 
         if not _build_plan_overridden(callback):
+            if isinstance(logging_obj, LiteLLMLoggingObject):
+                logging_obj.record_agentic_loop_response(response, completed_at)
             return await callback.async_run_agentic_loop(
                 tools=tool_calls,
                 model=model,
@@ -634,6 +637,8 @@ async def maybe_run_chat_completion_agentic_loop(
         if not plan.run_agentic_loop:
             continue
 
+        if isinstance(logging_obj, LiteLLMLoggingObject):
+            logging_obj.record_agentic_loop_response(response, completed_at)
         return await _execute_chat_completion_agentic_plan(
             response=response,
             plan=plan,
@@ -684,6 +689,7 @@ async def maybe_run_chat_completion_agentic_loop(
                 model=model,
                 custom_llm_provider=custom_llm_provider,
                 logging_obj=logging_obj,
+                record_completed_round=request_kwargs.get("_websearch_interception_converted_stream") is True,
             )
 
 
@@ -699,6 +705,7 @@ async def run_chat_completion_agentic_hooks(
     stream: bool,
     asking_only: Callable[[CustomLogger], bool] | None = None,
 ) -> object | None:
+    completed_at: Final = time.time()
     callbacks: Final = _custom_loggers(logging_obj)
     depth, max_loops, fingerprints = _agentic_loop_settings(kwargs)
     tools: Final = _request_tools(optional_params)
@@ -750,6 +757,7 @@ async def run_chat_completion_agentic_hooks(
             )
 
         if not _chat_build_plan_overridden(callback):
+            logging_obj.record_agentic_loop_response(response, completed_at)
             return await callback.async_run_chat_completion_agentic_loop(
                 tools=tool_calls,
                 model=model,
@@ -782,6 +790,7 @@ async def run_chat_completion_agentic_hooks(
         if not plan.run_agentic_loop:
             continue
 
+        logging_obj.record_agentic_loop_response(response, completed_at)
         return await _execute_chat_completion_agentic_plan(
             response=response,
             plan=plan,

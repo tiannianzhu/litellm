@@ -379,9 +379,7 @@ class _ManagedFilesCreatedBy(CustomLogger):
         super().__init__()
         self.creators: Final = creators
 
-    async def can_user_call_unified_file_id(
-        self, unified_file_id: str, user_api_key_dict: ProxyUserAPIKeyAuth
-    ) -> bool:
+    async def can_user_call_unified_file_id(self, unified_file_id: str, user_api_key_dict: ProxyUserAPIKeyAuth) -> bool:
         if unified_file_id not in self.creators:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {unified_file_id}")
         return self.creators[unified_file_id] == user_api_key_dict.user_id
@@ -397,9 +395,7 @@ class _ManagedFilesCountingLookups(_ManagedFilesCreatedBy):
         super().__init__(creators)
         self.looked_up: Final[list[str]] = []  # mutable-ok: the fake records the lookups the gate makes
 
-    async def can_user_call_unified_file_id(
-        self, unified_file_id: str, user_api_key_dict: ProxyUserAPIKeyAuth
-    ) -> bool:
+    async def can_user_call_unified_file_id(self, unified_file_id: str, user_api_key_dict: ProxyUserAPIKeyAuth) -> bool:
         self.looked_up.append(unified_file_id)
         return await super().can_user_call_unified_file_id(unified_file_id, user_api_key_dict)
 
@@ -8407,6 +8403,229 @@ class TestAllmPassthroughStreamingProviderGate:
         assert "content-type" not in result.headers
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stream", "guardrail_cost"),
+    [(False, 0.0), (False, 0.25), (True, 0.0)],
+    ids=["non-streaming", "guardrail-charge", "streaming"],
+)
+async def test_responses_pinned_chat_proxy_costs_match_each_billed_round(
+    monkeypatch: pytest.MonkeyPatch,
+    respx_mock: respx.MockRouter,
+    local_model_cost_map: None,
+    stream: bool,
+    guardrail_cost: float,
+) -> None:
+    from pydantic import TypeAdapter
+
+    from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.litellm_core_utils.model_cost_table import changed_in_place
+    from litellm.proxy import proxy_server
+    from litellm.types.utils import StandardLoggingPayload, Usage
+
+    captured: Final[asyncio.Queue[StandardLoggingPayload]] = asyncio.Queue()
+    payload_adapter: Final = TypeAdapter(StandardLoggingPayload)
+    metadata: Final[dict[str, object]] = {"standard_logging_guardrail_information": ()}
+
+    class RoundRecorder(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.metadata: Final = metadata
+
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self,
+            kwargs: dict[str, object],
+            response_obj: object,
+            start_time: datetime.datetime,
+            end_time: datetime.datetime,
+        ) -> None:
+            payload: Final = payload_adapter.validate_python(kwargs["standard_logging_object"])
+            if payload["call_type"] == "acompletion":
+                captured.put_nowait(payload)
+
+        async def async_post_call_success_hook(
+            self, data: dict[str, object], user_api_key_dict: ProxyUserAPIKeyAuth, response: object
+        ) -> object:
+            self.metadata["standard_logging_guardrail_information"] = (
+                {"guardrail_name": "fixture", "guardrail_cost": guardrail_cost, "guardrail_status": "success"},
+            )
+            return response
+
+    vendor: Final = litellm.model_cost["gpt-5.6"]
+    assert isinstance(vendor, dict)
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "gpt-5.6",
+        {
+            **{key: value for key, value in vendor.items() if "cost" not in key},
+            "input_cost_per_token": 0.125,
+            "cache_read_input_token_cost": 0.03125,
+            "output_cost_per_token": 0.25,
+        },
+    )
+    changed_in_place()
+    for registry in ("success_callback", "_async_success_callback", "failure_callback", "_async_failure_callback"):
+        monkeypatch.setattr(litellm, registry, [])
+    monkeypatch.setattr(
+        litellm, "callbacks", [WebSearchInterceptionLogger(enabled_providers=["openai"]), RoundRecorder()]
+    )
+    monkeypatch.setattr(litellm, "apply_search_free_tier", False)
+    monkeypatch.setattr(litellm, "cost_discount_config", {})
+    monkeypatch.setattr(litellm, "cost_margin_config", {"openai": {"fixed_amount": 0.5}})
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setenv("PERPLEXITYAI_API_KEY", "fixture-search-key")
+    monkeypatch.delenv("PERPLEXITY_API_BASE", raising=False)
+    search: Final = respx_mock.post("https://api.perplexity.ai/search").respond(
+        json={"results": [{"title": "Fixture", "url": "https://example.com/fixture", "snippet": "Fixture result"}]}
+    )
+
+    def model_reply(request: httpx.Request) -> httpx.Response:
+        body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+        request_input: Final = TypeAdapter(tuple[dict[str, object], ...]).validate_python(body["input"])
+        following_search: Final = any(item.get("type") == "function_call_output" for item in request_input)
+        output: Final = (
+            {
+                "type": "message",
+                "id": "msg_final",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Fixture answer", "annotations": []}],
+            }
+            if following_search
+            else {
+                "type": "function_call",
+                "id": "fc_search",
+                "call_id": "call_search",
+                "name": "litellm_web_search",
+                "arguments": '{"query":"fixture query"}',
+                "status": "completed",
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_final" if following_search else "resp_first",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-5.6",
+                "output": [output],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+                "usage": {
+                    "input_tokens": 16 if following_search else 8,
+                    "input_tokens_details": {"cached_tokens": 4 if following_search else 2},
+                    "output_tokens": 4 if following_search else 2,
+                    "total_tokens": 20 if following_search else 10,
+                },
+            },
+        )
+
+    upstream: Final = respx_mock.post("https://round-cost.example/v1/responses").mock(side_effect=model_reply)
+    model: Final = "openai/responses/gpt-5.6"
+    messages: Final = [{"role": "user", "content": "Search the fixture"}]
+    logger: Final = Logging(
+        model=model,
+        messages=messages,
+        stream=stream,
+        call_type="acompletion",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="round-cost-header",
+        function_id="round-cost-header",
+    )
+    proxy_logging: Final = ProxyLogging(user_api_key_cache=DualCache())
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", proxy_logging)
+    processor: Final = ProxyBaseLLMRequestProcessing(
+        data={
+            "model": model,
+            "messages": messages,
+            "tools": [{"type": "web_search"}],
+            "stream": stream,
+            "stream_options": {"include_usage": True} if stream else None,
+            "api_key": "fixture-model-key",
+            "api_base": "https://round-cost.example/v1",
+            "litellm_logging_obj": logger,
+            "litellm_call_id": logger.litellm_call_id,
+            "metadata": metadata,
+        }
+    )
+    disconnected: Final = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    fastapi_response: Final = Response()
+    result: Final = await processor.base_process_llm_request(
+        request=Request(
+            {"type": "http", "method": "POST", "path": "/v1/chat/completions", "headers": []},
+            receive=receive,
+        ),
+        fastapi_response=fastapi_response,
+        user_api_key_dict=ProxyUserAPIKeyAuth(api_key="fixture-key", spend=10.0),
+        route_type="acompletion",
+        proxy_logging_obj=proxy_logging,
+        general_settings={},
+        proxy_config=proxy_server.ProxyConfig(),
+        user_model=model,
+        select_data_generator=proxy_server.select_data_generator,
+        is_streaming_request=stream,
+        skip_pre_call_logic=True,
+    )
+    served_headers: Final = result.headers if isinstance(result, StreamingResponse) else fastapi_response.headers
+    if stream:
+        assert isinstance(result, StreamingResponse)
+        frames: Final = [chunk async for chunk in result.body_iterator]
+        body: Final = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in frames)
+        data_lines: Final = (line[6:] for line in body.splitlines() if line.startswith("data: "))
+        events: Final = tuple(
+            TypeAdapter(dict[str, object]).validate_json(line) for line in data_lines if line != "[DONE]"
+        )
+        usages: Final = tuple(
+            TypeAdapter(Usage).validate_python(event["usage"]) for event in events if event.get("usage")
+        )
+        assert len(usages) == 1
+        assert usages[0].cost == pytest.approx(4.9375)
+    else:
+        assert logger.prepared_cost is not None and logger.finalized_cost is not None
+        assert logger.prepared_cost.amount == pytest.approx(1.8125)
+        assert logger.finalized_cost.amount == pytest.approx(1.8125 + guardrail_cost)
+    await GLOBAL_LOGGING_WORKER.flush()
+    rows: Final = tuple(captured.get_nowait() for _ in range(captured.qsize()))
+
+    assert upstream.call_count == 2 and search.call_count == 1
+    assert len(rows) == 2
+    assert {row["prompt_tokens"]: row["response_cost"] for row in rows} == pytest.approx(
+        {8: 1.8125 + guardrail_cost, 16: 3.125}
+    )
+    assert float(served_headers["x-litellm-response-cost"]) == pytest.approx(sum(row["response_cost"] for row in rows))
+    assert {
+        name: float(served_headers[name])
+        for name in (
+            "x-litellm-response-cost-original",
+            "x-litellm-response-cost-input",
+            "x-litellm-response-cost-output",
+            "x-litellm-response-cost-cache-read",
+            "x-litellm-response-cost-margin-amount",
+        )
+    } == pytest.approx(
+        {
+            "x-litellm-response-cost-original": 3.9375,
+            "x-litellm-response-cost-input": 2.25,
+            "x-litellm-response-cost-output": 1.5,
+            "x-litellm-response-cost-cache-read": 0.1875,
+            "x-litellm-response-cost-margin-amount": 1.0,
+        }
+    )
+
+
 class TestResponseCostHeaderForTypedDictResponses:
     """
     Regression for LIT-4076. x-litellm-response-cost went missing on Anthropic
@@ -13104,6 +13323,7 @@ class TestPerRequestModelGroupAlias:
 
         assert merged_for == ["group-b"]
 
+
 class TestSessionIdentityFallback:
     @pytest.mark.asyncio
     async def test_direct_model_call_applies_global_prefix_fallback_before_hooks(self, monkeypatch):
@@ -16207,11 +16427,19 @@ class TestResponseCostFromLoggingObjForCacheHits:
         ((float("nan"), None), (float("inf"), None), (0.0042, "0.0042"), (2, "2")),
         ids=("nan", "inf", "finite", "int"),
     )
+    @pytest.mark.parametrize("aggregate", (False, True), ids=("single-round", "all-rounds"))
     async def test_a_non_finite_response_cost_sends_no_cost_header(
-        self, response_cost: float, expected_header: str | None
+        self, response_cost: float, expected_header: str | None, aggregate: bool
     ):
         response: Final = litellm.ModelResponse()
         response._hidden_params = {"response_cost": response_cost}
+        if aggregate:
+            from litellm.litellm_core_utils.litellm_logging import UncachedPrice
+            from litellm.responses.mcp.round_billing import PRICE_OF_EVERY_ROUND
+
+            response._hidden_params[PRICE_OF_EVERY_ROUND] = UncachedPrice(
+                cost=response_cost, cost_breakdown={"total_cost": response_cost}
+            )
 
         headers: Final = await ProxyBaseLLMRequestProcessing.build_litellm_proxy_success_headers_from_llm_response(
             response=response,
@@ -16224,6 +16452,27 @@ class TestResponseCostFromLoggingObjForCacheHits:
         )
 
         assert headers.get("x-litellm-response-cost") == expected_header
+
+    def test_an_aggregate_adjustment_that_overflows_keeps_the_cost_unknown(self):
+        from dataclasses import replace
+
+        from litellm.litellm_core_utils.litellm_logging import UncachedPrice
+        from litellm.litellm_core_utils.llm_cost_calc.finalization import finalize_cost
+        from litellm.responses.mcp.round_billing import PRICE_OF_EVERY_ROUND
+
+        logging_obj: Final = self._logging_obj()
+        prepared: Final = logging_obj.prepare_response_cost(dict(self.BODY), logging_obj.start_time)
+        assert prepared is not None
+        logging_obj.prepared_cost = replace(prepared, amount=1e308)
+        logging_obj.finalized_cost = finalize_cost(1.5e308, None)
+
+        headers: Final = ProxyBaseLLMRequestProcessing.get_custom_headers(
+            user_api_key_dict=ProxyUserAPIKeyAuth(api_key="fixture-key"),
+            hidden_params={PRICE_OF_EVERY_ROUND: UncachedPrice(cost=1.5e308, cost_breakdown=None)},
+            litellm_logging_obj=logging_obj,
+        )
+
+        assert "x-litellm-response-cost" not in headers
 
     @pytest.mark.asyncio
     async def test_an_overflowing_cost_breakdown_sends_no_infinite_cost_header(self):

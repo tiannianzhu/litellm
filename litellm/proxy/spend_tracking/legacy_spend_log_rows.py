@@ -28,6 +28,7 @@ from pydantic import BaseModel, TypeAdapter
 import litellm
 from litellm.constants import (
     EMPTY_MAPPING,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     LITELLM_TRUNCATED_PAYLOAD_FIELD,
     LITELLM_TRUNCATION_DB_SAFEGUARD_NOTE,
     MAX_SPEND_LOG_MODEL_NAME_LENGTH,
@@ -88,6 +89,7 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _string_or_empty,
     _without_tokens,
     get_spend_logs_id,
+    is_unmarked_agentic_loop,
     redact_logged_api_key,
     requester_ip_address_logging_disabled,
     sanitize_error_information_for_spend_logs,
@@ -731,7 +733,12 @@ def logging_payload(
         response_obj = {"result": str(response_obj)}
     # standardize this function to be used across, s3, dynamoDB, langfuse logging
     litellm_params: Final = kwargs.get("litellm_params", {})
-    metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
+    request_metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
+    metadata: Final = (
+        {**request_metadata, INTERNAL_CALL_ORIGIN_METADATA_KEY: "agentic_loop"}
+        if is_unmarked_agentic_loop(request_metadata)
+        else request_metadata
+    )
     routing_litellm_params: Final[Mapping[str, object] | None] = (
         litellm_params if isinstance(litellm_params, Mapping) else None
     )
@@ -827,7 +834,8 @@ def logging_payload(
     ):  # use 'tags' from standard logging payload instead
         request_tags = safe_dumps(standard_logging_payload["request_tags"])
 
-    _model_id: Final = metadata.get("model_info", {}).get("id", "") or _sl_attribution_fallback(
+    model_info: Final = as_str_mapping(metadata.get("model_info"))
+    _model_id: Final = (model_info.get("id", "") if model_info is not None else "") or _sl_attribution_fallback(
         standard_logging_payload, "model_id"
     )
     _model_group: Final = _string_or_empty(metadata.get("model_group")) or _sl_attribution_fallback(

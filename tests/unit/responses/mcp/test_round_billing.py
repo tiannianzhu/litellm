@@ -223,6 +223,44 @@ def test_rounds_with_different_fixed_fees_charge_the_final_rounds_fee_once():
     assert breakdown["margin_total_amount"] == pytest.approx(0.001)
 
 
+def test_independently_billed_rounds_keep_each_fixed_margin_in_the_total_and_breakdown() -> None:
+    first_breakdown: Final[CostBreakdown] = {
+        "input_cost": 2.0,
+        "output_cost": 0.75,
+        "original_cost": 2.75,
+        "total_cost": 3.0,
+        "margin_fixed_amount": 0.25,
+        "margin_total_amount": 0.25,
+    }
+    final_breakdown: Final[CostBreakdown] = {
+        "input_cost": 4.0,
+        "output_cost": 0.5,
+        "original_cost": 4.5,
+        "total_cost": 5.0,
+        "margin_fixed_amount": 0.5,
+        "margin_total_amount": 0.5,
+    }
+    first: Final = _round("resp_first", 3.0)
+    final: Final = _round("resp_final", 5.0)
+
+    billed: Final = billed_for_every_round(
+        first, first_breakdown, final, final_breakdown, independently_billed=True
+    )
+    breakdown: Final = summed_cost_breakdown(
+        first, first_breakdown, final, final_breakdown, independently_billed=True
+    )
+
+    assert billed.hidden_params["response_cost"] == 8.0
+    assert breakdown == {
+        "input_cost": 6.0,
+        "output_cost": 1.25,
+        "original_cost": 7.25,
+        "total_cost": 8.0,
+        "margin_fixed_amount": 0.75,
+        "margin_total_amount": 0.75,
+    }
+
+
 @pytest.mark.parametrize(
     ("first_cached", "final_cached", "kept_breakdown"),
     [

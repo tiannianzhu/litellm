@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 _METADATA: Final = TypeAdapter(dict[str, object])
 _TAGS: Final = TypeAdapter(list[object])
+INTERNAL_CALL_ORIGINS_WITH_MODEL_USAGE: Final = ("agentic_loop", BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN)
 
 
 class _UpsertTable(Protocol):
@@ -116,7 +117,7 @@ def date_from_start_time(start_time: datetime | str) -> str | None:
 def build_model_usage_transaction(payload: SpendLogsPayload) -> ModelUsageTransaction | None:
     date: Final = get_daily_spend_date(payload["startTime"])
     origin: Final = _internal_call_origin(payload["metadata"])
-    if date is None or (origin and origin != BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN):
+    if date is None or (origin and origin not in INTERNAL_CALL_ORIGINS_WITH_MODEL_USAGE):
         return None
     model: Final = payload["model"] or "unknown"
     successful: Final = payload["status"] == "success"

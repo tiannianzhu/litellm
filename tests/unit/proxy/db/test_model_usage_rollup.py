@@ -203,16 +203,16 @@ def test_only_successful_caller_requests_with_a_duration_count_toward_response_t
 
 
 @pytest.mark.asyncio
-async def test_a_background_response_billing_row_adds_spend_but_no_request() -> None:
-    """A background response is billed by a later event, not by the create the client sent, so
-    model insights counts its spend and tokens once and its request once, from the create."""
-    batcher = _FakeBatcher()
-    prisma = _prisma(MagicMock(return_value=batcher))
-    create = build_model_usage_transaction(_payload(spend=0.0))
-    billing = build_model_usage_transaction(
+@pytest.mark.parametrize("origin", [BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN, "agentic_loop"])
+async def test_billable_internal_round_adds_usage_to_the_model_without_counting_another_request(origin: str) -> None:
+    batcher: Final = _FakeBatcher()
+    prisma: Final = _prisma(MagicMock(return_value=batcher))
+    create: Final = build_model_usage_transaction(_payload(spend=0.0, request_duration_ms=50))
+    billing: Final = build_model_usage_transaction(
         _payload(
             spend=0.5,
-            metadata=json.dumps({INTERNAL_CALL_ORIGIN_METADATA_KEY: BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN}),
+            request_duration_ms=100,
+            metadata=json.dumps({INTERNAL_CALL_ORIGIN_METADATA_KEY: origin}),
         )
     )
     assert create is not None and billing is not None
@@ -220,10 +220,12 @@ async def test_a_background_response_billing_row_adds_spend_but_no_request() -> 
     await flush_model_usage_transactions(prisma_client=prisma, transactions=[create, billing])
 
     (upsert,) = batcher.litellm_dailymodelusage.upsert.call_args_list
-    created = upsert.kwargs["data"]["create"]
+    created: Final = upsert.kwargs["data"]["create"]
     assert created["spend"] == 0.5
     assert created["prompt_tokens"] == 20
+    assert created["completion_tokens"] == 40
     assert (created["request_count"], created["successful_requests"], created["failed_requests"]) == (1, 1, 0)
+    assert (created["total_response_time_ms"], created["timed_requests"]) == (50, 1)
 
 
 @pytest.mark.asyncio

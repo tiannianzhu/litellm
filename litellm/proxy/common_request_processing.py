@@ -110,8 +110,9 @@ from litellm.litellm_core_utils.get_supported_openai_params import (
     get_supported_openai_params,
 )
 from litellm.litellm_core_utils.internal_call_metadata import is_unbilled_non_inference_call_from_params
-from litellm.litellm_core_utils.litellm_logging import BilledRoundsDispatch
+from litellm.litellm_core_utils.litellm_logging import BilledRoundsDispatch, UncachedPrice
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.llm_cost_calc.finalization import finalize_cost
 from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import (
     guardrail_entries,
     guardrail_information_cost,
@@ -216,6 +217,7 @@ from litellm.proxy.utils import (  # noqa: F401  # legacy module exports
     run_hook_subscribers,
 )
 from litellm.responses.mcp.parked_stream_dispatch import in_flight_round_biller, parked_success
+from litellm.responses.mcp.round_billing import price_of_every_round
 from litellm.responses.streaming_iterator import partial_responses_incomplete_event_on_disconnect, spawn_logging_task
 from litellm.router import Router
 from litellm.router_api import RoutingContext
@@ -381,6 +383,7 @@ from litellm.types.litellm_params import STREAM_USAGE_INJECTED_FIELD
 from litellm.types.utils import (
     CallTypes,
     Choices,
+    CostBreakdown,
     ImageResponse,
     LLMResponseTypes,
     ModelResponse,
@@ -2342,6 +2345,8 @@ def _anthropic_messages_cache_key_header(response_cache_key: object, logging_obj
 def _get_cost_breakdown_from_logging_obj(
     litellm_logging_obj: LiteLLMLoggingObj | None,
     response_cost: float | str | None = None,
+    *,
+    response_price: UncachedPrice | None = None,
 ) -> CostBreakdownHeaderValues:
     """Extract discount, margin, and per-component cost information from logging object's cost breakdown.
 
@@ -2350,18 +2355,28 @@ def _get_cost_breakdown_from_logging_obj(
     normally (retrieving a background response, and the cost poller's read of one) reports the
     breakdown it stored, or nothing at all when the breakdown has not landed yet.
     """
-    if not litellm_logging_obj or not hasattr(litellm_logging_obj, "cost_breakdown"):
-        return CostBreakdownHeaderValues()
-    if litellm_logging_obj.finalized_cost is None and _is_cache_hit(litellm_logging_obj):
-        return _ZERO_COST_BREAKDOWN
-
+    if response_price is None:
+        if not litellm_logging_obj or not hasattr(litellm_logging_obj, "cost_breakdown"):
+            return CostBreakdownHeaderValues()
+        if litellm_logging_obj.finalized_cost is None and _is_cache_hit(litellm_logging_obj):
+            return _ZERO_COST_BREAKDOWN
     cost_breakdown: Final = (
-        litellm_logging_obj.finalized_cost.logging_breakdown()
-        if litellm_logging_obj.finalized_cost is not None
-        else litellm_logging_obj.cost_breakdown
+        response_price.cost_breakdown
+        if response_price is not None
+        else (
+            litellm_logging_obj.finalized_cost.logging_breakdown()
+            if litellm_logging_obj is not None and litellm_logging_obj.finalized_cost is not None
+            else litellm_logging_obj.cost_breakdown
+            if litellm_logging_obj is not None
+            else None
+        )
     )
     if not cost_breakdown:
-        if litellm_logging_obj.call_type in NON_INFERENCE_CALL_TYPES and _totals_to_zero(response_cost):
+        if (
+            litellm_logging_obj is not None
+            and litellm_logging_obj.call_type in NON_INFERENCE_CALL_TYPES
+            and _totals_to_zero(response_cost)
+        ):
             return _ZERO_COST_BREAKDOWN
         return CostBreakdownHeaderValues()
 
@@ -2426,7 +2441,10 @@ def _failed_request_response_cost(
 
 
 def cost_headers(
-    response_cost: float | str | None, litellm_logging_obj: LiteLLMLoggingObj | None
+    response_cost: float | str | None,
+    litellm_logging_obj: LiteLLMLoggingObj | None,
+    *,
+    response_price: UncachedPrice | None = None,
 ) -> Mapping[str, str | None]:
     if (
         response_cost == 0
@@ -2436,7 +2454,7 @@ def cost_headers(
     ):
         return {}
     cost_breakdown: Final = _get_cost_breakdown_from_logging_obj(
-        litellm_logging_obj=litellm_logging_obj, response_cost=response_cost
+        litellm_logging_obj=litellm_logging_obj, response_cost=response_cost, response_price=response_price
     )
     return {
         "x-litellm-response-cost": str(response_cost),
@@ -2451,6 +2469,31 @@ def cost_headers(
         "x-litellm-response-cost-reasoning": _header_value(cost_breakdown.reasoning_cost),
         "x-litellm-response-cost-tool-usage": _header_value(cost_breakdown.tool_usage_cost),
     }
+
+
+def _price_for_response_headers(
+    hidden_params: Mapping[str, object], logging_obj: LiteLLMLoggingObj | None
+) -> UncachedPrice | None:
+    price: Final = price_of_every_round(hidden_params)
+    if price is None or price.cost is None or logging_obj is None:
+        return price
+    prepared: Final = logging_obj.prepared_cost
+    finalized: Final = logging_obj.finalized_cost
+    if prepared is None or finalized is None:
+        return price
+    guardrail_cost: Final = finalized.amount + finalized.allowance_discount - prepared.amount
+    breakdown: Final[CostBreakdown | None] = (
+        {
+            **price.cost_breakdown,
+            "guardrail_cost": price.cost_breakdown.get("guardrail_cost", 0.0) + guardrail_cost,
+            "total_cost": price.cost + guardrail_cost,
+        }
+        if price.cost_breakdown is not None and guardrail_cost > 0
+        else price.cost_breakdown
+    )
+    projected: Final = finalize_cost(price.cost + guardrail_cost, breakdown, finalized.allowance_discount)
+    amount: Final = finite_cost(projected.amount)
+    return UncachedPrice(cost=amount, cost_breakdown=None if amount is None else projected.logging_breakdown())
 
 
 def _classifier_cost_from_request_data(request_data: Mapping[str, object] | None) -> float | None:
@@ -3052,6 +3095,8 @@ class ProxyBaseLLMRequestProcessing:
     ) -> dict[str, str]:
         exclude_values: Final = {"", None, "None"}
         hidden_params = hidden_params or {}
+        response_price: Final = _price_for_response_headers(hidden_params, litellm_logging_obj)
+        served_response_cost: Final = response_cost if response_price is None else response_price.cost
         resolved_call_id: Final = (
             call_id or hidden_params.get("litellm_call_id") or (request_data or {}).get("litellm_call_id")
         )
@@ -3064,10 +3109,12 @@ class ProxyBaseLLMRequestProcessing:
         # Calculate updated spend for header (include current response_cost)
         current_spend: Final = user_api_key_dict.spend or 0.0
         updated_spend = current_spend
-        if response_cost is not None:
+        if served_response_cost is not None:
             try:
                 # Convert response_cost to float if it's a string
-                cost_value: Final = float(response_cost) if isinstance(response_cost, str) else response_cost
+                cost_value: Final = (
+                    float(served_response_cost) if isinstance(served_response_cost, str) else served_response_cost
+                )
                 if cost_value > 0:
                     updated_spend = current_spend + cost_value
             except (ValueError, TypeError):
@@ -3087,7 +3134,7 @@ class ProxyBaseLLMRequestProcessing:
             ),  # don't include query params, risk of leaking sensitive info
             "x-litellm-version": version,
             "x-litellm-model-region": model_region,
-            **cost_headers(response_cost, litellm_logging_obj),
+            **cost_headers(served_response_cost, litellm_logging_obj, response_price=response_price),
             "x-litellm-classifier-cost": (str(classifier_cost) if classifier_cost is not None else None),
             "x-litellm-key-tpm-limit": str(user_api_key_dict.tpm_limit),
             "x-litellm-key-rpm-limit": str(user_api_key_dict.rpm_limit),

@@ -644,6 +644,11 @@ def _snapshotless_cost_breakdown(  # pyright: ignore[reportUnusedFunction]  # sh
         return None
 
 
+def is_unmarked_agentic_loop(metadata: Mapping[str, object]) -> bool:
+    depth: Final = metadata.get("_agentic_loop_depth")
+    return type(depth) is int and depth > 0 and not metadata.get(INTERNAL_CALL_ORIGIN_METADATA_KEY)
+
+
 def get_logging_payload(
     kwargs: dict[str, object] | None,
     response_obj: object,

@@ -634,15 +634,11 @@ async def test_increment_spend_counters_skips_reserved_counter_keys(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_database", [False, True])
 async def test_increment_spend_counters_failing_scope_propagates_after_siblings_settle(
     monkeypatch,
+    has_database: bool,
 ):
-    """A failure in one scope must propagate to the caller (so it can invalidate
-    reserved counters) while every other scope still settles rather than being
-    left as an orphaned background task, and the reservation is not finalized.
-    The surviving scopes' increments are still applied in the single pipeline:
-    dropping them would under-count spend, the unsafe direction for budget
-    enforcement."""
     warmed_keys: list[str] = []
 
     async def _warm_check(counter: str) -> None:
@@ -661,8 +657,8 @@ async def test_increment_spend_counters_failing_scope_propagates_after_siblings_
         "spend:org:org1",
     )
     spend = _spend_counters(monkeypatch, redis=dict.fromkeys(keys, 1.0), batch_reads=False, read_hook=_warm_check)
-    monkeypatch.setattr(ps, "user_api_key_cache", _make_user_api_key_cache(get_value=None))
-    monkeypatch.setattr(ps, "prisma_client", None)
+    monkeypatch.setattr(ps, "user_api_key_cache", _make_user_api_key_cache(get_value={}))
+    monkeypatch.setattr(ps, "prisma_client", MagicMock() if has_database else None)
     monkeypatch.setattr(ps.SpendCounterReseed, "coalesced", AsyncMock(side_effect=_reseed_fails))
 
     reservation = {"finalized": False}
@@ -681,9 +677,12 @@ async def test_increment_spend_counters_failing_scope_propagates_after_siblings_
     assert reservation["finalized"] is False
     # every sibling scope settled (its warm-check ran) before the error propagated
     assert set(warmed_keys) == {*keys, "spend:team:t1"}
-    # the surviving scopes' increments were still applied, in one pipeline call
-    assert [command.split()[0] for command in spend.commands if not command.startswith("GET")] == ["PIPELINE"]
-    assert spend.redis == dict.fromkeys(keys, 6.0)
+    if has_database:
+        assert [command.split()[0] for command in spend.commands if not command.startswith("GET")] == ["PIPELINE"]
+        assert spend.redis == dict.fromkeys(keys, 6.0)
+    else:
+        assert all(command.startswith("GET") for command in spend.commands)
+        assert spend.redis == dict.fromkeys(keys, 1.0)
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Final, Literal, cast
 from unittest.mock import patch
@@ -559,6 +560,13 @@ async def test_completed_call_keeps_its_charge_when_post_call_processing_fails(
         },
     )
     writer: Final = create_autospec(DBSpendUpdateWriter, instance=True)
+
+    async def admit(*, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **_: object) -> bool:
+        if on_accounting_admitted is not None:
+            await on_accounting_admitted()
+        return True
+
+    writer.update_database.side_effect = admit
     monkeypatch.setattr(litellm, "callbacks", [RejectCompletedCall(), ProxyDBLogger(spend_writer=lambda: writer)])
     monkeypatch.setattr(litellm, "apply_search_free_tier", False)
     data: Final = {

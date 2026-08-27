@@ -19,6 +19,7 @@ from litellm._uuid import uuid
 from litellm.constants import (
     CALLER_SESSION_ID_METADATA_KEY,
     DEFAULT_MAX_RECURSE_DEPTH,
+    INTERNAL_CALL_ORIGIN_METADATA_KEY,
     SESSION_ID_GENERATED_METADATA_KEY,
     SESSION_ID_INHERITED_METADATA_KEY,
 )
@@ -323,6 +324,7 @@ def spend_log_row_input(
         _snapshotless_cost_breakdown,  # pyright: ignore[reportPrivateUsage]  # validated against the CostBreakdown type
         _string_or_empty,  # pyright: ignore[reportPrivateUsage]  # the router lookup key is read the logging payload's way
         get_spend_logs_id,
+        is_unmarked_agentic_loop,
         should_store_prompts_and_responses_in_spend_logs,
     )
 
@@ -337,7 +339,12 @@ def spend_log_row_input(
     )
     response: Final = response_obj if isinstance(response_obj, BaseModel) else response_obj_dict
     litellm_params: Final = _str_mapping(kwargs.get("litellm_params", {})) or {}
-    metadata: Final = _str_mapping(get_litellm_metadata_from_kwargs(kwargs)) or {}  # pyright: ignore[reportUnknownArgumentType]  # the metadata helper returns an untyped dict
+    request_metadata: Final = _str_mapping(get_litellm_metadata_from_kwargs(kwargs)) or {}  # pyright: ignore[reportUnknownArgumentType]  # the metadata helper returns an untyped dict
+    metadata: Final = (
+        {**request_metadata, INTERNAL_CALL_ORIGIN_METADATA_KEY: "agentic_loop"}
+        if is_unmarked_agentic_loop(request_metadata)
+        else request_metadata
+    )
     completion_start_time: Final = _COMPLETION_START_TIME.validate_python(kwargs.get("completion_start_time", end_time))
     call_type: Final = kwargs.get("call_type")
     usage: Final = _final_usage(kwargs, _usage(call_type, metadata, response, response_obj_dict))

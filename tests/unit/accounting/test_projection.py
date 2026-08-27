@@ -24,6 +24,64 @@ _NOW: Final = datetime(2026, 11, 2, tzinfo=timezone.utc)
 _FIELDS: Final = TypeAdapter(dict[str, object])
 
 
+def test_agentic_followup_usage_is_attributed_to_its_model_without_counting_another_request() -> None:
+    request: Final = DeliveryProjection(
+        {
+            "startTime": _NOW,
+            "model": "initial-model",
+            "model_group": "initial-alias",
+            "custom_llm_provider": "provider-a",
+            "status": "success",
+            "request_duration_ms": 50,
+            "spend": 0.25,
+            "prompt_tokens": 8,
+            "completion_tokens": 3,
+        }
+    )
+    followup: Final = DeliveryProjection(
+        {
+            "startTime": _NOW,
+            "model": "followup-model",
+            "model_group": "followup-alias",
+            "custom_llm_provider": "provider-b",
+            "metadata": {INTERNAL_CALL_ORIGIN_METADATA_KEY: "agentic_loop"},
+            "status": "failure",
+            "spend": 0.5,
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+        }
+    )
+    usage: Final = {
+        (dict(item.key)["model_group"], dict(item.key)["model"], dict(item.key)["custom_llm_provider"]): dict(
+            item.increments
+        )
+        for item in project_deliveries((request, followup))
+        if item.table == "LiteLLM_DailyModelUsage"
+    }
+    assert usage == {
+        ("initial-alias", "initial-model", "provider-a"): {
+            "spend": 0.25,
+            "prompt_tokens": 8,
+            "completion_tokens": 3,
+            "request_count": 1,
+            "successful_requests": 1,
+            "failed_requests": 0,
+            "timed_requests": 1,
+            "total_response_time_ms": 50,
+        },
+        ("followup-alias", "followup-model", "provider-b"): {
+            "spend": 0.5,
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "request_count": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "timed_requests": 0,
+            "total_response_time_ms": 0,
+        },
+    }
+
+
 def test_customer_daily_totals_stay_separate_per_model_alias_and_provider() -> None:
     stamp: Final = CustomerUsageAttribution(customer_org_id="org-1", customer_member_id="member-1").model_dump_json()
     base: Final = {

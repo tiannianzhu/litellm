@@ -1221,6 +1221,72 @@ def test_cost_field_in_usage_chunks():
     assert usage.completion_tokens == 5
 
 
+@pytest.mark.parametrize("with_logging", [False, True], ids=["sdk-assembly", "proxy-assembly"])
+@pytest.mark.parametrize("overflow", (False, True), ids=("finite", "overflow"))
+def test_stream_chunk_builder_preserves_the_cost_of_independently_billed_rounds(
+    monkeypatch: pytest.MonkeyPatch, local_model_cost_map: None, with_logging: bool, overflow: bool
+) -> None:
+    from datetime import datetime
+
+    from litellm.litellm_core_utils.hidden_params import get_hidden_params, set_hidden_params
+    from litellm.litellm_core_utils.litellm_logging import Logging, UncachedPrice
+    from litellm.litellm_core_utils.model_cost_table import changed_in_place
+    from litellm.responses.mcp.round_billing import PRICE_OF_EVERY_ROUND, price_of_every_round
+    from litellm.types.utils import CostBreakdown
+
+    model: Final = "aggregate-cost-fixture"
+    monkeypatch.setitem(
+        litellm.model_cost,
+        model,
+        {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.125, "output_cost_per_token": 0.25},
+    )
+    changed_in_place()
+    monkeypatch.setattr(litellm, "cost_margin_config", {"openai": {"fixed_amount": 0.25}})
+    logger: Final = Logging(
+        model=model,
+        messages=[],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="aggregate-cost",
+        function_id="aggregate-cost",
+    )
+    logger.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="openai")
+    breakdown: Final[CostBreakdown] = {
+        "original_cost": 1.0,
+        "input_cost": 0.5,
+        "output_cost": 0.5,
+        "margin_fixed_amount": 0.5,
+        "margin_total_amount": 0.5,
+        "total_cost": 1.5,
+    }
+    aggregate_cost: Final = 1e308 + 1e308 if overflow else 1.5
+    price: Final = UncachedPrice(cost=aggregate_cost, cost_breakdown=breakdown)
+    text_chunk: Final = ModelResponseStream(
+        model=model,
+        choices=[StreamingChoices(index=0, delta=Delta(content="Fixture"), finish_reason="stop")],
+    )
+    usage_chunk: Final = ModelResponseStream(
+        model=model,
+        choices=[],
+        usage=Usage(prompt_tokens=4, completion_tokens=2, total_tokens=6),
+    )
+    set_hidden_params(usage_chunk, {PRICE_OF_EVERY_ROUND: price, "response_cost": price.cost})
+
+    response: Final = litellm.stream_chunk_builder(
+        [text_chunk, usage_chunk], logging_obj=logger if with_logging else None
+    )
+
+    assert isinstance(response, litellm.ModelResponse)
+    expected_cost: Final = None if overflow else 1.5
+    assert getattr(response.usage, "cost", None) == expected_cost
+    hidden: Final = get_hidden_params(response) or {}
+    assert hidden["response_cost"] == expected_cost
+    carried: Final = price_of_every_round(hidden)
+    assert carried is not None
+    assert carried.cost_breakdown == (None if overflow else breakdown)
+
+
 def test_the_rebuilt_response_keeps_the_upstream_cost_a_stamped_usage_chunk_saved(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(litellm, "cost_margin_config", {"global": 0.5})
     text_chunk = ModelResponseStream(
@@ -1243,7 +1309,6 @@ def test_the_rebuilt_response_keeps_the_upstream_cost_a_stamped_usage_chunk_save
     assert litellm.completion_cost(rebuilt, custom_llm_provider="openai") == pytest.approx(0.0015), (
         "the upstream's 0.001 gets the 50% margin once, litellm's 0.0015 bill is not margined again"
     )
-
 
 
 def _perplexity_usage_chunk(cost: Mapping[str, float], finish_reason: str | None) -> ModelResponseStream:
@@ -1285,6 +1350,7 @@ def test_a_provider_usage_key_named_like_the_dropped_cost_flag_keeps_the_stream_
 
     assert response is not None
     assert getattr(response.usage, "cost", None) == 0.00371
+
 
 def test_stream_chunk_builder_tolerates_trailing_chunk_without_choices():
     """Regression for https://github.com/BerriAI/litellm/issues/32051
@@ -2862,7 +2928,9 @@ def test_stream_chunk_builder_carries_the_bedrock_guardrail_trace_and_records_it
     assert entry["guardrail_cost"] == pytest.approx(2 * 0.00015)
 
 
-def _vllm_chat_chunk(index: int, content: str, finish_reason: str | None = None, **fields: object) -> ModelResponseStream:
+def _vllm_chat_chunk(
+    index: int, content: str, finish_reason: str | None = None, **fields: object
+) -> ModelResponseStream:
     return ModelResponseStream(
         id="chatcmpl-1",
         created=1,
@@ -2916,14 +2984,13 @@ def test_stream_chunk_builder_keeps_null_vllm_fields_and_adds_none_for_other_pro
             _vllm_chat_chunk(0, "", "stop", stop_reason=None, token_ids=None),
         ]
     )
-    other_built: Final = stream_chunk_builder(
-        chunks=[_vllm_chat_chunk(0, "hi"), _vllm_chat_chunk(0, "", "stop")]
-    )
+    other_built: Final = stream_chunk_builder(chunks=[_vllm_chat_chunk(0, "hi"), _vllm_chat_chunk(0, "", "stop")])
 
     assert vllm_built is not None and other_built is not None
-    assert {
-        field: vllm_built.model_dump()["choices"][0][field] for field in ("stop_reason", "token_ids")
-    } == {"stop_reason": None, "token_ids": None}
+    assert {field: vllm_built.model_dump()["choices"][0][field] for field in ("stop_reason", "token_ids")} == {
+        "stop_reason": None,
+        "token_ids": None,
+    }
     assert {"stop_reason", "token_ids"}.isdisjoint(other_built.model_dump()["choices"][0])
 
 

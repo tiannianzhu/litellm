@@ -32,7 +32,10 @@ from litellm.integrations.code_interpreter_interception.handler import (
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.custom_logger_v2 import CallContext, CustomLoggerV2, Field, Hook, on
 from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
+from litellm.litellm_core_utils.agentic_followup_failure import is_agentic_followup_failure
+from litellm.litellm_core_utils.core_helpers import as_str_mapping
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.llms.anthropic.messages.native import handler as python_messages
 from litellm.llms.anthropic.skills.transformation import AnthropicSkillsConfig
@@ -6139,7 +6142,38 @@ class _SearchAgainLoop(CustomLogger):
 
 
 @pytest.mark.asyncio
-async def test_hosted_vllm_bills_the_first_call_on_the_failure_log_when_the_follow_up_fails(monkeypatch):
+@pytest.mark.parametrize("park_first_round", [False, True], ids=["immediate", "parked"])
+async def test_hosted_vllm_keeps_the_first_calls_own_charge_when_the_follow_up_fails(
+    monkeypatch: pytest.MonkeyPatch, park_first_round: bool
+) -> None:
+    charged: Final[asyncio.Queue[tuple[str, object, object, object]]] = asyncio.Queue()
+
+    class RoundBillingRecorder(CustomLogger):
+        async def async_pre_call_deployment_hook(
+            self, kwargs: Mapping[str, object], call_type: CallTypes | None
+        ) -> None:
+            logger: Final = kwargs.get("litellm_logging_obj")
+            if park_first_round and not kwargs.get("_agentic_loop_depth") and isinstance(logger, LiteLLMLoggingObj):
+                logger.defer_async_logging = True
+
+        def _record(self, kwargs: Mapping[str, object], phase: str) -> None:
+            row: Final = as_str_mapping(kwargs.get("standard_logging_object"))
+            if row is None:
+                return
+            usage_and_cost: Final = (row.get("prompt_tokens"), row.get("completion_tokens"), row.get("response_cost"))
+            if any(usage_and_cost):
+                charged.put_nowait((phase, *usage_and_cost))
+
+        async def async_log_success_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            self._record(kwargs, "success")
+
+        async def async_log_failure_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            self._record(kwargs, "failure")
+
     loop: Final = _PlannedChatLoop(
         AgenticLoopPlan(
             run_agentic_loop=True,
@@ -6149,9 +6183,9 @@ async def test_hosted_vllm_bills_the_first_call_on_the_failure_log_when_the_foll
             ),
         )
     )
-    monkeypatch.setattr(litellm, "callbacks", [loop])
+    monkeypatch.setattr(litellm, "callbacks", [loop, RoundBillingRecorder()])
 
-    with pytest.raises(litellm.RateLimitError):
+    with pytest.raises(litellm.RateLimitError) as raised:
         await litellm.acompletion(
             model="hosted_vllm/served-model",
             api_base="https://fake-vllm.test/v1",
@@ -6164,9 +6198,10 @@ async def test_hosted_vllm_bills_the_first_call_on_the_failure_log_when_the_foll
             max_retries=0,
         )
 
-    (logging_obj,) = loop.logging_objs
-    assert logging_obj.model_call_details["combined_usage_object"].total_tokens == 8
-    assert logging_obj.model_call_details["response_cost"] == pytest.approx(5 * 0.001 + 3 * 0.002)
+    await GLOBAL_LOGGING_WORKER.flush()
+    assert charged.qsize() == 1
+    assert charged.get_nowait() == ("success", 5, 3, pytest.approx(5 * 0.001 + 3 * 0.002))
+    assert is_agentic_followup_failure(raised.value)
 
 
 @pytest.mark.asyncio
