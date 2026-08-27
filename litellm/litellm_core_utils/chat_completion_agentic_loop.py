@@ -1,6 +1,7 @@
 # this is a patch to allow for agentic loops covering llm_http_handler.py and openai sdk based calling flows for the .completion() api
 
 import json
+import time
 from collections.abc import Mapping
 from itertools import chain
 from types import MappingProxyType
@@ -115,6 +116,7 @@ def _converted_stream_replay(
     model: str,
     custom_llm_provider: str,
     logging_obj: object,
+    record_completed_round: bool = False,
 ) -> CustomStreamWrapper | None:
     if depth or not converted_stream_requested(kwargs):
         return None
@@ -123,6 +125,8 @@ def _converted_stream_replay(
     if not isinstance(response, ModelResponse) or not isinstance(logging_obj, LiteLLMLoggingObject):
         return None
 
+    if record_completed_round:
+        logging_obj.record_agentic_loop_response(response, time.time())
     return CustomStreamWrapper(
         completion_stream=MockResponseIterator(model_response=response),
         model=model,
@@ -232,6 +236,7 @@ async def _execute_chat_completion_agentic_plan(
             model=model,
             custom_llm_provider=custom_llm_provider,
             logging_obj=logging_obj,
+            record_completed_round=kwargs.get("_websearch_interception_converted_stream") is True,
         )
         return response_followup if replay is None else replay
     finally:
@@ -264,6 +269,7 @@ async def maybe_run_chat_completion_agentic_loop(
     depth, max_loops, fingerprints = _agentic_loop_settings(kwargs)
     tools: Final = optional_params.get("tools", [])
 
+    completed_at: Final = time.time()
     for callback in callbacks:
         if not isinstance(callback, CustomLogger):
             continue
@@ -306,6 +312,8 @@ async def maybe_run_chat_completion_agentic_loop(
 
         try:
             if not _build_plan_overridden(callback):
+                if isinstance(logging_obj, LiteLLMLoggingObject):
+                    logging_obj.record_agentic_loop_response(response, completed_at)
                 return await callback.async_run_agentic_loop(
                     tools=tool_calls,
                     model=model,
@@ -337,6 +345,8 @@ async def maybe_run_chat_completion_agentic_loop(
             if not plan.run_agentic_loop:
                 continue
 
+            if isinstance(logging_obj, LiteLLMLoggingObject):
+                logging_obj.record_agentic_loop_response(response, completed_at)
             return await _execute_chat_completion_agentic_plan(
                 plan=plan,
                 callback=callback,
@@ -363,4 +373,5 @@ async def maybe_run_chat_completion_agentic_loop(
         model=model,
         custom_llm_provider=custom_llm_provider,
         logging_obj=logging_obj,
+        record_completed_round=kwargs.get("_websearch_interception_converted_stream") is True,
     )
