@@ -3360,6 +3360,11 @@ workflows:
           seed: false
           coverage_flag: roi-postgres
           timeout_minutes: 10
+      - postgres_suite:
+          name: search-quota
+          test_path: tests/test_callbacks/test_search_quota.py
+          seed: false
+          timeout_minutes: 5
       - mcp_integration:
           name: mcp-integration
       - redis_compat:
