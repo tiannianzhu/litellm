@@ -665,6 +665,14 @@ model LiteLLM_SpendLogs {
   @@index([session_id])
 }
 
+model LiteLLM_SearchQuota {
+  day      DateTime @client.Date
+  identity String
+  calls    Int      @default(0)
+
+  @@id([day, identity])
+}
+
 model LiteLLM_BudgetWindowSpend {
   entity_type     String
   entity_id       String
