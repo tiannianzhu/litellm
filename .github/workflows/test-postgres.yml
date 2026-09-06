@@ -68,6 +68,13 @@ jobs:
             timeout-minutes: 20
             job-timeout-minutes: 45
 
+          - shard: search-quota
+            test-path: "tests/test_callbacks/test_search_quota.py"
+            seed: none
+            workers: 0
+            timeout-minutes: 5
+            job-timeout-minutes: 20
+
     env:
       DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/litellm_test"
 
