@@ -160,6 +160,7 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
 
 def _get_spend_logs_metadata(
     metadata: dict | None,
+    error_information: StandardLoggingPayloadErrorInformation | None = None,
     applied_guardrails: list[str] | None = None,
     batch_models: list[str] | None = None,
     batch_successful_requests: int | None = None,
@@ -195,7 +196,7 @@ def _get_spend_logs_metadata(
             additional_usage_values=None,
             applied_guardrails=None,
             status="success",
-            error_information=None,
+            error_information=_sanitize_error_information_for_spend_logs(error_information),
             proxy_server_request=None,
             batch_models=None,
             batch_successful_requests=None,
@@ -264,6 +265,12 @@ def _get_spend_logs_metadata(
     clean_metadata["litellm_overhead_time_ms"] = litellm_overhead_time_ms
     clean_metadata["cost_breakdown"] = cost_breakdown
     clean_metadata["litellm_call_id"] = litellm_call_id
+    selected_error_information: Final = (
+        error_information if error_information is not None else clean_metadata["error_information"]
+    )
+    clean_metadata["error_information"] = _sanitize_error_information_for_spend_logs(
+        selected_error_information if isinstance(selected_error_information, dict) else None
+    )
 
     return clean_metadata
 
@@ -507,7 +514,10 @@ def get_logging_payload(
     litellm_params: Final = kwargs.get("litellm_params", {})
     metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
     completion_start_time: Final = kwargs.get("completion_start_time", end_time)
-    call_type: Final = kwargs.get("call_type")
+    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
+    call_type: Final = kwargs.get("call_type") or (
+        standard_logging_payload.get("call_type") if standard_logging_payload is not None else None
+    )
     cache_hit: Final = kwargs.get("cache_hit", False)
 
     # Convert response_obj to dict first
@@ -538,7 +548,6 @@ def get_logging_payload(
         usage = _combined_usage.model_dump()
 
     id = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs)
-    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
 
     end_user_id = get_end_user_id_for_cost_tracking(litellm_params)
 
@@ -639,8 +648,16 @@ def get_logging_payload(
     )
 
     # clean up litellm metadata
+    payload_error_information: Final = (
+        standard_logging_payload.get("error_information", None) if standard_logging_payload is not None else None
+    )
     clean_metadata = _get_spend_logs_metadata(
         persisted_metadata,
+        error_information=(
+            _scrub_raw_model_from_error_information(payload_error_information, raw_model)
+            if model_is_placeholdered
+            else payload_error_information
+        ),
         applied_guardrails=(
             standard_logging_payload["metadata"].get("applied_guardrails", None)
             if standard_logging_payload is not None
