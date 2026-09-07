@@ -1450,8 +1450,9 @@ def test_count_reasoning_tokens_counts_visible_reasoning():
     "estimated_reasoning_tokens, expected_reasoning_tokens, expected_text_tokens",
     [(40, 40, 60), (250, 100, 0)],
 )
+@pytest.mark.parametrize("has_details", [False, True])
 def test_calculate_usage_fills_unknown_split_from_reasoning_estimate(
-    estimated_reasoning_tokens, expected_reasoning_tokens, expected_text_tokens
+    estimated_reasoning_tokens, expected_reasoning_tokens, expected_text_tokens, has_details
 ):
     from litellm.types.utils import CompletionTokensDetailsWrapper
 
@@ -1463,7 +1464,9 @@ def test_calculate_usage_fills_unknown_split_from_reasoning_estimate(
             prompt_tokens=50,
             completion_tokens=100,
             total_tokens=150,
-            completion_tokens_details=CompletionTokensDetailsWrapper(reasoning_tokens=None, text_tokens=None),
+            completion_tokens_details=(
+                CompletionTokensDetailsWrapper(reasoning_tokens=None, text_tokens=None) if has_details else None
+            ),
         ),
     )
     processor = ChunkProcessor(chunks=[chunk])
@@ -1603,3 +1606,81 @@ def test_calculate_usage_falls_back_to_prompt_counter_when_mock_stream_has_no_ad
     )
 
     assert usage.prompt_tokens == 77
+
+
+@pytest.mark.parametrize("content", ["", "answer"])
+def test_partial_reasoning_stream_includes_reasoning_in_completion_total(content: str) -> None:
+    from litellm import token_counter
+    from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
+
+    chunks: Final = [
+        ModelResponseStream(
+            model="glm-5.3-flash",
+            choices=[
+                StreamingChoices(
+                    index=0,
+                    finish_reason=None,
+                    delta=Delta(role="assistant", reasoning_content="Let me work through the calculation."),
+                )
+            ],
+        ),
+        ModelResponseStream(
+            model="glm-5.3-flash",
+            choices=[StreamingChoices(index=0, finish_reason=None, delta=Delta(content=content))],
+        ),
+    ]
+    response: Final = stream_chunk_builder(chunks=chunks, messages=[{"role": "user", "content": "Calculate."}])
+    assert response is not None
+    usage: Final = response.usage
+    reasoning: Final = usage.completion_tokens_details.reasoning_tokens
+    assert reasoning > 0
+    assert usage.completion_tokens == reasoning + token_counter(text=content, count_response_tokens=True)
+    assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+    _, output_cost = generic_cost_per_token(
+        model="glm-5.3-flash",
+        usage=usage,
+        custom_llm_provider="hosted_vllm",
+        model_info={"input_cost_per_token": 0.0, "output_cost_per_token": 0.0000005},
+    )
+    assert output_cost == pytest.approx(usage.completion_tokens * 0.0000005)
+
+
+def test_reasoning_estimate_cannot_increase_cost_above_provider_completion_total() -> None:
+    from litellm.litellm_core_utils.llm_cost_calc.utils import generic_cost_per_token
+
+    chunk: Final = ModelResponseStream(
+        model="glm-5.3-flash",
+        choices=[],
+        usage=Usage(prompt_tokens=59, completion_tokens=128, total_tokens=187),
+    )
+    usage: Final = ChunkProcessor(chunks=[chunk]).calculate_usage(
+        chunks=[chunk], model="glm-5.3-flash", completion_output="", reasoning_tokens=154
+    )
+    assert usage.completion_tokens == 128
+    assert usage.total_tokens == 187
+    assert usage.completion_tokens_details.reasoning_tokens == 128
+    _, output_cost = generic_cost_per_token(
+        model="glm-5.3-flash",
+        usage=usage,
+        custom_llm_provider="hosted_vllm",
+        model_info={"input_cost_per_token": 0.0, "output_cost_per_token": 0.0000005},
+    )
+    assert output_cost == pytest.approx(0.000064)
+
+
+@pytest.mark.parametrize("provider_total", [0, 100])
+def test_usage_prefers_provider_reasoning_detail_over_local_estimate(provider_total: int) -> None:
+    from litellm.types.utils import CompletionTokensDetailsWrapper
+
+    details: Final = CompletionTokensDetailsWrapper(reasoning_tokens=40)
+    chunk: Final = ModelResponseStream(
+        model="glm-5.3-flash",
+        choices=[],
+        usage=Usage(prompt_tokens=50, completion_tokens=provider_total, completion_tokens_details=details),
+    )
+    usage: Final = ChunkProcessor(chunks=[chunk]).calculate_usage(
+        chunks=[chunk], model="glm-5.3-flash", completion_output="answer", reasoning_tokens=250
+    )
+    assert usage.completion_tokens == (provider_total or 41)
+    assert usage.completion_tokens_details.reasoning_tokens == 40
+    assert usage.completion_tokens_details.model_dump() == details.model_dump()

@@ -14,6 +14,7 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.litellm_logging import use_custom_pricing_for_model
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_content_from_model_response,
+    reasoning_content_from_thinking_blocks,
 )
 from litellm.llms.anthropic import get_anthropic_config
 from litellm.llms.anthropic.chat.handler import (
@@ -33,6 +34,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
 )
 from litellm.types.utils import (
     Choices,
+    CompletionTokensDetailsWrapper,
     LiteLLMBatch,
     Message,
     ModelResponse,
@@ -261,7 +263,19 @@ class AnthropicPassthroughLoggingHandler:
             verbose_proxy_logger.warning(
                 "Anthropic passthrough: could not cost the partial usage of a failed stream (model=%s): %s", model, e
             )
-            return 0.0
+            response_cost: Final = 0.0
+            AnthropicPassthroughLoggingHandler._synchronize_response_cost(
+                litellm_model_response=partial_response,
+                response_cost=response_cost,
+                logging_obj=logging_obj,
+            )
+            logging_obj.set_cost_breakdown(
+                input_cost=0.0,
+                output_cost=0.0,
+                total_cost=response_cost,
+                cost_for_built_in_tools_cost_usd_dollar=0.0,
+            )
+            return response_cost
 
     @staticmethod
     def _compute_response_cost(
@@ -270,14 +284,26 @@ class AnthropicPassthroughLoggingHandler:
         logging_obj: LiteLLMLoggingObj,
     ) -> float:
         if logging_obj.model_call_details.get("cache_hit") is True:
-            return 0.0
+            cache_cost: Final = 0.0
+            AnthropicPassthroughLoggingHandler._synchronize_response_cost(
+                litellm_model_response=litellm_model_response,
+                response_cost=cache_cost,
+                logging_obj=logging_obj,
+            )
+            logging_obj.set_cost_breakdown(
+                input_cost=0.0,
+                output_cost=0.0,
+                total_cost=cache_cost,
+                cost_for_built_in_tools_cost_usd_dollar=0.0,
+            )
+            return cache_cost
         custom_llm_provider: Final = logging_obj.model_call_details.get("custom_llm_provider")
         model_for_cost: Final = (
             f"{custom_llm_provider}/{model}"
             if custom_llm_provider and not model.startswith(f"{custom_llm_provider}/")
             else model
         )
-        return litellm.completion_cost(
+        computed_cost: Final = litellm.completion_cost(
             completion_response=litellm_model_response,
             model=model_for_cost,
             custom_llm_provider=custom_llm_provider,
@@ -285,7 +311,28 @@ class AnthropicPassthroughLoggingHandler:
                 litellm_params=(logging_obj.litellm_params if hasattr(logging_obj, "litellm_params") else None)
             ),
             router_model_id=logging_obj.get_router_model_id(),
+            litellm_logging_obj=logging_obj,
         )
+        AnthropicPassthroughLoggingHandler._synchronize_response_cost(
+            litellm_model_response=litellm_model_response,
+            response_cost=computed_cost,
+            logging_obj=logging_obj,
+        )
+        return computed_cost
+
+    @staticmethod
+    def _synchronize_response_cost(
+        litellm_model_response: ModelResponse | TextCompletionResponse,
+        response_cost: float,
+        logging_obj: LiteLLMLoggingObj,
+    ) -> None:
+        usage: Final = getattr(litellm_model_response, "usage", None)
+        if isinstance(usage, Usage):
+            usage.cost = response_cost
+        hidden_params: Final = getattr(litellm_model_response, "_hidden_params", None)
+        if isinstance(hidden_params, dict):
+            hidden_params["response_cost"] = response_cost
+        logging_obj.model_call_details["response_cost"] = response_cost
 
     @staticmethod
     def _extract_message_start_field(
@@ -373,28 +420,42 @@ class AnthropicPassthroughLoggingHandler:
         if not AnthropicPassthroughLoggingHandler._stream_was_interrupted(all_chunks):
             return
         usage: Final = getattr(response, "usage", None)
-        if usage is None:
+        if not isinstance(usage, Usage):
             return
         output_text: Final = get_content_from_model_response(response)
-        if not output_text:
+        reasoning_text: Final = "\n".join(
+            choice.message.reasoning_content
+            if hasattr(choice.message, "reasoning_content") and choice.message.reasoning_content
+            else reasoning_content_from_thinking_blocks(choice.message.thinking_blocks or ())
+            if hasattr(choice.message, "thinking_blocks")
+            else ""
+            for choice in response.choices
+        )
+        if not output_text and not reasoning_text:
             return
         try:
-            recovered_output_tokens = litellm.token_counter(model=model, text=output_text, count_response_tokens=True)
+            recovered_text_tokens: Final = (
+                litellm.token_counter(model=model, text=output_text, count_response_tokens=True) if output_text else 0
+            )
+            recovered_reasoning_tokens: Final = (
+                litellm.token_counter(model=model, text=reasoning_text, count_response_tokens=True)
+                if reasoning_text
+                else 0
+            )
         except Exception:
             verbose_proxy_logger.warning(
                 "Could not re-tokenize interrupted stream output; keeping placeholder completion token count."
             )
             return
+        recovered_output_tokens: Final = recovered_text_tokens + recovered_reasoning_tokens
         if recovered_output_tokens <= (usage.completion_tokens or 0):
             return
         usage.completion_tokens = recovered_output_tokens
         usage.total_tokens = (usage.prompt_tokens or 0) + recovered_output_tokens
-        # Anthropic costing reads completion_tokens_details.text_tokens, so the
-        # stale message_start placeholder there must be corrected too or spend
-        # stays undercounted even after completion_tokens is fixed.
-        details: Final = getattr(usage, "completion_tokens_details", None)
-        if details is not None and getattr(details, "text_tokens", None) is not None:
-            details.text_tokens = recovered_output_tokens
+        details: Final = usage.completion_tokens_details or CompletionTokensDetailsWrapper()
+        details.text_tokens = recovered_text_tokens
+        details.reasoning_tokens = recovered_reasoning_tokens
+        usage.completion_tokens_details = details
 
     @staticmethod
     def _create_anthropic_response_logging_payload(
@@ -424,9 +485,6 @@ class AnthropicPassthroughLoggingHandler:
 
             kwargs["response_cost"] = response_cost
             kwargs["model"] = model
-            # the pass-through success path reads spend from
-            # model_call_details["response_cost"], not from kwargs
-            logging_obj.model_call_details["response_cost"] = response_cost
             passthrough_logging_payload: Final[PassthroughStandardLoggingPayload | None] = kwargs.get(
                 "passthrough_logging_payload"
             )

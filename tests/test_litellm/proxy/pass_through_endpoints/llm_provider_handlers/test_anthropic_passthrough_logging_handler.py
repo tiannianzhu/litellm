@@ -1,7 +1,7 @@
 import asyncio
 import json
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, Final, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1550,7 +1550,14 @@ class TestInterruptedStreamOutputTokenRecovery:
     def _sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
-    _MODEL = "claude-3-5-haiku-20241022"
+    _MODEL = "anthropic-passthrough-reasoning-cost-test"
+    _PRICES: Final = {
+        "input_cost_per_token": 0.000001,
+        "output_cost_per_token": 0.000002,
+        "cache_read_input_token_cost": 0.0000005,
+        "litellm_provider": "anthropic",
+        "mode": "chat",
+    }
     _OUTPUT_TEXT = (
         "The history of computing spans centuries, beginning with mechanical "
         "calculators and the abacus, advancing through Charles Babbage's "
@@ -1558,6 +1565,11 @@ class TestInterruptedStreamOutputTokenRecovery:
         "theoretical machine, and the electronic computers of the twentieth "
         "century that gave rise to the modern information age."
     )
+
+    def _register_model(self) -> None:
+        import litellm
+
+        litellm.register_model({self._MODEL: self._PRICES})
 
     def _interrupted_chunks(self, *, placeholder_output_tokens: int = 2):
         from litellm.proxy.pass_through_endpoints.streaming_handler import (
@@ -1626,6 +1638,7 @@ class TestInterruptedStreamOutputTokenRecovery:
         return chunks
 
     def _run(self, all_chunks):
+        self._register_model()
         logging_obj = MagicMock()
         logging_obj.model_call_details = {"model": self._MODEL, "stream": True}
         logging_obj.litellm_call_id = "test-call-id"
@@ -1675,6 +1688,109 @@ class TestInterruptedStreamOutputTokenRecovery:
         # Terminal message_delta present: recovery must not fire; the authoritative
         # provider count is preserved verbatim.
         assert usage.completion_tokens == final
+
+    @pytest.mark.parametrize("output_kind", ["thinking", "text", "tool"])
+    @pytest.mark.parametrize("completed", [False, True])
+    @pytest.mark.asyncio
+    async def test_thinking_stream_recovers_interrupted_usage(self, output_kind: str, completed: bool) -> None:
+        import litellm
+        from litellm.litellm_core_utils.prompt_templates.common_utils import get_content_from_model_response
+        from litellm.types.utils import Choices, ModelResponse
+
+        thinking: Final = "Let me carefully check each possibility before answering the question."
+        self._register_model()
+        ordinary_block: Final = (
+            {"type": "tool_use", "id": "call_lookup", "name": "lookup", "input": {}}
+            if output_kind == "tool"
+            else {"type": "text", "text": ""}
+        )
+        ordinary_delta: Final = (
+            {"type": "input_json_delta", "partial_json": '{"query":"weather"}'}
+            if output_kind == "tool"
+            else {"type": "text_delta", "text": "The answer is ready."}
+        )
+        events: Final = (
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_thinking_disconnect",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self._MODEL,
+                    "content": [],
+                    "usage": {"input_tokens": 29, "output_tokens": 0, "cache_read_input_tokens": 50},
+                },
+            },
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": thinking}},
+            *(
+                (
+                    {"type": "content_block_stop", "index": 0},
+                    {"type": "content_block_start", "index": 1, "content_block": ordinary_block},
+                    {"type": "content_block_delta", "index": 1, "delta": ordinary_delta},
+                )
+                if output_kind != "thinking"
+                else ()
+            ),
+            *(
+                ({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}},)
+                if completed
+                else ()
+            ),
+        )
+        now: Final = datetime.now()
+        logging_obj: Final = LiteLLMLoggingObj(
+            model=self._MODEL,
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+            call_type="anthropic_messages",
+            start_time=now,
+            litellm_call_id="test-thinking-disconnect",
+            function_id="test-thinking-disconnect",
+        )
+        logging_obj.optional_params = {}
+        payload: Final = AnthropicPassthroughLoggingHandler._handle_logging_anthropic_collected_chunks(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(),
+            url_route="/anthropic/v1/messages",
+            request_body={"model": self._MODEL, "stream": True},
+            endpoint_type="messages",
+            start_time=now,
+            all_chunks=["data: " + json.dumps(event) for event in events],
+            end_time=now,
+        )
+        result: Final = payload["result"]
+        assert isinstance(result, ModelResponse)
+        assert isinstance(result.choices[0], Choices)
+        assert result.choices[0].message.reasoning_content == thinking
+        usage: Final = result.usage
+        assert usage.prompt_tokens == 79
+        assert usage.prompt_tokens_details.cached_tokens == 50
+        expected_cost: Final = (
+            29 * self._PRICES["input_cost_per_token"]
+            + 50 * self._PRICES["cache_read_input_token_cost"]
+            + usage.completion_tokens * self._PRICES["output_cost_per_token"]
+        )
+        assert payload["kwargs"]["response_cost"] == pytest.approx(expected_cost)
+        assert logging_obj.model_call_details["response_cost"] == pytest.approx(expected_cost)
+        assert usage.cost == pytest.approx(expected_cost)
+        assert result._hidden_params["response_cost"] == pytest.approx(expected_cost)
+        assert logging_obj.cost_breakdown is not None
+        assert logging_obj.cost_breakdown["total_cost"] == pytest.approx(expected_cost)
+        await logging_obj.async_success_handler(result=result, start_time=now, end_time=now)
+        assert logging_obj.model_call_details["response_cost"] == pytest.approx(expected_cost)
+        assert logging_obj.model_call_details["standard_logging_object"]["response_cost"] == pytest.approx(expected_cost)
+        if completed:
+            assert usage.completion_tokens == 7
+            return
+        text_tokens: Final = litellm.token_counter(
+            model=self._MODEL, text=get_content_from_model_response(result), count_response_tokens=True
+        )
+        reasoning_tokens: Final = litellm.token_counter(model=self._MODEL, text=thinking, count_response_tokens=True)
+        assert usage.completion_tokens == text_tokens + reasoning_tokens
+        assert usage.completion_tokens_details.reasoning_tokens == reasoning_tokens
+        assert usage.completion_tokens_details.text_tokens == text_tokens
+        assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
 
 
 class TestStreamFalseDeduplication:
@@ -2315,6 +2431,57 @@ class TestAnthropicResponseCostRecordedOnModelCallDetails:
         )
         assert logging_obj.model_call_details["response_cost"] > 0
 
+    def test_cache_hit_clears_response_cost_caches_and_breakdown(self):
+        from litellm.types.utils import Choices, Message, ModelResponse
+
+        now: Final = datetime.now()
+        logging_obj: Final = LiteLLMLoggingObj(
+            model="anthropic-passthrough-cache-hit-test",
+            messages=[{"role": "user", "content": "hello"}],
+            stream=True,
+            call_type="anthropic_messages",
+            start_time=now,
+            litellm_call_id="test-cache-hit",
+            function_id="test-cache-hit",
+        )
+        logging_obj.optional_params = {}
+        logging_obj.model_call_details["cache_hit"] = True
+        logging_obj.set_cost_breakdown(
+            input_cost=0.001,
+            output_cost=0.002,
+            total_cost=0.003,
+            cost_for_built_in_tools_cost_usd_dollar=0.0,
+        )
+        response: Final = ModelResponse(
+            id="test-id",
+            choices=[
+                Choices(
+                    finish_reason="stop",
+                    index=0,
+                    message=Message(content="hello", role="assistant"),
+                )
+            ],
+            model="anthropic-passthrough-cache-hit-test",
+            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.003},
+        )
+        response._hidden_params["response_cost"] = 0.003
+
+        payload: Final = AnthropicPassthroughLoggingHandler._create_anthropic_response_logging_payload(
+            litellm_model_response=response,
+            model="anthropic-passthrough-cache-hit-test",
+            kwargs={},
+            start_time=now,
+            end_time=now,
+            logging_obj=logging_obj,
+        )
+
+        assert payload["response_cost"] == 0.0
+        assert response.usage.cost == 0.0
+        assert response._hidden_params["response_cost"] == 0.0
+        assert logging_obj.model_call_details["response_cost"] == 0.0
+        assert logging_obj.cost_breakdown is not None
+        assert logging_obj.cost_breakdown["total_cost"] == 0.0
+
 
 class TestAnthropicPassthroughFastMode:
     """Anthropic charges a provider-specific multiplier for ``speed=fast``, applied off
@@ -2504,6 +2671,9 @@ class TestRecordPartialUsageForFailure:
         usage = logging_obj.model_call_details["combined_usage_object"]
         assert usage.prompt_tokens == 52
         assert logging_obj.model_call_details["response_cost"] > 0
+        assert usage.cost == logging_obj.model_call_details["response_cost"]
+        assert logging_obj.cost_breakdown is not None
+        assert logging_obj.cost_breakdown["total_cost"] == logging_obj.model_call_details["response_cost"]
 
     def test_stashes_partial_usage_at_zero_cost_when_model_is_unpriced(self):
         logging_obj = self._make_logging_obj()
@@ -2517,6 +2687,9 @@ class TestRecordPartialUsageForFailure:
         usage = logging_obj.model_call_details["combined_usage_object"]
         assert usage.prompt_tokens == 52
         assert logging_obj.model_call_details["response_cost"] == 0.0
+        assert usage.cost == 0.0
+        assert logging_obj.cost_breakdown is not None
+        assert logging_obj.cost_breakdown["total_cost"] == 0.0
 
     def test_leaves_logging_obj_untouched_when_nothing_streamed(self):
         logging_obj = self._make_logging_obj()

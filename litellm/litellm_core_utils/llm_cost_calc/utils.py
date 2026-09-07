@@ -1254,8 +1254,24 @@ def generic_cost_per_token(
             # No breakdown at all, all tokens are text tokens
             text_tokens = usage.completion_tokens
             is_text_tokens_total = True
+    reasoning_rate: Final = (
+        _resolve_billed_reasoning_rate(
+            model_info=model_info,
+            usage=usage,
+            service_tier=service_tier,
+            completion_base_cost=completion_base_cost,
+            current_time=billing_time,
+        )
+        if reasoning_tokens > 0
+        else completion_base_cost
+    )
+    uniform_text_output_price: Final = (
+        audio_tokens == 0 and image_tokens == 0 and video_tokens == 0 and reasoning_rate == completion_base_cost
+    )
     ## TEXT COST
-    completion_cost = float(text_tokens) * completion_base_cost
+    completion_cost = (
+        float(usage.completion_tokens if uniform_text_output_price else text_tokens) * completion_base_cost
+    )
 
     ## AUDIO COST
     if not is_text_tokens_total and audio_tokens is not None and audio_tokens > 0:
@@ -1266,14 +1282,8 @@ def generic_cost_per_token(
         completion_cost += float(audio_tokens) * _output_cost_per_audio_token
 
     ## REASONING COST
-    if not is_text_tokens_total and reasoning_tokens and reasoning_tokens > 0:
-        completion_cost += float(reasoning_tokens) * _resolve_billed_reasoning_rate(
-            model_info=model_info,
-            usage=usage,
-            service_tier=service_tier,
-            completion_base_cost=completion_base_cost,
-            current_time=billing_time,
-        )
+    if not uniform_text_output_price and not is_text_tokens_total and reasoning_tokens and reasoning_tokens > 0:
+        completion_cost += float(reasoning_tokens) * reasoning_rate
 
     ## IMAGE COST
     if not is_text_tokens_total and image_tokens and image_tokens > 0:
