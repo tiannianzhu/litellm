@@ -20,7 +20,10 @@ from litellm.constants import (
     SESSION_ID_OMITTED_METADATA_KEY,
     UNKNOWN_MODEL_SPEND_LOG_MODEL,
 )
-from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
+from litellm.litellm_core_utils.litellm_logging import (
+    StandardLoggingPayloadSetup,
+    create_dummy_standard_logging_payload,
+)
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import SpendLogsPayload, UserAPIKeyAuth
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
@@ -49,6 +52,7 @@ from litellm.types.utils import (
     StandardLoggingMetadata,
     StandardLoggingModelInformation,
     StandardLoggingPayload,
+    StandardLoggingPayloadErrorInformation,
 )
 
 
@@ -79,10 +83,16 @@ def test_classifier_audit_spend_storage_obeys_privacy_and_truncation(monkeypatch
         "classifier_input": {"system": "rubric" * 1000, "messages": [{"role": "user", "content": "ask"}]},
         "originating_request_masked": {"input": "source-only", "api_key": "REDACTED"},
     }
-    stored: Final = json.loads(_get_proxy_server_request_for_spend_logs_payload(
-        metadata={}, litellm_params={"proxy_server_request": {"body": {"model": "classifier"}}},
-        kwargs={"standard_logging_object": audit, "standard_callback_dynamic_params": {"turn_off_message_logging": redact}},
-    ))
+    stored: Final = json.loads(
+        _get_proxy_server_request_for_spend_logs_payload(
+            metadata={},
+            litellm_params={"proxy_server_request": {"body": {"model": "classifier"}}},
+            kwargs={
+                "standard_logging_object": audit,
+                "standard_callback_dynamic_params": {"turn_off_message_logging": redact},
+            },
+        )
+    )
     if not store_prompts or redact:
         assert "classifier_input" not in stored
         assert "originating_request_masked" not in stored
@@ -208,9 +218,7 @@ def test_batch_lifecycle_rows_derive_the_same_session_from_the_batch_id():
     from litellm.proxy.spend_tracking.spend_tracking_utils import _get_batch_trace_session_id
 
     create_session: Final = _get_batch_trace_session_id(call_type="acreate_batch", request_id="batch-uid-1")
-    cost_session: Final = _get_batch_trace_session_id(
-        call_type="aretrieve_batch", request_id="batch-uid-1_batch_cost"
-    )
+    cost_session: Final = _get_batch_trace_session_id(call_type="aretrieve_batch", request_id="batch-uid-1_batch_cost")
     assert create_session == cost_session == "batch-uid-1"
 
 
@@ -469,6 +477,83 @@ def _make_standard_logging_payload_with_usage_object(usage_object: dict) -> Stan
             usage_object=None,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("request_call_type", "logged_call_type", "expected"),
+    [
+        (None, "acompletion", "acompletion"),
+        ("", "anthropic_messages", "anthropic_messages"),
+        (None, "aresponses", "aresponses"),
+        ("acompletion", "aresponses", "acompletion"),
+        (None, None, ""),
+    ],
+)
+def test_failure_payload_preserves_call_type(
+    request_call_type: str | None, logged_call_type: str | None, expected: str
+) -> None:
+    standard_log: Final = create_dummy_standard_logging_payload() if logged_call_type is not None else None
+    if standard_log is not None and logged_call_type is not None:
+        standard_log["call_type"] = logged_call_type
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": request_call_type,
+            "standard_logging_object": standard_log,
+            "litellm_params": {"metadata": {"status": "failure"}},
+        },
+        response_obj=RuntimeError("provider failed"),
+        start_time=now,
+        end_time=now,
+    )
+    assert payload["call_type"] == expected
+
+
+def test_get_logging_payload_preserves_standard_logging_client_disconnect_error_information():
+    standard_logging_payload: Final = create_dummy_standard_logging_payload()
+    error_information: Final = {
+        "error_code": "499",
+        "error_class": "ClientDisconnected",
+        "llm_provider": "hosted_vllm",
+        "traceback": "",
+        "error_message": "Client disconnected the request",
+    }
+    standard_logging_payload["error_information"] = error_information
+    now: Final = datetime.datetime.now(timezone.utc)
+
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "hosted_vllm/test-model",
+            "call_type": "anthropic_messages",
+            "litellm_params": {"metadata": {"user_api_key": "test-key"}},
+            "standard_logging_object": standard_logging_payload,
+        },
+        response_obj={"id": "chatcmpl-disconnected", "usage": {"prompt_tokens": 5, "completion_tokens": 0}},
+        start_time=now,
+        end_time=now,
+    )
+
+    assert json.loads(payload["metadata"])["error_information"] == error_information
+
+
+@pytest.mark.parametrize(
+    ("metadata", "standard_error_information"),
+    [
+        (None, {"error_code": "499", "error_class": "ClientDisconnected"}),
+        ({"error_information": {"error_code": "499", "error_class": "ClientDisconnected"}}, None),
+    ],
+)
+def test_get_spend_logs_metadata_preserves_client_disconnect_error_information(
+    metadata: dict[str, object] | None,
+    standard_error_information: StandardLoggingPayloadErrorInformation | None,
+):
+    error_information: Final = _get_spend_logs_metadata(
+        metadata=metadata,
+        error_information=standard_error_information,
+    )["error_information"]
+
+    assert error_information == {"error_code": "499", "error_class": "ClientDisconnected"}
 
 
 def test_get_logging_payload_maps_responses_api_cache_write_tokens_from_usage_object():
@@ -4460,7 +4545,7 @@ ANTHROPIC_MESSAGES_SSE_CHUNKS: Final = (
     'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
     'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
     '"usage":{"output_tokens":4}}\n\n',
-    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
 )
 
 
@@ -4498,9 +4583,7 @@ def test_spend_log_request_id_is_the_message_id_a_non_streaming_messages_caller_
     """
     logging_obj = _anthropic_messages_logging_obj(stream=False)
 
-    logged_response = logging_obj._handle_anthropic_messages_response_logging(
-        result=ANTHROPIC_MESSAGES_RESPONSE
-    )
+    logged_response = logging_obj._handle_anthropic_messages_response_logging(result=ANTHROPIC_MESSAGES_RESPONSE)
 
     assert logged_response.id == "msg_01Lit6806NonStreaming"
     assert (
@@ -4576,9 +4659,7 @@ def test_spend_log_request_id_still_falls_back_to_litellm_call_id_without_a_prov
         end_time=datetime.datetime.now(timezone.utc),
         logging_obj=logging_obj,
     )
-    assert logging_obj.model_call_details["complete_streaming_response"].id == (
-        "6806cafe-0000-4000-8000-000000000001"
-    )
+    assert logging_obj.model_call_details["complete_streaming_response"].id == ("6806cafe-0000-4000-8000-000000000001")
 
 
 def test_spend_log_request_id_for_chat_completions_is_untouched():

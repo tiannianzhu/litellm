@@ -1886,9 +1886,15 @@ async def test_track_cost_callback_keeps_guardrail_cost_on_cache_hit():
     }
 
     with (
-        patch("litellm.proxy.proxy_server.increment_spend_counters", new_callable=AsyncMock) as mock_increment,  # test-quality-ok: the callback imports this from proxy_server inside its body, so there is no injection seam
-        patch("litellm.proxy.proxy_server.update_cache", new_callable=AsyncMock),  # test-quality-ok: same function-body import, no injection seam
-        patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging,  # test-quality-ok: same function-body import, no injection seam
+        patch(  # test-quality-ok: the callback imports this from proxy_server inside its body, so there is no injection seam
+            "litellm.proxy.proxy_server.increment_spend_counters", new_callable=AsyncMock
+        ) as mock_increment,
+        patch(  # test-quality-ok: same function-body import, no injection seam
+            "litellm.proxy.proxy_server.update_cache", new_callable=AsyncMock
+        ),
+        patch(  # test-quality-ok: same function-body import, no injection seam
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_proxy_logging,
     ):
         mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
         mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
@@ -2393,3 +2399,81 @@ async def test_async_post_call_failure_hook_persists_no_raw_model_on_an_unknown_
         == "/chat/completions: Invalid model name passed in. Call `/v1/models` to view available models for your key."
     )
     assert error_information["error_class"] == "ProxyModelNotFoundError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_path", ["prepared", "deferred_stream", "proxy_only"])
+async def test_failure_chain_preserves_archive_identity(monkeypatch: pytest.MonkeyPatch, failure_path: str) -> None:
+    import json
+    from typing import Final
+
+    import litellm
+    from litellm.caching.caching import DualCache
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.proxy._types import ProxyErrorTypes
+    from litellm.proxy.utils import ProxyLogging
+
+    started: Final = datetime(2025, 1, 2, 3, 4, 5)
+    error: Final = RuntimeError("stream interrupted")
+    logging_obj: Final = Logging(
+        model="test-model",
+        messages=[],
+        stream=True,
+        call_type="anthropic_messages",
+        start_time=started,
+        litellm_call_id="failure-call",
+        function_id="failure-function",
+    )
+    logging_obj.record_partial_usage_for_failure(Usage(prompt_tokens=12, completion_tokens=3, total_tokens=15), 0.125)
+    monkeypatch.setattr(litellm, "cold_storage_custom_logger", "s3")
+    monkeypatch.setattr(litellm, "callbacks", [_ProxyDBLogger()])
+    monkeypatch.setattr(litellm, "failure_callback", [])
+    monkeypatch.setattr(litellm, "_async_failure_callback", [])
+    proxy_logging: Final = ProxyLogging(user_api_key_cache=DualCache())
+    proxy_logging.alert_types = []
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", proxy_logging)
+    data: Final = {"model": "test-model", "metadata": {}, "litellm_call_id": "failure-call"}
+    if failure_path != "proxy_only":
+        data["litellm_logging_obj"] = logging_obj
+    if failure_path == "prepared":
+        logging_obj._failure_handler_helper_fn(error, "original traceback")
+    with patch(  # test-quality-ok: intercept the database boundary; execute the real outer hook and payload builder
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as writer:
+        await proxy_logging.post_call_failure_hook(
+            request_data=data,
+            original_exception=error,
+            user_api_key_dict=UserAPIKeyAuth(
+                request_route="/v1/models" if failure_path == "proxy_only" else "/v1/messages"
+            ),
+            error_type=ProxyErrorTypes.auth_error if failure_path == "proxy_only" else None,
+            route="/v1/models" if failure_path == "proxy_only" else "/v1/messages",
+            traceback_str="original traceback",
+        )
+    writer.assert_awaited_once()
+    args: Final = writer.call_args.kwargs
+    payload: Final = get_logging_payload(
+        kwargs=args["kwargs"],
+        response_obj=args["completion_response"],
+        start_time=args["start_time"],
+        end_time=args["end_time"],
+    )
+    assert "litellm_logging_obj" not in data
+    assert payload["call_type"] == ("/v1/models" if failure_path == "proxy_only" else "anthropic_messages")
+    metadata: Final = json.loads(payload["metadata"])
+    assert metadata["cold_storage_object_key"]
+    assert metadata["cold_storage_object_key"] == data["standard_logging_object"]["metadata"]["cold_storage_object_key"]
+    if failure_path != "proxy_only":
+        assert args["start_time"] == started
+        assert payload["spend"] == 0.125
+        assert payload["prompt_tokens"] == 12
+        assert payload["completion_tokens"] == 3
+        assert metadata["cold_storage_object_key"] == "2025-01-02/time-03-04-05-000000_failure-call.json"
+        assert logging_obj.model_call_details["traceback_exception"] == "original traceback"
+        await logging_obj.dispatch_failure_handlers(error, "original traceback", prefer_async_handlers=True)
+        archived: Final = logging_obj.model_call_details["standard_logging_object"]
+        assert archived["metadata"]["cold_storage_object_key"] == metadata["cold_storage_object_key"]
+        assert archived["response_cost"] == payload["spend"]
+        assert archived["prompt_tokens"] == payload["prompt_tokens"]
+        assert archived["completion_tokens"] == payload["completion_tokens"]
