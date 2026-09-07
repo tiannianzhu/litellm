@@ -83,7 +83,7 @@ from litellm.proxy._types import (
     SpendLogsRouterMetadata,
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
-from litellm.proxy.spend_tracking.spend_log_error_logger import spend_log_error
+from litellm.proxy.spend_tracking.spend_log_error_logger import should_suppress_spend_log_tracebacks, spend_log_error
 from litellm.proxy.utils import PrismaClient, hash_token, query_raw_within_statement_timeout
 from litellm.responses.litellm_completion_transformation.compaction_items import (
     compaction_summary,
@@ -121,6 +121,7 @@ _TENANT_PROMPT_STORAGE_FIELDS: Final = ("user_api_key_metadata", "user_api_key_t
 _SPEND_LOGS_PRIVACY_METADATA_ADAPTER: Final[TypeAdapter[Mapping[str, object] | None]] = TypeAdapter(
     Mapping[str, object] | None
 )
+_SPEND_LOG_ERROR_INFORMATION_ADAPTER: Final = TypeAdapter(StandardLoggingPayloadErrorInformation)
 
 
 def _get_max_string_length_prompt_in_db() -> int:
@@ -259,8 +260,19 @@ def _stored_customer_identity(metadata: Mapping[object, object]) -> _CustomerIde
     return _CUSTOMER_IDENTITY_ADAPTER.validate_python(values)
 
 
+def _metadata_error_information(metadata: Mapping[str, object] | None) -> StandardLoggingPayloadErrorInformation | None:
+    error_information: Final = metadata.get("error_information") if metadata is not None else None
+    if not isinstance(error_information, Mapping):
+        return None
+    try:
+        return _SPEND_LOG_ERROR_INFORMATION_ADAPTER.validate_python(error_information)
+    except ValidationError:
+        return None
+
+
 def _get_spend_logs_metadata(
     metadata: dict | None,
+    error_information: StandardLoggingPayloadErrorInformation | None = None,
     applied_guardrails: list[str] | None = None,
     batch_models: list[str] | None = None,
     batch_successful_requests: int | None = None,
@@ -287,8 +299,27 @@ def _get_spend_logs_metadata(
     upstream_provider_metadata: Final[_UpstreamProviderMetadata] = (
         {"upstream_provider": upstream_provider} if upstream_provider is not None else {}
     )
+    selected_error_information: Final = (
+        error_information if error_information is not None else _metadata_error_information(metadata)
+    )
+    sanitized_error_information: Final = _sanitize_error_information_for_spend_logs(selected_error_information)
+    client_disconnect_information: Final = (
+        sanitized_error_information
+        if sanitized_error_information is not None
+        and sanitized_error_information.get("error_code") == "499"
+        and sanitized_error_information.get("error_class") == "ClientDisconnected"
+        and (metadata is None or metadata.get("status") != "failure")
+        else None
+    )
+    persisted_error_information: Final = sanitized_error_information if client_disconnect_information is None else None
+
     if metadata is None:
         return SpendLogsMetadata(
+            actor_agent_id=None,
+            target_agent_id=None,
+            billing_agent_id=None,
+            agent_execution_mode=None,
+            verified_human_user_id=None,
             user_api_key=None,
             user_api_key_alias=None,
             user_api_key_team_id=None,
@@ -304,7 +335,8 @@ def _get_spend_logs_metadata(
             additional_usage_values=None,
             applied_guardrails=None,
             status="success",
-            error_information=None,
+            error_information=persisted_error_information,
+            client_disconnect_information=client_disconnect_information,
             proxy_server_request=None,
             batch_models=None,
             batch_successful_requests=None,
@@ -314,6 +346,7 @@ def _get_spend_logs_metadata(
             model_map_information=None,
             usage_object=None,
             guardrail_information=None,
+            routing_decision=None,
             internal_call_origin=None,
             litellm_roi_estimator=False,
             billed_retry_attempt=False,
@@ -389,8 +422,11 @@ def _get_spend_logs_metadata(
     clean_metadata["litellm_overhead_time_ms"] = litellm_overhead_time_ms
     clean_metadata["cost_breakdown"] = cost_breakdown
     clean_metadata["litellm_call_id"] = litellm_call_id
-
-    return clean_metadata
+    return {
+        **clean_metadata,
+        "error_information": persisted_error_information,
+        "client_disconnect_information": client_disconnect_information,
+    }
 
 
 JOB_POLL_GUARDRAIL_COST_REQUEST_ID_SUFFIX: Final = "_guardrail_cost"
@@ -721,7 +757,10 @@ def get_logging_payload(
     completion_start_time: Final = TypeAdapter[datetime | None](datetime | None).validate_python(
         kwargs.get("completion_start_time", end_time)
     )
-    call_type: Final = kwargs.get("call_type")
+    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
+    call_type: Final = kwargs.get("call_type") or (
+        standard_logging_payload.get("call_type") if standard_logging_payload is not None else None
+    )
     cache_hit: Final = kwargs.get("cache_hit", False)
 
     # Convert response_obj to dict first
@@ -759,7 +798,6 @@ def get_logging_payload(
         usage = _combined_usage.model_dump()
 
     id = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs, metadata)
-    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
 
     end_user_id = get_end_user_id_for_cost_tracking(
         dict(litellm_params) if isinstance(litellm_params, Mapping) else litellm_params
@@ -872,12 +910,20 @@ def get_logging_payload(
     )
 
     # clean up litellm metadata
+    payload_error_information: Final = (
+        standard_logging_payload.get("error_information", None) if standard_logging_payload is not None else None
+    )
     clean_metadata = _get_spend_logs_metadata(
         persisted_metadata,
         is_silent_experiment=(
             standard_logging_payload is not None
             and "is_silent_experiment" in standard_logging_payload["metadata"]
             and standard_logging_payload["metadata"]["is_silent_experiment"]
+        ),
+        error_information=(
+            _scrub_raw_model_from_error_information(payload_error_information, raw_model)
+            if model_is_placeholdered
+            else payload_error_information
         ),
         applied_guardrails=(
             standard_logging_payload["metadata"].get("applied_guardrails", None)
@@ -1858,7 +1904,16 @@ def sanitize_error_information_for_spend_logs(
         if isinstance(original_exception, ProxyModelNotFoundError)
         else error_information
     )
-    sanitized = cast(dict, {**persisted})
+    sanitized = cast(
+        dict,
+        {
+            key: value
+            for key, value in persisted.items()
+            if key != "traceback" or not should_suppress_spend_log_tracebacks()
+        },
+    )
+    if not any(value is not None and value != "" for value in sanitized.values()):
+        return None
 
     if not stores_full_prompts_in_spend_logs(metadata):
         for field in ("error_message", "traceback"):

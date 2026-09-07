@@ -7423,18 +7423,16 @@ def test_get_error_information_for_logging_payload_client_disconnect():
         original_exception=None,
         error_str="existing error",
     )
+    assert error_information is not None
     assert error_information["error_code"] == "499"
     assert error_str == "existing error"
 
-    baseline = StandardLoggingPayloadSetup.get_error_information(
-        original_exception=None,
-    )
     error_information, error_str = StandardLoggingPayloadSetup.get_error_information_for_logging_payload(
         metadata={},
         original_exception=None,
         error_str=None,
     )
-    assert error_information == baseline
+    assert error_information is None
     assert error_str is None
 
 

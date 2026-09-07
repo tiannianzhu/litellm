@@ -1,21 +1,23 @@
 import asyncio
 import datetime
 import json
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import timezone
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import Request
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 import litellm
 import litellm.proxy.spend_tracking.spend_tracking_utils as spend_tracking_utils
+from litellm._logging import verbose_proxy_logger
 from litellm.constants import (
     CALLER_SESSION_ID_METADATA_KEY,
     INTERNAL_CALL_ORIGIN_METADATA_KEY,
@@ -1018,6 +1020,190 @@ def _make_standard_logging_payload_with_usage_object(usage_object: dict) -> Stan
             usage_object=None,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("request_call_type", "logged_call_type", "expected"),
+    [
+        (None, "acompletion", "acompletion"),
+        ("", "anthropic_messages", "anthropic_messages"),
+        (None, "aresponses", "aresponses"),
+        ("acompletion", "aresponses", "acompletion"),
+        (None, None, ""),
+    ],
+)
+def test_failure_payload_preserves_call_type(
+    request_call_type: str | None, logged_call_type: str | None, expected: str
+) -> None:
+    standard_log: Final = create_dummy_standard_logging_payload() if logged_call_type is not None else None
+    if standard_log is not None and logged_call_type is not None:
+        standard_log["call_type"] = logged_call_type
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": request_call_type,
+            "standard_logging_object": standard_log,
+            "litellm_params": {"metadata": {"status": "failure"}},
+        },
+        response_obj=RuntimeError("provider failed"),
+        start_time=now,
+        end_time=now,
+    )
+    assert payload["call_type"] == expected
+
+
+@pytest.mark.parametrize("status", ["success", "failure"])
+def test_get_logging_payload_separates_client_disconnect_from_request_failure(
+    status: Literal["success", "failure"],
+) -> None:
+    error_information: Final[StandardLoggingPayloadErrorInformation] = {
+        "error_code": "499",
+        "error_class": "ClientDisconnected",
+        "llm_provider": "hosted_vllm",
+        "traceback": "",
+        "error_message": "Client disconnected the request",
+    }
+    standard_logging_payload: Final[StandardLoggingPayload] = {
+        **create_dummy_standard_logging_payload(),
+        "status": status,
+        "error_information": error_information,
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+        "total_tokens": 7,
+    }
+    now: Final = datetime.datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "hosted_vllm/test-model",
+            "call_type": "anthropic_messages",
+            "litellm_params": {"metadata": {"user_api_key": "test-key", "status": status}},
+            "standard_logging_object": standard_logging_payload,
+            "response_cost": 0.01,
+        },
+        response_obj={
+            "id": "chatcmpl-disconnected",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        },
+        start_time=now,
+        end_time=now,
+    )
+
+    stored: Final = TypeAdapter(dict[str, JsonValue]).validate_json(payload["metadata"])
+    assert stored["error_information"] == (error_information if status == "failure" else None)
+    assert stored["client_disconnect_information"] == (error_information if status == "success" else None)
+    assert (payload["status"], payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (
+        status,
+        5,
+        2,
+        7,
+    )
+    assert payload["spend"] == 0.01
+
+
+@pytest.mark.parametrize(
+    ("metadata", "standard_error_information"),
+    [
+        (None, {"error_code": "499", "error_class": "ClientDisconnected"}),
+        ({"error_information": {"error_code": "499", "error_class": "ClientDisconnected"}}, None),
+    ],
+)
+def test_get_spend_logs_metadata_separates_client_disconnect_information(
+    metadata: dict[str, object] | None,
+    standard_error_information: StandardLoggingPayloadErrorInformation | None,
+):
+    stored: Final = _get_spend_logs_metadata(
+        metadata=metadata,
+        error_information=standard_error_information,
+    )
+
+    assert stored["error_information"] is None
+    assert stored["client_disconnect_information"] == {"error_code": "499", "error_class": "ClientDisconnected"}
+
+
+@pytest.mark.parametrize(
+    "error_information",
+    [
+        {},
+        {
+            "error_code": "",
+            "error_class": "",
+            "error_message": "",
+            "traceback": "",
+            "llm_provider": "",
+            "error_budget_limit": None,
+            "normalized_error": None,
+        },
+        {"traceback": "diagnostic traceback"},
+    ],
+)
+def test_get_logging_payload_drops_empty_error_information(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error_information: StandardLoggingPayloadErrorInformation,
+) -> None:
+    monkeypatch.setenv("LITELLM_SUPPRESS_SPEND_LOG_TRACEBACKS", "true")
+    caplog.set_level(logging.INFO, logger=verbose_proxy_logger.name)
+    standard_logging_payload: Final[StandardLoggingPayload] = {
+        **create_dummy_standard_logging_payload(),
+        "error_information": error_information,
+    }
+    now: Final = datetime.datetime(2025, 1, 1, tzinfo=timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": "acompletion",
+            "litellm_params": {"metadata": {"user_api_key": "test-key"}},
+            "standard_logging_object": standard_logging_payload,
+        },
+        response_obj={"id": "chatcmpl-success"},
+        start_time=now,
+        end_time=now,
+    )
+    stored: Final = TypeAdapter(dict[str, JsonValue]).validate_json(payload["metadata"])
+
+    assert payload["status"] == "success"
+    assert stored["error_information"] is None
+    assert stored["client_disconnect_information"] is None
+
+
+@pytest.mark.parametrize("error_information", [{"error_code": 499}, {"error_message": {"detail": "invalid"}}])
+def test_get_logging_payload_preserves_spend_with_invalid_error_information(
+    error_information: dict[str, object],
+) -> None:
+    now: Final = datetime.datetime(2025, 1, 1, tzinfo=timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": "acompletion",
+            "response_cost": 0.125,
+            "litellm_params": {"metadata": {"error_information": error_information}},
+        },
+        response_obj={
+            "id": "invalid-diagnostic",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+        },
+        start_time=now,
+        end_time=now,
+    )
+    stored: Final = TypeAdapter(dict[str, JsonValue]).validate_json(payload["metadata"])
+
+    assert (payload["spend"], payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (
+        0.125,
+        12,
+        3,
+        15,
+    )
+    assert payload["status"] == "success"
+    assert stored["error_information"] is None
+    assert stored["client_disconnect_information"] is None
+
+
+def test_sanitize_error_information_preserves_zero_budget_details() -> None:
+    error_information: Final[StandardLoggingPayloadErrorInformation] = {"error_budget_limit": 0.0}
+
+    assert sanitize_error_information_for_spend_logs(error_information) == error_information
 
 
 def test_get_logging_payload_maps_responses_api_cache_write_tokens_from_usage_object():
@@ -4734,6 +4920,12 @@ def test_get_spend_logs_metadata_keeps_master_key_alias_readable():
         }
     )
     assert meta["user_api_key"] == LITELLM_PROXY_MASTER_KEY_ALIAS
+
+
+def test_get_spend_logs_metadata_without_input_preserves_default_fields() -> None:
+    missing_input: Final = _get_spend_logs_metadata(None)
+    default_input: Final = _get_spend_logs_metadata({"status": "success"})
+    assert missing_input == default_input
 
 
 def test_get_spend_logs_metadata_keeps_user_agent():
