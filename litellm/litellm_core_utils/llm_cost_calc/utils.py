@@ -1731,8 +1731,24 @@ def generic_cost_per_token(
             # No breakdown at all, all tokens are text tokens
             text_tokens = usage.completion_tokens
             is_text_tokens_total = True
+    reasoning_rate: Final = (
+        _resolve_billed_reasoning_rate(
+            model_info=resolved_model_info,
+            usage=usage,
+            service_tier=service_tier,
+            completion_base_cost=completion_base_cost,
+            current_time=billing_time,
+        )
+        if reasoning_tokens > 0
+        else completion_base_cost
+    )
+    uniform_text_output_price: Final = (
+        audio_tokens == 0 and image_tokens == 0 and video_tokens == 0 and reasoning_rate == completion_base_cost
+    )
     ## TEXT COST
-    completion_cost = float(text_tokens) * completion_base_cost
+    completion_cost = (
+        float(usage.completion_tokens if uniform_text_output_price else text_tokens) * completion_base_cost
+    )
 
     ## AUDIO COST
     if not is_text_tokens_total and audio_tokens is not None and audio_tokens > 0:
@@ -1743,14 +1759,9 @@ def generic_cost_per_token(
         completion_cost += float(audio_tokens) * _output_cost_per_audio_token
 
     ## REASONING COST
-    if not is_text_tokens_total and reasoning_tokens and reasoning_tokens > 0:
-        completion_cost += float(reasoning_tokens) * _resolve_billed_reasoning_rate(
-            model_info=resolved_model_info,
-            usage=usage,
-            service_tier=service_tier,
-            completion_base_cost=completion_base_cost,
-            current_time=billing_time,
-        )
+    itemized_output_cost: Final = not uniform_text_output_price and not is_text_tokens_total
+    if itemized_output_cost and reasoning_tokens and reasoning_tokens > 0:
+        completion_cost += float(reasoning_tokens) * reasoning_rate
 
     ## IMAGE COST
     if not is_text_tokens_total and image_tokens and image_tokens > 0:
@@ -1830,11 +1841,21 @@ class TokenTypeCostBreakdown:
     differently-argued way. None when the model's pricing could not be resolved."""
 
 
-def _reasoning_token_count(usage: Usage) -> int:
-    parsed: Final = (
-        parse_completion_tokens_details(usage)["reasoning_tokens"] if usage.completion_tokens_details is not None else 0
+def _reasoning_token_count(usage: Usage, rates: BilledTokenRates) -> int:
+    parsed: Final = parse_completion_tokens_details(usage) if usage.completion_tokens_details is not None else None
+    reasoning_tokens: Final = (parsed["reasoning_tokens"] if parsed is not None else 0) or _coerce_token_count(
+        getattr(usage, "reasoning_tokens", 0)
     )
-    return parsed or _coerce_token_count(getattr(usage, "reasoning_tokens", 0))
+    if rates.output_cost_per_reasoning_token != rates.output_cost_per_token:
+        return reasoning_tokens
+    has_output_modalities: Final = (
+        parsed["audio_tokens"] != 0 or parsed["image_tokens"] != 0 or parsed["video_tokens"] != 0
+        if parsed is not None
+        else False
+    )
+    if has_output_modalities:
+        return reasoning_tokens
+    return min(max(0, reasoning_tokens), max(0, usage.completion_tokens))
 
 
 def _cache_token_counts(usage: Usage) -> tuple[int, int, int, CacheCreationTokenDetails | None]:
@@ -2028,7 +2049,7 @@ def get_token_type_cost_breakdown(
         )
     )
     return TokenTypeCostBreakdown(
-        reasoning_cost=float(_reasoning_token_count(usage)) * rates.output_cost_per_reasoning_token,
+        reasoning_cost=float(_reasoning_token_count(usage, rates)) * rates.output_cost_per_reasoning_token,
         cache_read_cost=(
             float(cache_read_tokens - cached_audio_tokens - cached_image_tokens) * rates.cache_read_input_token_cost
             + float(cached_audio_tokens) * rates.cache_read_input_audio_token_cost
