@@ -937,6 +937,7 @@ class BilledUsage(TypedDict):
     """The quantities one call bills on each meter, the pricing core's ``TokenUsage`` document."""
 
     prompt_tokens: ReadOnly[int]
+    reported_completion_tokens: ReadOnly[int]
     input: ReadOnly[ModalityCounts]
     cache_read: ReadOnly[CacheReadCounts]
     cache_write: ReadOnly[CacheWriteCounts]
@@ -974,6 +975,7 @@ def billed_usage(usage: Usage) -> BilledUsage:
     )
     return BilledUsage(
         prompt_tokens=_count(usage.prompt_tokens),
+        reported_completion_tokens=_count(usage.completion_tokens),
         input=ModalityCounts(
             text=_count(prompt["text_tokens"]),
             audio=_count(prompt["audio_tokens"]),
@@ -1119,11 +1121,21 @@ class TokenTypeCostBreakdown:
     differently-argued way. None when the model's pricing could not be resolved."""
 
 
-def _reasoning_token_count(usage: Usage) -> int:
-    parsed: Final = (
-        parse_completion_tokens_details(usage)["reasoning_tokens"] if usage.completion_tokens_details is not None else 0
+def _reasoning_token_count(usage: Usage, rates: BilledTokenRates) -> int:
+    parsed: Final = parse_completion_tokens_details(usage) if usage.completion_tokens_details is not None else None
+    reasoning_tokens: Final = (parsed["reasoning_tokens"] if parsed is not None else 0) or _coerce_token_count(
+        getattr(usage, "reasoning_tokens", 0)
     )
-    return parsed or _coerce_token_count(getattr(usage, "reasoning_tokens", 0))
+    if rates.output_cost_per_reasoning_token != rates.output_cost_per_token:
+        return reasoning_tokens
+    has_output_modalities: Final = (
+        parsed["audio_tokens"] != 0 or parsed["image_tokens"] != 0 or parsed["video_tokens"] != 0
+        if parsed is not None
+        else False
+    )
+    if has_output_modalities:
+        return reasoning_tokens
+    return min(max(0, reasoning_tokens), max(0, usage.completion_tokens))
 
 
 def _cache_token_counts(usage: Usage) -> tuple[int, int, int, CacheCreationTokenDetails | None]:
@@ -1295,7 +1307,7 @@ def get_token_type_cost_breakdown(
         )
     )
     return TokenTypeCostBreakdown(
-        reasoning_cost=float(_reasoning_token_count(usage)) * rates.output_cost_per_reasoning_token,
+        reasoning_cost=float(_reasoning_token_count(usage, rates)) * rates.output_cost_per_reasoning_token,
         cache_read_cost=(
             float(cache_read_tokens - cached_audio_tokens - cached_image_tokens) * rates.cache_read_input_token_cost
             + float(cached_audio_tokens) * rates.cache_read_input_audio_token_cost

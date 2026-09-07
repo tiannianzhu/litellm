@@ -124,12 +124,23 @@ pub(super) fn breakdown(rates: &BilledRates, usage: &TokenUsage, flat_writes: bo
             + writes.one_hour as f64 * rates.cache_write_one_hour
             + writes.twelve_hours as f64 * rates.cache_write_twelve_hours
     };
+    let reasoning_tokens = match usage.reported_completion_tokens {
+        Some(total)
+            if rates.reasoning == rates.output
+                && usage.output.audio == 0
+                && usage.output.image == 0
+                && usage.output.video == 0 =>
+        {
+            usage.reasoning.min(total)
+        }
+        _ => usage.reasoning,
+    };
     Breakdown {
         cache_read: reads.text as f64 * rates.cache_read
             + reads.audio as f64 * rates.cache_read_audio
             + reads.image as f64 * rates.cache_read_image.unwrap_or(rates.cache_read),
         cache_creation,
-        reasoning: usage.reasoning as f64 * rates.reasoning,
+        reasoning: reasoning_tokens as f64 * rates.reasoning,
     }
 }
 

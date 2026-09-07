@@ -27,7 +27,7 @@ pub fn calculate(
     let completion = Billed::new(
         &quote,
         Side::Completion,
-        completion_charges(usage),
+        completion_charges(&quote, usage),
         &uplifts,
     );
     let lines: Vec<Line> = prompt.lines.into_iter().chain(completion.lines).collect();
@@ -102,9 +102,25 @@ fn prompt_charges(quote: &Quote<'_>, usage: &Usage) -> Vec<Vec<Charge>> {
     ]
 }
 
-fn completion_charges(usage: &Usage) -> Vec<Vec<Charge>> {
+fn completion_charges(quote: &Quote<'_>, usage: &Usage) -> Vec<Vec<Charge>> {
+    let tokens = |kind| usage.tokens.output.get(&kind).copied().unwrap_or(0);
+    let text_only = [TokenKind::Audio, TokenKind::Image, TokenKind::Video]
+        .into_iter()
+        .all(|kind| tokens(kind) == 0);
+    let same_rate = usage.tokens.reasoning == 0
+        || quote.rate(&Meter::TEXT_OUTPUT).is_some_and(|text| {
+            quote
+                .rate(&Meter::REASONING)
+                .is_some_and(|reasoning| reasoning.unit_price == text.unit_price)
+        });
+    if let Some(total) = usage
+        .reported_completion_tokens
+        .filter(|_| text_only && same_rate)
+    {
+        return vec![vec![(Meter::TEXT_OUTPUT, Quantity::Count(total))]];
+    }
     let output = |kind: TokenKind| {
-        let tokens = usage.tokens.output.get(&kind).copied().unwrap_or(0);
+        let tokens = tokens(kind);
         vec![(
             Meter::Output(OutputUnit::Token(kind)),
             Quantity::Count(tokens),

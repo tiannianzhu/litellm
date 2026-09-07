@@ -9,6 +9,8 @@ pub struct Usage {
     /// Prompt size as the provider reported it. Only picks `_above_Nk_tokens` bands, never billed.
     /// Filled even when the call bills characters, `0` when the provider reports none
     pub prompt_tokens: u64,
+    /// Inclusive output total, when the provider supplied it
+    pub reported_completion_tokens: Option<u64>,
     /// Billed token quantities by meter
     pub tokens: Tokens,
     /// Billed character quantities. Used only when the row's `billing.text_unit` is `Character`

@@ -217,6 +217,8 @@ pub struct TokensQuery {
 pub struct TokenUsage {
     /// Prompt size as reported, cache included. Only picks the band
     pub prompt_tokens: u64,
+    /// Inclusive output total, when the provider supplied it
+    pub reported_completion_tokens: Option<u64>,
     /// Uncached prompt tokens
     pub input: Modalities,
     pub cache_read: CacheReads,
@@ -331,6 +333,7 @@ impl TokenUsage {
         };
         Usage {
             prompt_tokens: self.prompt_tokens,
+            reported_completion_tokens: self.reported_completion_tokens,
             tokens: Tokens {
                 input: nonzero(self.input.by_kind()),
                 cache_read: [
@@ -401,7 +404,8 @@ impl TokenUsage {
 
     /// Completion tokens, reasoning included
     pub fn completion_total(&self) -> u64 {
-        self.output.total() + self.reasoning
+        self.reported_completion_tokens
+            .unwrap_or_else(|| self.output.total() + self.reasoning)
     }
 }
 
