@@ -77,6 +77,9 @@ if TYPE_CHECKING:
     from litellm.router import Router
 
 
+_SPEND_LOG_ERROR_INFORMATION_ADAPTER: Final = TypeAdapter(StandardLoggingPayloadErrorInformation)
+
+
 def _get_max_string_length_prompt_in_db() -> int:
     """
     Resolve prompt truncation threshold at runtime so values loaded later via
@@ -173,6 +176,7 @@ _STAMPED_METADATA_KEYS: Final = frozenset(
 
 def _get_spend_logs_metadata(
     metadata: dict | None,
+    error_information: StandardLoggingPayloadErrorInformation | None = None,
     applied_guardrails: list[str] | None = None,
     batch_models: list[str] | None = None,
     batch_successful_requests: int | None = None,
@@ -193,6 +197,25 @@ def _get_spend_logs_metadata(
     azure_spillover: AzureSpillover | None = None,
     used_client_oauth_token: bool | None = None,
 ) -> SpendLogsMetadata:
+    metadata_error_information: Final[object] = metadata.get("error_information") if metadata is not None else None
+    selected_error_information: Final = (
+        error_information
+        if error_information is not None
+        else _SPEND_LOG_ERROR_INFORMATION_ADAPTER.validate_python(metadata_error_information)
+        if isinstance(metadata_error_information, dict)
+        else None
+    )
+    sanitized_error_information: Final = _sanitize_error_information_for_spend_logs(selected_error_information)
+    client_disconnect_information: Final = (
+        sanitized_error_information
+        if sanitized_error_information is not None
+        and sanitized_error_information.get("error_code") == "499"
+        and sanitized_error_information.get("error_class") == "ClientDisconnected"
+        and (metadata is None or metadata.get("status") != "failure")
+        else None
+    )
+    persisted_error_information: Final = sanitized_error_information if client_disconnect_information is None else None
+
     if metadata is None:
         return SpendLogsMetadata(
             user_api_key=None,
@@ -209,7 +232,8 @@ def _get_spend_logs_metadata(
             additional_usage_values=None,
             applied_guardrails=None,
             status="success",
-            error_information=None,
+            error_information=persisted_error_information,
+            client_disconnect_information=client_disconnect_information,
             proxy_server_request=None,
             batch_models=None,
             batch_successful_requests=None,
@@ -282,8 +306,11 @@ def _get_spend_logs_metadata(
     clean_metadata["litellm_overhead_time_ms"] = litellm_overhead_time_ms
     clean_metadata["cost_breakdown"] = cost_breakdown
     clean_metadata["litellm_call_id"] = litellm_call_id
-
-    return clean_metadata
+    return {
+        **clean_metadata,
+        "error_information": persisted_error_information,
+        "client_disconnect_information": client_disconnect_information,
+    }
 
 
 BATCH_COST_REQUEST_ID_SUFFIX: Final = "_batch_cost"
@@ -525,7 +552,10 @@ def get_logging_payload(
     litellm_params: Final = kwargs.get("litellm_params", {})
     metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
     completion_start_time: Final = kwargs.get("completion_start_time", end_time)
-    call_type: Final = kwargs.get("call_type")
+    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
+    call_type: Final = kwargs.get("call_type") or (
+        standard_logging_payload.get("call_type") if standard_logging_payload is not None else None
+    )
     cache_hit: Final = kwargs.get("cache_hit", False)
 
     # Convert response_obj to dict first
@@ -556,7 +586,6 @@ def get_logging_payload(
         usage = _combined_usage.model_dump()
 
     id = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs)
-    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
 
     end_user_id = get_end_user_id_for_cost_tracking(litellm_params)
 
@@ -657,8 +686,16 @@ def get_logging_payload(
     )
 
     # clean up litellm metadata
+    payload_error_information: Final = (
+        standard_logging_payload.get("error_information", None) if standard_logging_payload is not None else None
+    )
     clean_metadata = _get_spend_logs_metadata(
         persisted_metadata,
+        error_information=(
+            _scrub_raw_model_from_error_information(payload_error_information, raw_model)
+            if model_is_placeholdered
+            else payload_error_information
+        ),
         applied_guardrails=(
             standard_logging_payload["metadata"].get("applied_guardrails", None)
             if standard_logging_payload is not None
@@ -1440,7 +1477,7 @@ def sanitize_error_information_for_spend_logs(
     Scoped to the spend-log path — OTEL/Datadog/etc. callbacks still receive
     the untruncated error per ``LITELLM_TRUNCATION_DB_SAFEGUARD_NOTE``.
     """
-    if error_information is None:
+    if error_information is None or not any(value is not None and value != "" for value in error_information.values()):
         return None
 
     persisted: Final = (

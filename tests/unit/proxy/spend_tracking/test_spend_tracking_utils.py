@@ -4,18 +4,18 @@ import json
 from collections.abc import Callable, Mapping
 from datetime import timezone
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 import litellm
 import litellm.constants as litellm_constants
 import litellm.proxy.spend_tracking.spend_tracking_utils as spend_tracking_utils
 from litellm.constants import LITELLM_TRUNCATED_PAYLOAD_FIELD, LITELLM_TRUNCATION_DB_SAFEGUARD_NOTE, LITTELM_CLI_SERVICE_ACCOUNT_NAME, LITTELM_INTERNAL_HEALTH_SERVICE_ACCOUNT_NAME, MAX_SPEND_LOG_MODEL_NAME_LENGTH, REDACTED_BY_LITELM_STRING, SESSION_ID_OMITTED_METADATA_KEY, UNKNOWN_MODEL_SPEND_LOG_MODEL
-from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
+from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup, create_dummy_standard_logging_payload
 from litellm.llms.base_llm.ocr.transformation import OCRResponse, OCRUsageInfo
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsMetadataFields, SpendLogsPayload, UserAPIKeyAuth
@@ -475,6 +475,153 @@ def _make_standard_logging_payload_with_usage_object(usage_object: dict) -> Stan
             usage_object=None,
         ),
     )
+
+
+@pytest.mark.parametrize(
+    ("request_call_type", "logged_call_type", "expected"),
+    [
+        (None, "acompletion", "acompletion"),
+        ("", "anthropic_messages", "anthropic_messages"),
+        (None, "aresponses", "aresponses"),
+        ("acompletion", "aresponses", "acompletion"),
+        (None, None, ""),
+    ],
+)
+def test_failure_payload_preserves_call_type(
+    request_call_type: str | None, logged_call_type: str | None, expected: str
+) -> None:
+    standard_log: Final = create_dummy_standard_logging_payload() if logged_call_type is not None else None
+    if standard_log is not None and logged_call_type is not None:
+        standard_log["call_type"] = logged_call_type
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": request_call_type,
+            "standard_logging_object": standard_log,
+            "litellm_params": {"metadata": {"status": "failure"}},
+        },
+        response_obj=RuntimeError("provider failed"),
+        start_time=now,
+        end_time=now,
+    )
+    assert payload["call_type"] == expected
+
+
+@pytest.mark.parametrize("status", ["success", "failure"])
+def test_get_logging_payload_separates_client_disconnect_from_request_failure(
+    status: Literal["success", "failure"],
+) -> None:
+    error_information: Final[StandardLoggingPayloadErrorInformation] = {
+        "error_code": "499",
+        "error_class": "ClientDisconnected",
+        "llm_provider": "hosted_vllm",
+        "traceback": "",
+        "error_message": "Client disconnected the request",
+    }
+    standard_logging_payload: Final[StandardLoggingPayload] = {
+        **create_dummy_standard_logging_payload(),
+        "status": status,
+        "error_information": error_information,
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+        "total_tokens": 7,
+    }
+    now: Final = datetime.datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "hosted_vllm/test-model",
+            "call_type": "anthropic_messages",
+            "litellm_params": {"metadata": {"user_api_key": "test-key", "status": status}},
+            "standard_logging_object": standard_logging_payload,
+            "response_cost": 0.01,
+        },
+        response_obj={
+            "id": "chatcmpl-disconnected",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        },
+        start_time=now,
+        end_time=now,
+    )
+
+    stored: Final = TypeAdapter(dict[str, JsonValue]).validate_json(payload["metadata"])
+    assert stored["error_information"] == (error_information if status == "failure" else None)
+    assert stored["client_disconnect_information"] == (error_information if status == "success" else None)
+    assert (payload["status"], payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (
+        status,
+        5,
+        2,
+        7,
+    )
+    assert payload["spend"] == 0.01
+
+
+@pytest.mark.parametrize(
+    ("metadata", "standard_error_information"),
+    [
+        (None, {"error_code": "499", "error_class": "ClientDisconnected"}),
+        ({"error_information": {"error_code": "499", "error_class": "ClientDisconnected"}}, None),
+    ],
+)
+def test_get_spend_logs_metadata_separates_client_disconnect_information(
+    metadata: dict[str, object] | None,
+    standard_error_information: StandardLoggingPayloadErrorInformation | None,
+):
+    stored: Final = _get_spend_logs_metadata(
+        metadata=metadata,
+        error_information=standard_error_information,
+    )
+
+    assert stored["error_information"] is None
+    assert stored["client_disconnect_information"] == {"error_code": "499", "error_class": "ClientDisconnected"}
+
+
+@pytest.mark.parametrize(
+    "error_information",
+    [
+        {},
+        {
+            "error_code": "",
+            "error_class": "",
+            "error_message": "",
+            "traceback": "",
+            "llm_provider": "",
+            "error_budget_limit": None,
+            "normalized_error": None,
+        },
+    ],
+)
+def test_get_logging_payload_drops_empty_error_information(
+    error_information: StandardLoggingPayloadErrorInformation,
+) -> None:
+    standard_logging_payload: Final[StandardLoggingPayload] = {
+        **create_dummy_standard_logging_payload(),
+        "error_information": error_information,
+    }
+    now: Final = datetime.datetime(2025, 1, 1, tzinfo=timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": "acompletion",
+            "litellm_params": {"metadata": {"user_api_key": "test-key"}},
+            "standard_logging_object": standard_logging_payload,
+        },
+        response_obj={"id": "chatcmpl-success"},
+        start_time=now,
+        end_time=now,
+    )
+    stored: Final = TypeAdapter(dict[str, JsonValue]).validate_json(payload["metadata"])
+
+    assert payload["status"] == "success"
+    assert stored["error_information"] is None
+    assert stored["client_disconnect_information"] is None
+
+
+def test_sanitize_error_information_preserves_zero_budget_details() -> None:
+    error_information: Final[StandardLoggingPayloadErrorInformation] = {"error_budget_limit": 0.0}
+
+    assert sanitize_error_information_for_spend_logs(error_information) == error_information
 
 
 def test_get_logging_payload_maps_responses_api_cache_write_tokens_from_usage_object():

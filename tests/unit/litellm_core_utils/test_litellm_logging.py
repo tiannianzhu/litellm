@@ -5758,6 +5758,14 @@ def test_get_error_information_for_logging_payload_ignores_spoofed_disconnect_wi
     assert error_str == "provider failure"
 
 
+def test_successful_logging_payload_has_no_error_information() -> None:
+    from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
+
+    assert StandardLoggingPayloadSetup.get_error_information_for_logging_payload(
+        metadata={}, original_exception=None, error_str=None
+    ) == (None, None)
+
+
 def test_get_error_information_for_logging_payload_client_disconnect():
     from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
 
@@ -5779,18 +5787,16 @@ def test_get_error_information_for_logging_payload_client_disconnect():
         original_exception=None,
         error_str="existing error",
     )
+    assert error_information is not None
     assert error_information["error_code"] == "499"
     assert error_str == "existing error"
 
-    baseline = StandardLoggingPayloadSetup.get_error_information(
-        original_exception=None,
-    )
     error_information, error_str = StandardLoggingPayloadSetup.get_error_information_for_logging_payload(
         metadata={},
         original_exception=None,
         error_str=None,
     )
-    assert error_information == baseline
+    assert error_information is None
     assert error_str is None
 
 

@@ -4332,6 +4332,7 @@ class SpendLogsMetadata(TypedDict):
     batch_successful_requests: int | None  # writable-ok: built by assignment like every sibling key in this TypedDict
     batch_failed_requests: int | None  # writable-ok: built by assignment like every sibling key in this TypedDict
     error_information: StandardLoggingPayloadErrorInformation | None
+    client_disconnect_information: ReadOnly[StandardLoggingPayloadErrorInformation | None]
     usage_object: dict | None
     model_map_information: StandardLoggingModelInformation | None
     cold_storage_object_key: str | None  # S3/GCS object key for cold storage retrieval
