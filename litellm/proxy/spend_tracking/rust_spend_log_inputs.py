@@ -6,7 +6,6 @@ from typing import Final
 
 import litellm
 from litellm._internal_context import reporting_nested_tool_call_failure
-from litellm._uuid import uuid
 from litellm.constants import BACKGROUND_INTERACTION_COST_POLLING_ENABLED
 from litellm.integrations.custom_logger_v2.field_sources import HookArgs
 from litellm.litellm_core_utils.batch_utils import defers_batch_cost
@@ -122,7 +121,6 @@ def _row_input(kwargs: Mapping[str, object], response: object, start_time: datet
             end_time,
             get_llm_router(),
             time.time(),
-            str(uuid.uuid4()),  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]  # litellm's uuid shim is untyped
         )
     except Exception as error:  # noqa: BLE001  # update_database logs a row it cannot build and still charges it
         return {"unbuildable": str(error)}

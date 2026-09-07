@@ -346,7 +346,8 @@ pub struct RowInput {
     /// `time.time()` when the row is built, for the cache-hit id suffix.
     pub(crate) now: f64,
     /// A fresh `uuid4`, the session of a request that carries none.
-    pub(crate) fallback_session_id: String,
+    pub(crate) fallback_session_id: Option<String>,
+    pub(crate) session_id: Option<Option<String>>,
     pub(crate) start_time: Timestamp,
     pub(crate) end_time: Timestamp,
     pub(crate) completion_start_time: Option<Timestamp>,
@@ -407,10 +408,8 @@ impl RowInput {
             unknown_model_error_message: rejected_as_unknown_model
                 .then(|| text_field(value, "unknown_model_error_message")),
             now: number_of(get_or_none(value, "now")).ok_or(RowError::Input("now"))?,
-            fallback_session_id: match get_or_none(value, "fallback_session_id") {
-                Value::Str(session) => session.clone(),
-                _ => return Err(RowError::Input("fallback_session_id")),
-            },
+            fallback_session_id: text_field(value, "fallback_session_id"),
+            session_id: get(value, "session_id").map(text_of),
             start_time: Timestamp::parse(required(value, "start_time")?, "start_time")?,
             end_time: Timestamp::parse(required(value, "end_time")?, "end_time")?,
             completion_start_time: match get_or_none(value, "completion_start_time") {

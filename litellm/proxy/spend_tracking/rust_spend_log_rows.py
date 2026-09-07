@@ -15,7 +15,6 @@ from pydantic import BaseModel, TypeAdapter
 from typing_extensions import TypeIs  # noqa: TID251  # TypeIs reaches typing only on 3.13
 
 import litellm
-from litellm._uuid import uuid
 from litellm.constants import (
     CALLER_SESSION_ID_METADATA_KEY,
     DEFAULT_MAX_RECURSE_DEPTH,
@@ -38,6 +37,7 @@ from litellm.litellm_core_utils.secret_redaction import (
 )
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsPayload
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
+from litellm.proxy.spend_tracking.spend_log_error_logger import should_suppress_spend_log_tracebacks
 from litellm.proxy.spend_tracking.spend_logs_ledger_setting import spend_logs_ledger_enabled
 from litellm.rust_bridge import _native
 from litellm.types.proxy.spend_log_rows import LedgerColumns, NativeSpendLogRow
@@ -315,7 +315,7 @@ def spend_log_row_input(
     end_time: datetime,
     llm_router: "Router | None",
     now: float,
-    fallback_session_id: str,
+    fallback_session_id: str | None = None,
 ) -> Mapping[str, object]:
     from litellm.proxy.spend_tracking.spend_tracking_utils import (
         _adapter_route_call_type,  # pyright: ignore[reportPrivateUsage]  # the route table lookup stays with the route table
@@ -324,8 +324,11 @@ def spend_log_row_input(
         _snapshotless_cost_breakdown,  # pyright: ignore[reportPrivateUsage]  # validated against the CostBreakdown type
         _string_or_empty,  # pyright: ignore[reportPrivateUsage]  # the router lookup key is read the logging payload's way
         get_spend_logs_id,
+        is_spend_log_client_disconnect,
         is_unmarked_agentic_loop,
         should_store_prompts_and_responses_in_spend_logs,
+        spend_log_error_information,
+        stored_spend_log_session,
     )
 
     response_obj_dict: Final[dict[str, object]] = (  # mutable-ok: the response dict main's extractors take
@@ -346,9 +349,20 @@ def spend_log_row_input(
         else request_metadata
     )
     completion_start_time: Final = _COMPLETION_START_TIME.validate_python(kwargs.get("completion_start_time", end_time))
-    call_type: Final = kwargs.get("call_type")
-    usage: Final = _final_usage(kwargs, _usage(call_type, metadata, response, response_obj_dict))
     payload: Final = _str_mapping(kwargs.get("standard_logging_object", None))
+    call_type: Final = kwargs.get("call_type") or (payload.get("call_type") if payload is not None else None)
+    usage: Final = _final_usage(kwargs, _usage(call_type, metadata, response, response_obj_dict))
+    error: Final = spend_log_error_information(
+        payload if payload is not None and payload.get("error_information") is not None else metadata
+    )
+    suppress_traceback: Final = should_suppress_spend_log_tracebacks()
+    error_fields: Final = {
+        key: value for key, value in (error or {}).items() if key != "traceback" or not suppress_traceback
+    }
+    persisted_error: Final = (
+        _bounded(error_fields) if any(value not in (None, "") for value in error_fields.values()) else None
+    )
+    client_disconnect: Final = is_spend_log_client_disconnect(error, metadata.get("status"))
     payload_metadata: Final = _str_mapping(payload.get("metadata")) if payload is not None else None
     hidden_params: Final = _str_mapping(payload.get("hidden_params")) if payload is not None else None
     dynamic_params: Final = _str_mapping(kwargs.get("standard_callback_dynamic_params"))
@@ -385,11 +399,16 @@ def spend_log_row_input(
         else None,
         "now": now,
         "fallback_session_id": fallback_session_id,
+        "session_id": stored_spend_log_session(kwargs, metadata, payload),
         "start_time": _timestamp(start_time),
         "end_time": _timestamp(end_time),
         "completion_start_time": _timestamp(completion_start_time) if completion_start_time is not None else None,
         "usage": _bounded(usage),
-        "metadata": _metadata(metadata),
+        "metadata": {
+            **_metadata(metadata),
+            "error_information": None if client_disconnect else persisted_error,
+            "client_disconnect_information": persisted_error if client_disconnect else None,
+        },
         "litellm_params": {
             **_projected(litellm_params, _LITELLM_PARAMS_KEYS),
             **(_proxy_server_request(litellm_params) if stores_prompts else {}),
@@ -455,7 +474,7 @@ def current_spend_log_row_input(
     end_time: datetime,
     llm_router: "Router | None",
 ) -> Mapping[str, object]:
-    return spend_log_row_input(kwargs, response_obj, start_time, end_time, llm_router, time.time(), str(uuid.uuid4()))
+    return spend_log_row_input(kwargs, response_obj, start_time, end_time, llm_router, time.time())
 
 
 def encode_row_input(row_input: Mapping[str, object]) -> bytes:

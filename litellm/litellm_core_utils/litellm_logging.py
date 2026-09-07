@@ -8915,7 +8915,10 @@ class StandardLoggingPayloadSetup:
         metadata: Mapping[str, object],
         original_exception: Exception | None,
         error_str: str | None,
-    ) -> tuple[StandardLoggingPayloadErrorInformation, str | None]:
+    ) -> tuple[StandardLoggingPayloadErrorInformation | None, str | None]:
+        if original_exception is None and not metadata.get("client_disconnected"):
+            return None, error_str
+
         error_information = StandardLoggingPayloadSetup.get_error_information(
             original_exception=original_exception,
         )

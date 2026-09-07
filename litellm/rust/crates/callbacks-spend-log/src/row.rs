@@ -648,6 +648,13 @@ pub(crate) fn build(
         ),
     );
 
+    if let Some(information) = get(&persisted_metadata, "client_disconnect_information") {
+        clean.set(
+            "client_disconnect_information",
+            builder.sanitize_error_information(information, None, input),
+        );
+    }
+
     let request_id = if input.cache_hit == Some(true) || input.served_from_cache {
         let base = input.request_id.as_deref().unwrap_or("None");
         Some(format!(
@@ -771,17 +778,18 @@ fn session_id(
     {
         return Some(caller);
     }
+    if let Some(session) = &input.session_id {
+        return session.clone();
+    }
     if let Some(payload) = &input.payload
         && let Some(trace_id) = payload.field("trace_id")
         && !matches!(trace_id, Value::None)
     {
         return Some(to_str(trace_id));
     }
-    Some(
-        input
-            .kwargs
-            .litellm_trace_id
-            .clone()
-            .unwrap_or_else(|| input.fallback_session_id.clone()),
-    )
+    input
+        .kwargs
+        .litellm_trace_id
+        .clone()
+        .or_else(|| input.fallback_session_id.clone())
 }

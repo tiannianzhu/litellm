@@ -92,7 +92,7 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     is_unmarked_agentic_loop,
     redact_logged_api_key,
     requester_ip_address_logging_disabled,
-    sanitize_error_information_for_spend_logs,
+    spend_log_error_information,
     stores_latest_turn_only,
 )
 from litellm.responses.litellm_completion_transformation.compaction_items import (
@@ -752,7 +752,10 @@ def logging_payload(
     completion_start_time: Final = TypeAdapter[datetime | None](datetime | None).validate_python(
         kwargs.get("completion_start_time", end_time)
     )
-    call_type: Final = kwargs.get("call_type")
+    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
+    call_type: Final = kwargs.get("call_type") or (
+        standard_logging_payload.get("call_type") if standard_logging_payload is not None else None
+    )
     cache_hit: Final = kwargs.get("cache_hit", False)
 
     # Convert response_obj to dict first
@@ -790,7 +793,6 @@ def logging_payload(
         usage = _combined_usage.model_dump()
 
     id = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs, metadata)
-    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
 
     end_user_id = get_end_user_id_for_cost_tracking(
         dict(litellm_params) if isinstance(litellm_params, Mapping) else litellm_params
@@ -893,14 +895,6 @@ def logging_payload(
         call_type if isinstance(call_type, str) else None,
         cast("Mapping[str, object]", metadata),  # cast-ok: request metadata is an untyped dict here
     )
-    persisted_metadata: Final = (
-        {
-            **metadata,
-            "error_information": _scrub_raw_model_from_error_information(metadata.get("error_information"), raw_model),
-        }
-        if model_is_placeholdered
-        else metadata
-    )
     litellm_call_id: Final = cast(
         str | None,
         kwargs.get("litellm_call_id") or litellm_params.get("litellm_call_id"),
@@ -908,8 +902,14 @@ def logging_payload(
 
     no_log: Final = spend_tracking_utils.is_no_log_call(kwargs)
     # clean up litellm metadata
+    standard_error: Final = standard_logging_payload.get("error_information") if standard_logging_payload else None
+    selected_error: Final = standard_error if standard_error is not None else spend_log_error_information(metadata)
     clean_metadata = _get_spend_logs_metadata(
-        persisted_metadata,
+        metadata,
+        error_information=(
+            _scrub_raw_model_from_error_information(selected_error, raw_model) if model_is_placeholdered else selected_error
+        ),
+        original_exception=failure_exception,
         no_log=no_log,
         is_silent_experiment=(
             standard_logging_payload is not None
@@ -1041,12 +1041,6 @@ def logging_payload(
     drop_requester_ip_address: Final = requester_ip_address_logging_disabled()
     if drop_requester_ip_address:
         clean_metadata["requester_ip_address"] = None
-    clean_metadata["error_information"] = sanitize_error_information_for_spend_logs(
-        clean_metadata["error_information"],
-        original_exception=failure_exception,
-        metadata=_SPEND_LOGS_PRIVACY_METADATA_ADAPTER.validate_python(metadata),
-        no_log=no_log,
-    )
 
     if litellm.cache is None:
         cache_key = "Cache OFF"
