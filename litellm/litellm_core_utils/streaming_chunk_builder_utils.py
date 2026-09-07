@@ -1084,6 +1084,15 @@ class ChunkProcessor:
         except Exception:  # don't allow this failing to block a complete streaming response from being returned
             print_verbose("token_counter failed, assuming prompt tokens is 0")
             returned_usage.prompt_tokens = 0
+        fallback_reasoning_tokens: Final = max(
+            0,
+            (
+                completion_tokens_details.reasoning_tokens
+                if completion_tokens_details is not None and completion_tokens_details.reasoning_tokens is not None
+                else reasoning_tokens
+            )
+            or 0,
+        )
         returned_usage.completion_tokens = (
             completion_tokens
             if completion_tokens is not None
@@ -1093,7 +1102,7 @@ class ChunkProcessor:
                     text=completion_output,
                     count_response_tokens=True,  # count_response_tokens is a Flag to tell token counter this is a response, No need to add extra tokens we do for input messages
                 )
-                + (reasoning_tokens or 0)
+                + fallback_reasoning_tokens
             )
         )
         returned_usage.total_tokens = returned_usage.prompt_tokens + returned_usage.completion_tokens
