@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timezone
+from typing import Final
 
 import pytest
 from fastapi.testclient import TestClient
@@ -129,6 +130,37 @@ def test_reasoning_tokens_no_price_set(_local_model_cost_map):
         expected_completion_cost,
         10,
     )
+
+
+@pytest.mark.parametrize("reasoning_rate", [None, 4e-6])
+@pytest.mark.parametrize(
+    "completion_tokens,reasoning_tokens,text_tokens",
+    [(1000, 600, None), (1000, 1400, None), (1000, 1400, 100), (1000, 600, 1000), (0, 1400, None)],
+)
+def test_uniform_text_output_price_uses_completion_total(
+    completion_tokens: int, reasoning_tokens: int, text_tokens: int | None, reasoning_rate: float | None
+) -> None:
+    model_info: Final[ModelInfo] = {
+        "input_cost_per_token": 1e-6,
+        "output_cost_per_token": 4e-6,
+        "output_cost_per_reasoning_token": reasoning_rate,
+    }
+    usage: Final = Usage(
+        prompt_tokens=100,
+        completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetailsWrapper(
+            reasoning_tokens=reasoning_tokens, text_tokens=text_tokens
+        ),
+    )
+    original_usage: Final = usage.model_dump()
+
+    prompt_cost, completion_cost = generic_cost_per_token(
+        model="synthetic-model", usage=usage, custom_llm_provider="openai", model_info=model_info
+    )
+
+    assert prompt_cost == pytest.approx(100 * 1e-6)
+    assert completion_cost == pytest.approx(completion_tokens * 4e-6)
+    assert usage.model_dump() == original_usage
 
 
 def test_reasoning_tokens_gemini(_local_model_cost_map):
