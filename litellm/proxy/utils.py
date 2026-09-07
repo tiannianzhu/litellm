@@ -1585,7 +1585,12 @@ def _proxy_only_error_log_fields(
 
 
 def _failure_fields_to_lift(
-    request_data: Mapping[str, object], provider_billed: bool = False, dispatched_call_type: str | None = None
+    request_data: Mapping[str, object],
+    provider_billed: bool = False,
+    dispatched_call_type: str | None = None,
+    *,
+    original_exception: Exception | None = None,
+    traceback_str: str | None = None,
 ) -> Mapping[str, object]:
     """Failure-path callbacks run after ``litellm_logging_obj`` is popped from
     request_data (it is not serialisable), so the caller merges these fields
@@ -1597,6 +1602,15 @@ def _failure_fields_to_lift(
     if _logging_obj is None:
         return _EMPTY_LIFT
     _model_call_details: Final = getattr(_logging_obj, "model_call_details", {})
+    if (
+        isinstance(_logging_obj, Logging)
+        and original_exception is not None
+        and _model_call_details.get("combined_usage_object") is not None
+        and _model_call_details.get("standard_logging_object") is None
+    ):
+        _logging_obj._failure_handler_helper_fn(  # pyright: ignore[reportPrivateUsage]  # prepare the same payload used by deferred archive callbacks
+            original_exception, traceback_str or ""
+        )
     _first_handoff: Final = _model_call_details.get("first_api_call_start_time")
     _litellm_params: Final = getattr(_logging_obj, "litellm_params", None)
     _base_model: Final = get_base_model_from_metadata(model_call_details=_model_call_details)
@@ -1623,9 +1637,17 @@ def _failure_fields_to_lift(
         else ()
     )
     _entries: Final = (
-        ("start_time", _model_call_details.get("start_time")),
+        (
+            "call_type",
+            request_data.get("call_type")
+            or getattr(_logging_obj, "call_type", None)
+            or _model_call_details.get("call_type"),
+        ),
+        (
+            "start_time",
+            getattr(_logging_obj, "start_time", None) or _model_call_details.get("start_time"),
+        ),
         ("first_api_call_start_time", _first_handoff),
-        ("call_type", _model_call_details.get("call_type")),
         ("combined_usage_object", None if _usage_to_lift is None else _usage_to_lift[0]),
         ("response_cost", None if _usage_to_lift is None else (_usage_to_lift[1] or 0.0)),
         ("standard_logging_object", _model_call_details.get("standard_logging_object")),
@@ -3890,6 +3912,8 @@ class ProxyLogging:
                 request_data,
                 provider_billed=_provider_billed_the_failure(original_exception),
                 dispatched_call_type=dispatched_call_type or _call_type_for_route(user_api_key_dict.request_route),
+                original_exception=original_exception,
+                traceback_str=traceback_str,
             )
         )
 
@@ -4098,6 +4122,7 @@ class ProxyLogging:
                 api_key="",
             )
 
+            request_data["litellm_logging_obj"] = litellm_logging_obj
             await self._dispatch_proxy_only_failure_handlers(
                 litellm_logging_obj=litellm_logging_obj,
                 original_exception=original_exception,
