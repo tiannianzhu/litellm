@@ -916,16 +916,7 @@ class ChunkProcessor:
                 if usage_chunk_dict["completion_tokens_details"] is not None:
                     completion_tokens_details = usage_chunk_dict["completion_tokens_details"]
                 if hasattr(usage_chunk, "server_tool_use") and usage_chunk.server_tool_use is not None:
-                    # Coerce dict to ServerToolUse so downstream cost-calc code
-                    # (which accesses .web_search_requests as an attribute)
-                    # doesn't raise AttributeError. Some providers / streaming
-                    # paths leave server_tool_use as a plain dict on the chunk.
-                    if isinstance(usage_chunk.server_tool_use, dict):
-                        server_tool_use = ServerToolUse(**usage_chunk.server_tool_use)
-                    elif isinstance(usage_chunk.server_tool_use, ServerToolUse):
-                        server_tool_use = usage_chunk.server_tool_use
-                    else:
-                        server_tool_use = ServerToolUse.model_validate(usage_chunk.server_tool_use)
+                    server_tool_use = ServerToolUse.model_validate(usage_chunk.server_tool_use)
                 if usage_chunk_dict["prompt_tokens_details"] is not None:
                     chunk_web_search_requests: int | None = getattr(
                         usage_chunk_dict["prompt_tokens_details"],
@@ -1096,6 +1087,15 @@ class ChunkProcessor:
         except Exception:  # don't allow this failing to block a complete streaming response from being returned
             print_verbose("token_counter failed, assuming prompt tokens is 0")
             returned_usage.prompt_tokens = 0
+        fallback_reasoning_tokens: Final = max(
+            0,
+            (
+                completion_tokens_details.reasoning_tokens
+                if completion_tokens_details is not None and completion_tokens_details.reasoning_tokens is not None
+                else reasoning_tokens
+            )
+            or 0,
+        )
         returned_usage.completion_tokens = (
             completion_tokens
             if completion_tokens is not None
@@ -1105,7 +1105,7 @@ class ChunkProcessor:
                     text=completion_output,
                     count_response_tokens=True,  # count_response_tokens is a Flag to tell token counter this is a response, No need to add extra tokens we do for input messages
                 )
-                + (reasoning_tokens or 0)
+                + fallback_reasoning_tokens
             )
         )
         returned_usage.total_tokens = returned_usage.prompt_tokens + returned_usage.completion_tokens
