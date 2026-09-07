@@ -348,6 +348,115 @@ def test_reasoning_tokens_no_price_set(_local_model_cost_map):
     )
 
 
+@pytest.mark.parametrize("reasoning_rate", [None, 4e-6])
+@pytest.mark.parametrize(
+    "completion_tokens,reasoning_tokens,text_tokens",
+    [(1000, 600, None), (1000, 1400, None), (1000, 1400, 100), (1000, 600, 1000), (0, 1400, None)],
+)
+def test_uniform_text_output_price_uses_completion_total(
+    completion_tokens: int, reasoning_tokens: int, text_tokens: int | None, reasoning_rate: float | None
+) -> None:
+    model_info: Final[ModelInfo] = {
+        "input_cost_per_token": 1e-6,
+        "output_cost_per_token": 4e-6,
+        "output_cost_per_reasoning_token": reasoning_rate,
+    }
+    usage: Final = Usage(
+        prompt_tokens=100,
+        completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetailsWrapper(
+            reasoning_tokens=reasoning_tokens, text_tokens=text_tokens
+        ),
+    )
+    original_usage: Final = usage.model_dump()
+
+    prompt_cost, completion_cost = generic_cost_per_token(
+        model="synthetic-model", usage=usage, custom_llm_provider="openai", model_info=model_info
+    )
+
+    assert prompt_cost == pytest.approx(100 * 1e-6)
+    assert completion_cost == pytest.approx(completion_tokens * 4e-6)
+    assert usage.model_dump() == original_usage
+
+
+@pytest.mark.parametrize(("completion_tokens", "expected_reasoning_cost"), [(1000, 0.004), (0, 0.0)])
+def test_uniform_output_cost_breakdown_respects_completion_total(
+    monkeypatch: pytest.MonkeyPatch, completion_tokens: int, expected_reasoning_cost: float
+) -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.types.utils import ModelResponse
+
+    model: Final = "uniform-output-fixture"
+    pricing: Final[ModelInfo] = {
+        "litellm_provider": "openai",
+        "mode": "chat",
+        "input_cost_per_token": 1e-6,
+        "output_cost_per_token": 4e-6,
+    }
+    monkeypatch.setitem(litellm.model_cost, model, pricing)
+    monkeypatch.setitem(litellm.model_cost, f"openai/{model}", pricing)
+    usage: Final = Usage(
+        prompt_tokens=100,
+        completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetailsWrapper(reasoning_tokens=1400),
+    )
+    original_usage: Final = usage.model_dump()
+    response: Final = ModelResponse(model=model, usage=usage)
+    logging: Final = Logging(
+        model=model,
+        messages=[],
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="uniform-output-call",
+        function_id="uniform-output-function",
+    )
+    logging.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="openai")
+
+    cost: Final = litellm.completion_cost(
+        completion_response=response, model=model, custom_llm_provider="openai", litellm_logging_obj=logging
+    )
+
+    assert cost == pytest.approx(100 * 1e-6 + completion_tokens * 4e-6)
+    assert logging.cost_breakdown is not None
+    assert logging.cost_breakdown.get("output_cost") == pytest.approx(completion_tokens * 4e-6)
+    assert logging.cost_breakdown.get("reasoning_cost", 0.0) == pytest.approx(expected_reasoning_cost)
+    assert logging.cost_breakdown.get("total_cost") == pytest.approx(cost)
+    assert response.usage.model_dump() == original_usage
+
+
+@pytest.mark.parametrize(
+    ("reasoning_rate", "audio_tokens", "image_tokens", "video_tokens", "expected_reasoning_cost"),
+    [
+        (6e-6, 0, 0, 0, 0.00084),
+        (4e-6, 10, 0, 0, 0.00056),
+        (4e-6, 0, 10, 0, 0.00056),
+        (4e-6, 0, 0, 10, 0.00056),
+    ],
+)
+def test_separate_output_components_keep_their_reasoning_cost(
+    reasoning_rate: float, audio_tokens: int, image_tokens: int, video_tokens: int, expected_reasoning_cost: float
+) -> None:
+    usage: Final = Usage(
+        prompt_tokens=0,
+        completion_tokens=100,
+        completion_tokens_details=CompletionTokensDetailsWrapper(
+            reasoning_tokens=140, audio_tokens=audio_tokens, image_tokens=image_tokens, video_tokens=video_tokens
+        ),
+    )
+    breakdown: Final = get_token_type_cost_breakdown(
+        model="nonuniform-output-fixture",
+        custom_llm_provider="openai",
+        usage=usage,
+        model_info={
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 4e-6,
+            "output_cost_per_reasoning_token": reasoning_rate,
+        },
+    )
+    assert breakdown.reasoning_cost == pytest.approx(expected_reasoning_cost)
+
+
 def test_reasoning_tokens_gemini(_local_model_cost_map):
     model = "gemini-2.5-flash"
     custom_llm_provider = "gemini"
@@ -2955,10 +3064,10 @@ def test_token_type_cost_breakdown_is_provider_agnostic(
 
     usage = Usage(
         prompt_tokens=1000,
-        completion_tokens=2000,
-        total_tokens=3000,
+        completion_tokens=2000 + reasoning_tokens,
+        total_tokens=3000 + reasoning_tokens,
         completion_tokens_details=CompletionTokensDetailsWrapper(
-            reasoning_tokens=reasoning_tokens, text_tokens=2000 - reasoning_tokens
+            reasoning_tokens=reasoning_tokens, text_tokens=2000
         ),
         prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=cached_tokens, text_tokens=1000 - cached_tokens),
     )
