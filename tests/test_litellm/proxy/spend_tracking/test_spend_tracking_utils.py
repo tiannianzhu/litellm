@@ -20,6 +20,7 @@ from litellm.constants import (
     SESSION_ID_OMITTED_METADATA_KEY,
     UNKNOWN_MODEL_SPEND_LOG_MODEL,
 )
+from litellm.litellm_core_utils.litellm_logging import create_dummy_standard_logging_payload
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import SpendLogsPayload, UserAPIKeyAuth
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
@@ -48,6 +49,7 @@ from litellm.types.utils import (
     StandardLoggingMetadata,
     StandardLoggingModelInformation,
     StandardLoggingPayload,
+    StandardLoggingPayloadErrorInformation,
 )
 
 
@@ -468,6 +470,52 @@ def _make_standard_logging_payload_with_usage_object(usage_object: dict) -> Stan
             usage_object=None,
         ),
     )
+
+
+def test_get_logging_payload_preserves_standard_logging_client_disconnect_error_information():
+    standard_logging_payload: Final = create_dummy_standard_logging_payload()
+    error_information: Final = {
+        "error_code": "499",
+        "error_class": "ClientDisconnected",
+        "llm_provider": "hosted_vllm",
+        "traceback": "",
+        "error_message": "Client disconnected the request",
+    }
+    standard_logging_payload["error_information"] = error_information
+    now: Final = datetime.datetime.now(timezone.utc)
+
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "hosted_vllm/test-model",
+            "call_type": "anthropic_messages",
+            "litellm_params": {"metadata": {"user_api_key": "test-key"}},
+            "standard_logging_object": standard_logging_payload,
+        },
+        response_obj={"id": "chatcmpl-disconnected", "usage": {"prompt_tokens": 5, "completion_tokens": 0}},
+        start_time=now,
+        end_time=now,
+    )
+
+    assert json.loads(payload["metadata"])["error_information"] == error_information
+
+
+@pytest.mark.parametrize(
+    ("metadata", "standard_error_information"),
+    [
+        (None, {"error_code": "499", "error_class": "ClientDisconnected"}),
+        ({"error_information": {"error_code": "499", "error_class": "ClientDisconnected"}}, None),
+    ],
+)
+def test_get_spend_logs_metadata_preserves_client_disconnect_error_information(
+    metadata: dict[str, object] | None,
+    standard_error_information: StandardLoggingPayloadErrorInformation | None,
+):
+    error_information: Final = _get_spend_logs_metadata(
+        metadata=metadata,
+        error_information=standard_error_information,
+    )["error_information"]
+
+    assert error_information == {"error_code": "499", "error_class": "ClientDisconnected"}
 
 
 def test_get_logging_payload_maps_responses_api_cache_write_tokens_from_usage_object():
