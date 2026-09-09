@@ -1,6 +1,7 @@
 import asyncio
 import json
 import ssl
+import time
 from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -5880,6 +5881,7 @@ class BaseLLMHTTPHandler:
         tools: Final = optional_params.get("tools", [])
         depth, max_loops, fingerprints = self._get_agentic_loop_settings(kwargs=kwargs)
 
+        completed_at: Final = time.time()
         for callback in callbacks:
             if not isinstance(callback, CustomLogger):
                 continue
@@ -5929,6 +5931,7 @@ class BaseLLMHTTPHandler:
                     is not CustomLogger.async_build_chat_completion_agentic_loop_plan
                 )
                 if not build_plan_overridden:
+                    logging_obj.record_agentic_loop_response(response, completed_at)
                     return await callback.async_run_chat_completion_agentic_loop(
                         tools=tool_calls,
                         model=model,
@@ -5963,6 +5966,7 @@ class BaseLLMHTTPHandler:
                 if not plan.run_agentic_loop:
                     continue
 
+                logging_obj.record_agentic_loop_response(response, completed_at)
                 return await self._execute_chat_completion_agentic_plan(
                     plan=plan,
                     model=model,

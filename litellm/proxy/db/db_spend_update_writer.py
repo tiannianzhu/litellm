@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.caching import RedisCache
+from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import (
     DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
     DB_SPEND_UPDATE_JOB_NAME,
@@ -241,6 +242,8 @@ class DBSpendUpdateWriter:
         self.daily_org_spend_update_queue = DailySpendUpdateQueue()
         self.daily_tag_spend_update_queue = DailySpendUpdateQueue()
         self.window_spend_update_queue = WindowSpendUpdateQueue()
+        self._spend_log_admission_lock = asyncio.Lock()
+        self._recent_spend_log_admissions = InMemoryCache(max_size_in_memory=10_000, default_ttl=600)
 
     async def update_database(
         # LiteLLM management object fields
@@ -259,8 +262,8 @@ class DBSpendUpdateWriter:
     ) -> bool:
         """Record the request's spend, answering whether its cost still needs charging.
 
-        False only for a batch retrieve whose cost row another retrieve already wrote,
-        so the caller leaves the key, team, and user counters alone (LIT-7048).
+        False for duplicate ordinary callbacks retained by this writer, or a batch
+        retrieve whose cost row another retrieve already wrote.
         """
         from litellm.proxy.proxy_server import (
             disable_spend_logs,
@@ -270,6 +273,13 @@ class DBSpendUpdateWriter:
         from litellm.proxy.utils import ProxyUpdateSpend, hash_token
 
         try:
+            if (
+                kwargs is not None
+                and kwargs.get("websearch_short_circuit") is True
+                and kwargs.get("call_type") in (CallTypes.anthropic_messages.value, CallTypes.aanthropic_messages.value)
+                and response_cost == 0
+            ):
+                return
             verbose_proxy_logger.debug(
                 "Enters prisma db call, response_cost: %s, token: %s; user_id: %s; team_id: %s",
                 response_cost,
@@ -375,9 +385,14 @@ class DBSpendUpdateWriter:
             return await self._claim_batch_cost_spend_log(
                 payload=payload, prisma_client=prisma_client, disable_spend_logs=disable_spend_logs
             )
-        if disable_spend_logs is False:
-            await self._insert_spend_log_to_db(payload=payload, prisma_client=prisma_client)
-        return True
+        admission_key: Final = json.dumps((payload["request_id"], payload.get("status")))
+        async with self._spend_log_admission_lock:
+            if self._recent_spend_log_admissions.get_cache(admission_key) is True:
+                return False
+            if disable_spend_logs is False:
+                await self._insert_spend_log_to_db(payload=payload, prisma_client=prisma_client)
+            self._recent_spend_log_admissions.set_cache(admission_key, True)
+            return True
 
     async def _claim_batch_cost_spend_log(
         self, payload: SpendLogsPayload, prisma_client: "PrismaClient", disable_spend_logs: bool

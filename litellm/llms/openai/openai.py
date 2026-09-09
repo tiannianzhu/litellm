@@ -599,6 +599,8 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     )
 
                     if should_run:
+                        if isinstance(response, ModelResponse):
+                            logging_obj.record_agentic_loop_response(response, time.time())
                         # Second: Execute agentic loop
                         kwargs_with_provider = litellm_params.copy() if litellm_params else {}
                         kwargs_with_provider["custom_llm_provider"] = custom_llm_provider

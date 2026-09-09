@@ -526,6 +526,8 @@ class Logging(LiteLLMLoggingBaseClass):
         self.callback_duration_ms: float = 0.0
         self.stream = stream
         self.start_time = start_time  # log the call start time
+        self._agentic_loop_response: ModelResponse | None = None
+        self._async_success_in_progress = False
         self.call_type = call_type
         self.litellm_call_id = litellm_call_id
         self.litellm_trace_id: str = litellm_trace_id if litellm_trace_id else str(uuid.uuid4())
@@ -1994,12 +1996,42 @@ class Logging(LiteLLMLoggingBaseClass):
         stream: bool = False,
     ) -> bool:
         try:
+            if self._agentic_loop_response is not None and event_type in ("async_failure", "sync_failure"):
+                return False
             if self.model_call_details.get(f"has_logged_{event_type}", False) is True:
                 return False
 
             return True
         except Exception:
             return True
+
+    def record_agentic_loop_response(self, response: ModelResponse, completed_at: float) -> None:
+        """Log this completed model round before an agentic follow-up replaces its response."""
+        if self._agentic_loop_response is not None:
+            return
+
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+        recorded_response: Final = response.model_copy(deep=True)
+        end_time: Final = datetime.datetime.fromtimestamp(completed_at, tz=self.start_time.tzinfo)
+        self._agentic_loop_response = recorded_response
+        self.stream = False
+        self.model_call_details["stream"] = False
+
+        def enqueue_logging() -> None:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
+                async_coroutine=self.async_success_handler(
+                    result=recorded_response, start_time=self.start_time, end_time=end_time
+                )
+            )
+            self.handle_sync_success_callbacks_for_async_calls(
+                result=recorded_response, start_time=self.start_time, end_time=end_time
+            )
+
+        if self._defer_async_logging:
+            self._enqueue_deferred_logging = enqueue_logging
+        else:
+            enqueue_logging()
 
     def has_run_logging(
         self,
@@ -2509,6 +2541,8 @@ class Logging(LiteLLMLoggingBaseClass):
         cache_hit: bool | None = None,
         **kwargs: Any,  # kwargs-ok: forwarded from success_handler
     ) -> None:
+        if self._agentic_loop_response is not None and result is not self._agentic_loop_response:
+            return
         verbose_logger.debug("Logging Details LiteLLM-Success Call: Cache_hit=%s", cache_hit)
         if not self.should_run_logging(event_type="sync_success"):  # prevent double logging
             return
@@ -2930,11 +2964,19 @@ class Logging(LiteLLMLoggingBaseClass):
     ) -> None:
         """Restores trace_id/session_id contextvars once this attempt's own success
         logging (including any nested calls its callbacks trigger) is fully done."""
+        claim_success: Final = self.stream is not True
+        if claim_success and self._async_success_in_progress:
+            self._restore_correlation_context()
+            return
+        if claim_success:
+            self._async_success_in_progress = True
         try:
             return await self._async_success_handler_body(
                 result=result, start_time=start_time, end_time=end_time, cache_hit=cache_hit, **kwargs
             )
         finally:
+            if claim_success:
+                self._async_success_in_progress = False
             self._restore_correlation_context()
 
     async def _async_success_handler_body(
@@ -2948,6 +2990,8 @@ class Logging(LiteLLMLoggingBaseClass):
         """
         Implementing async callbacks, to handle asyncio event loop issues when custom integrations need to use async functions.
         """
+        if self._agentic_loop_response is not None and result is not self._agentic_loop_response:
+            return
         print_verbose(f"Logging Details LiteLLM-Async Success Call, cache_hit={cache_hit}")
         if not self._is_assembled_stream_success(result) and not self.should_run_logging(
             event_type="async_success"

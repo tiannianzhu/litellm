@@ -7200,3 +7200,140 @@ def test_get_additional_headers_survives_a_thread_growing_headers_mid_copy():
         assert copied["llm_provider-x-custom-1999"] == "1999"
 
     _run_while_a_thread_grows(headers, read, reads=300)
+
+
+class _AgenticLoopSnapshotCaptureLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.responses: list[ModelResponse] = []
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.responses.append(response_obj)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exception_raised", [False, True])
+async def test_agentic_loop_snapshot_deferred_logging(exception_raised: bool):
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.utils import _dispatch_success_logging
+
+    callback = _AgenticLoopSnapshotCaptureLogger()
+    start_time = datetime.datetime.now()
+    logging_obj = LitellmLogging(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Use the tool"}],
+        stream=True,
+        call_type=CallTypes.acompletion.value,
+        start_time=start_time,
+        litellm_call_id="agentic-loop-snapshot-call",
+        function_id="agentic-loop-snapshot-function",
+        dynamic_async_success_callbacks=[callback],
+    )
+    logging_obj.update_environment_variables(
+        litellm_params={"acompletion": True},
+        optional_params={},
+        custom_llm_provider="openai",
+    )
+    raw_response = ModelResponse(
+        id="raw-tool-call",
+        model="gpt-4o-mini",
+        usage={"prompt_tokens": 13, "completion_tokens": 5, "total_tokens": 18},
+    )
+    outer_final_response = ModelResponse(id="outer-final", model="gpt-4o-mini")
+    logging_obj._defer_async_logging = True
+    logging_obj.record_agentic_loop_response(raw_response, start_time.timestamp())
+    raw_response.usage.prompt_tokens = 999
+
+    await logging_obj.async_success_handler(
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+    )
+    assert callback.responses == []
+
+    _dispatch_success_logging(
+        logging_obj=logging_obj,
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+        is_completion_with_fallbacks=False,
+        is_litellm_internal_call=False,
+    )
+    ProxyBaseLLMRequestProcessing._flush_deferred_async_logging(logging_obj, exception_raised)
+    await asyncio.sleep(0)
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    if exception_raised:
+        assert logging_obj._enqueue_deferred_logging is None
+        assert callback.responses == []
+        return
+
+    assert [
+        (response.id, response.usage.prompt_tokens, response.usage.completion_tokens)
+        for response in callback.responses
+    ] == [("raw-tool-call", 13, 5)]
+    assert logging_obj.model_call_details["standard_logging_object"]["response"]["id"] == "raw-tool-call"
+
+    await logging_obj.async_success_handler(
+        result=outer_final_response,
+        start_time=start_time,
+        end_time=datetime.datetime.now(),
+    )
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    assert len(callback.responses) == 1
+
+
+class _BlockedSuccessLogger(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.responses: list[str] = []
+
+    async def async_logging_hook(self, kwargs, result, call_type):
+        self.entered.set()
+        await self.release.wait()
+        return kwargs, result
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self.responses.append(response_obj.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", [CallTypes.acompletion.value, CallTypes.aresponses.value])
+@pytest.mark.parametrize("cancel_first", [False, True])
+async def test_concurrent_success_logs_once_and_cancelled_attempt_can_retry(call_type: str, cancel_first: bool):
+    callback = _BlockedSuccessLogger()
+    logging_obj = LitellmLogging(
+        model="hosted_vllm/logging-fixture",
+        messages=[],
+        stream=False,
+        call_type=call_type,
+        start_time=datetime.datetime.now(),
+        litellm_call_id="concurrent-success",
+        function_id="concurrent-success",
+        dynamic_async_success_callbacks=[callback],
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="hosted_vllm")
+    response = ModelResponse(
+        id="one-response",
+        model="hosted_vllm/logging-fixture",
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    response._hidden_params["response_cost"] = 0.01
+    first = asyncio.create_task(logging_obj.async_success_handler(result=response))
+    await asyncio.wait_for(callback.entered.wait(), timeout=5)
+    if cancel_first:
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+    rivals = tuple(asyncio.create_task(logging_obj.async_success_handler(result=response)) for _ in range(2))
+    await asyncio.sleep(0)
+    callback.release.set()
+    await asyncio.wait_for(asyncio.gather(*rivals), timeout=5)
+    if not cancel_first:
+        await asyncio.wait_for(first, timeout=5)
+    await logging_obj.async_success_handler(result=response)
+    assert callback.responses == ["one-response"]

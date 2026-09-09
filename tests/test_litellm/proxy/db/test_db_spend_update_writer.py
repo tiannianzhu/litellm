@@ -44,6 +44,53 @@ def test_get_daily_spend_date_rejects_invalid_start_time():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call_type, short_circuit, response_cost, expected_rows",
+    [
+        ("anthropic_messages", True, 0.0, 0),
+        ("aanthropic_messages", True, 0.0, 0),
+        ("anthropic_messages", False, 0.0, 1),
+        ("anthropic_messages", True, 0.005, 1),
+        ("asearch", False, 0.005, 1),
+        ("asearch", True, 0.0, 1),
+    ],
+)
+async def test_search_wrapper_does_not_duplicate_spend_records(
+    call_type: str, short_circuit: bool, response_cost: float, expected_rows: int
+):
+    writer = DBSpendUpdateWriter()
+    prisma = _tool_usage_prisma()
+    with (
+        patch("litellm.proxy.proxy_server.disable_spend_logs", False),  # test-quality-ok: TQ008 process configuration
+        patch("litellm.proxy.proxy_server.prisma_client", prisma),  # test-quality-ok: TQ008 injects an in-memory DB client
+        patch.object(writer, "_batch_database_updates", AsyncMock()) as daily_updates,
+    ):
+        await writer.update_database(
+            token="test-token",
+            user_id="test-user",
+            end_user_id="test-end-user",
+            team_id=None,
+            org_id=None,
+            kwargs={
+                "model": "test-model",
+                "call_type": call_type,
+                "websearch_short_circuit": short_circuit,
+                "litellm_params": {"metadata": {}},
+            },
+            completion_response={"id": "search-wrapper", "usage": {"input_tokens": 0, "output_tokens": 0}},
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            response_cost=response_cost,
+        )
+        await asyncio.sleep(0)
+
+    assert len(prisma.spend_log_transactions) == expected_rows
+    assert daily_updates.await_count == expected_rows
+    if expected_rows:
+        assert prisma.spend_log_transactions[0]["spend"] == response_cost
+
+
+@pytest.mark.asyncio
 async def test_daily_spend_tracking_with_disabled_spend_logs():
     """
     Test that add_spend_log_transaction_to_daily_user_transaction is still called
@@ -1691,6 +1738,7 @@ async def test_daily_agent_receives_deepcopied_payload():
 
     # Mock get_logging_payload to return a known dict and capture its identity
     fake_payload = {
+        "request_id": "req-deepcopy-agent",
         "startTime": "2024-01-01T00:00:00",
         "endTime": "2024-01-01T00:01:00",
         "model": "gpt-4",
@@ -2183,6 +2231,7 @@ async def test_update_database_does_not_deepcopy_on_request_path():
     db_writer.add_spend_log_transaction_to_daily_tag_transaction = AsyncMock()
 
     fake_payload = {
+        "request_id": "req-deepcopy-background",
         "startTime": "2024-01-01T00:00:00",
         "endTime": "2024-01-01T00:01:00",
         "model": "gpt-4",
@@ -2278,6 +2327,7 @@ async def test_spend_update_path_never_queries_user_cache_with_none_user_id():
         patch(
             "litellm.proxy.spend_tracking.spend_tracking_utils.get_logging_payload",
             return_value={
+                "request_id": "req-no-user-id",
                 "startTime": "2024-01-01T00:00:00",
                 "endTime": "2024-01-01T00:01:00",
                 "model": "gpt-4",
@@ -3037,6 +3087,61 @@ async def _update_database_with(
         )
         await asyncio.sleep(0)
         return charged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disable_spend_logs", [False, True])
+async def test_ordinary_callbacks_charge_each_response_and_status_once(disable_spend_logs: bool):
+    writer = DBSpendUpdateWriter()
+    writer._batch_database_updates = AsyncMock()
+    prisma = _tool_usage_prisma()
+    failed = {**_minimal_spend_payload(), "call_type": "acompletion", "status": "failure"}
+    successful = {**failed, "status": "success"}
+    next_round = {**successful, "request_id": "req-next-provider-round"}
+
+    assert await _update_database_with(writer, prisma, failed, disable_spend_logs, response_cost=0.0) is True
+    assert await _update_database_with(writer, prisma, failed, disable_spend_logs, response_cost=0.0) is False
+    assert await _update_database_with(writer, prisma, successful, disable_spend_logs) is True
+    assert await _update_database_with(writer, prisma, successful, disable_spend_logs) is False
+    assert await _update_database_with(writer, prisma, next_round, disable_spend_logs) is True
+
+    assert writer._batch_database_updates.await_count == 3
+    assert sum(update.kwargs["response_cost"] for update in writer._batch_database_updates.await_args_list) == 0.5
+    assert len(prisma.spend_log_transactions) == (0 if disable_spend_logs else 3)
+    prisma.db.litellm_spendlogs.create_many.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ordinary_spend_admission_waits_for_enqueue_before_claiming():
+    writer = DBSpendUpdateWriter()
+    prisma = _tool_usage_prisma()
+    payload = {**_minimal_spend_payload(), "call_type": "acompletion", "status": "success"}
+    await prisma._spend_log_transactions_lock.acquire()
+    first = asyncio.create_task(writer._record_spend_log(payload, prisma, False))
+    duplicate = asyncio.create_task(writer._record_spend_log(payload, prisma, False))
+    await asyncio.sleep(0)
+    assert not first.done()
+    assert not duplicate.done()
+    prisma._spend_log_transactions_lock.release()
+
+    assert await asyncio.gather(first, duplicate) == [True, False]
+    assert len(prisma.spend_log_transactions) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enqueue_failure", [RuntimeError("queue unavailable"), asyncio.CancelledError()])
+async def test_ordinary_spend_admission_can_retry_failed_or_cancelled_enqueue(enqueue_failure: BaseException):
+    writer = DBSpendUpdateWriter()
+    prisma = _tool_usage_prisma()
+    prisma._spend_log_transactions_lock = AsyncMock()
+    prisma._spend_log_transactions_lock.__aenter__.side_effect = [enqueue_failure, None]
+    payload = {**_minimal_spend_payload(), "call_type": "acompletion", "status": "success"}
+
+    with pytest.raises(type(enqueue_failure)):
+        await writer._record_spend_log(payload, prisma, False)
+    assert await writer._record_spend_log(payload, prisma, False) is True
+    assert await writer._record_spend_log(payload, prisma, False) is False
+    assert len(prisma.spend_log_transactions) == 1
 
 
 @pytest.mark.asyncio

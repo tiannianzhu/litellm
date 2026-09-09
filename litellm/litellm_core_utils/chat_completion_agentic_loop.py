@@ -1,7 +1,7 @@
 # this is a patch to allow for agentic loops covering llm_http_handler.py and openai sdk based calling flows for the .completion() api
 
 import json
-from collections.abc import Mapping
+import time
 from typing import Final, cast
 
 from litellm._logging import verbose_logger
@@ -14,10 +14,10 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.llms.base_llm.base_model_iterator import MockResponseIterator
 from litellm.types.integrations.custom_logger import (
     CHAT_COMPLETION_AGENTIC_SURFACE,
-    HEADROOM_CONVERTED_STREAM_KEY,
     NON_CODE_INTERPRETER_INTERCEPTION_INTERNAL_PREFIXES,
     AgenticLoopPlan,
     AgenticLoopRequestPatch,
+    converted_stream_requested,
     is_interception_internal_key,
 )
 from litellm.types.utils import ModelResponse
@@ -52,12 +52,6 @@ def _post_hook_overridden(callback: CustomLogger) -> bool:
     base: Final = CustomLogger.async_post_agentic_loop_response_hook
     func: Final = type(callback).async_post_agentic_loop_response_hook
     return getattr(func, "__func__", func) is not getattr(base, "__func__", base)
-
-
-def _converted_stream_requested(kwargs: Mapping[str, object]) -> bool:
-    return bool(
-        kwargs.get("_code_interpreter_interception_converted_stream") or kwargs.get(HEADROOM_CONVERTED_STREAM_KEY)
-    )
 
 
 def _coerce_int(value: object, default: int) -> int:
@@ -195,7 +189,7 @@ async def _execute_chat_completion_agentic_plan(
                     model,
                     str(e),
                 )
-        if _converted_stream_requested(kwargs) and not depth:
+        if converted_stream_requested(kwargs) and not depth:
             return _wrap_response_as_fake_stream(
                 response_followup,
                 model=model,
@@ -233,6 +227,7 @@ async def maybe_run_chat_completion_agentic_loop(
     depth, max_loops, fingerprints = _agentic_loop_settings(kwargs)
     tools: Final = optional_params.get("tools", [])
 
+    completed_at: Final = time.time()
     for callback in callbacks:
         if not isinstance(callback, CustomLogger):
             continue
@@ -275,6 +270,8 @@ async def maybe_run_chat_completion_agentic_loop(
 
         try:
             if not _build_plan_overridden(callback):
+                if isinstance(logging_obj, LiteLLMLoggingObject):
+                    logging_obj.record_agentic_loop_response(response, completed_at)
                 return await callback.async_run_agentic_loop(
                     tools=tool_calls,
                     model=model,
@@ -306,6 +303,8 @@ async def maybe_run_chat_completion_agentic_loop(
             if not plan.run_agentic_loop:
                 continue
 
+            if isinstance(logging_obj, LiteLLMLoggingObject):
+                logging_obj.record_agentic_loop_response(response, completed_at)
             return await _execute_chat_completion_agentic_plan(
                 plan=plan,
                 callback=callback,
@@ -325,7 +324,7 @@ async def maybe_run_chat_completion_agentic_loop(
                 str(e),
             )
 
-    if _converted_stream_requested(kwargs) and not depth:
+    if converted_stream_requested(kwargs) and not depth:
         return cast(
             "ModelResponse | CustomStreamWrapper",
             _wrap_response_as_fake_stream(

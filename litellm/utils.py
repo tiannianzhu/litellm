@@ -1220,7 +1220,8 @@ def _dispatch_success_logging(
                     )
                 )
 
-            logging_obj._enqueue_deferred_logging = _enqueue_deferred_logging
+            if logging_obj._enqueue_deferred_logging is None:  # pyright: ignore[reportPrivateUsage]  # Dispatcher must preserve the logging object's deferred snapshot hook.
+                logging_obj._enqueue_deferred_logging = _enqueue_deferred_logging
         else:
             asyncio.create_task(
                 _client_async_logging_helper(
