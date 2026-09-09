@@ -344,6 +344,7 @@ if TYPE_CHECKING:
     from litellm.litellm_core_utils.get_supported_openai_params import (
         get_supported_openai_params,
     )
+    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObject
     from litellm.litellm_core_utils.llm_request_utils import ensure_extra_body_is_safe
     from litellm.litellm_core_utils.llm_response_utils.convert_dict_to_response import (
         LiteLLMResponseObjectHandler,
@@ -364,7 +365,6 @@ if TYPE_CHECKING:
         update_response_metadata,
     )
     from litellm.litellm_core_utils.redact_messages import (
-        LiteLLMLoggingObject,
         redact_message_input_output_from_logging,
     )
     from litellm.litellm_core_utils.rules import Rules
@@ -2058,8 +2058,7 @@ def client(original_function):
                     and _caching_handler_response.final_embedding_cached_response is None
                 ):
                     if _is_converted_stream_result(_caching_handler_response.cached_result):
-                        logging_obj.stream = True
-                        logging_obj.model_call_details["stream"] = True
+                        logging_obj.mark_streaming_response()
                     return _caching_handler_response.cached_result
 
                 elif _caching_handler_response.embedding_all_elements_cache_hit is True:
@@ -2125,8 +2124,7 @@ def client(original_function):
 
             streaming_requested: Final = _is_streaming_request(kwargs=kwargs, call_type=call_type)
             if streaming_requested or _is_converted_stream_result(result):
-                logging_obj.stream = True
-                logging_obj.model_call_details["stream"] = True
+                logging_obj.mark_streaming_response()
                 if not streaming_requested:
                     await _run_success_deployment_hook_on_converted_chat_stream(
                         result=result, request_data=kwargs, call_type=call_type
