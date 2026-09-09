@@ -3032,34 +3032,31 @@ async def test_anthropic_messages_standard_logging_object_matches_fixture():
         litellm.callbacks = original_callbacks
 
 
-def test_add_litellm_metadata_from_request_headers_x_litellm_trace_id_sets_chain_id():
-    """x-litellm-trace-id sets both metadata and top-level litellm_session_id/litellm_trace_id for call chaining."""
+def test_add_litellm_metadata_from_request_headers_x_litellm_trace_id_sets_trace_id():
     headers = {"x-litellm-trace-id": "foo"}
     data = {"metadata": {}}
     LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
     assert data["metadata"]["trace_id"] == "foo"
-    assert data["metadata"]["session_id"] == "foo"
-    assert data["litellm_session_id"] == "foo"
     assert data["litellm_trace_id"] == "foo"
+    assert "session_id" not in data["metadata"]
+    assert "litellm_session_id" not in data
 
 
-def test_add_litellm_metadata_from_request_headers_x_litellm_session_id_sets_chain_id():
-    """x-litellm-session-id sets both metadata and top-level litellm_session_id/litellm_trace_id for call chaining."""
+def test_add_litellm_metadata_from_request_headers_x_litellm_session_id_sets_session_id():
     headers = {"x-litellm-session-id": "bar"}
     data = {"metadata": {}}
     LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
-    assert data["metadata"]["trace_id"] == "bar"
     assert data["metadata"]["session_id"] == "bar"
     assert data["litellm_session_id"] == "bar"
-    assert data["litellm_trace_id"] == "bar"
+    assert "trace_id" not in data["metadata"]
+    assert "litellm_trace_id" not in data
 
 
-def test_add_litellm_metadata_from_request_headers_both_headers_trace_id_precedence():
-    """When both x-litellm-trace-id and x-litellm-session-id are present, trace-id takes precedence for chain_id."""
+def test_add_litellm_metadata_from_request_headers_keeps_trace_and_session_ids_independent():
     headers = {
         "x-litellm-trace-id": "trace-value",
         "x-litellm-session-id": "session-value",
@@ -3069,8 +3066,8 @@ def test_add_litellm_metadata_from_request_headers_both_headers_trace_id_precede
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
     assert data["metadata"]["trace_id"] == "trace-value"
-    assert data["metadata"]["session_id"] == "trace-value"
-    assert data["litellm_session_id"] == "trace-value"
+    assert data["metadata"]["session_id"] == "session-value"
+    assert data["litellm_session_id"] == "session-value"
     assert data["litellm_trace_id"] == "trace-value"
 
 
@@ -3083,7 +3080,7 @@ def test_add_litellm_metadata_from_request_headers_generic_session_id_header():
     )
     assert data["metadata"]["session_id"] == "e96634a3-fa28-4083-b354-55542e2dca01"
     assert data["litellm_session_id"] == "e96634a3-fa28-4083-b354-55542e2dca01"
-    assert data["litellm_trace_id"] == "e96634a3-fa28-4083-b354-55542e2dca01"
+    assert "litellm_trace_id" not in data
 
 
 def test_add_litellm_metadata_from_anthropic_user_id_sets_session_id():
@@ -3128,7 +3125,7 @@ def test_add_litellm_metadata_from_headers_session_id_beats_anthropic_user_id():
     )
     assert data["metadata"]["session_id"] == "header-session-id"
     assert data["litellm_session_id"] == "header-session-id"
-    assert data["litellm_trace_id"] == "header-session-id"
+    assert "litellm_trace_id" not in data
 
 
 def test_add_litellm_metadata_from_headers_session_id_beats_anthropic_user_id_dict():
@@ -3146,7 +3143,7 @@ def test_add_litellm_metadata_from_headers_session_id_beats_anthropic_user_id_di
     )
     assert data["metadata"]["session_id"] == "header-session-id"
     assert data["litellm_session_id"] == "header-session-id"
-    assert data["litellm_trace_id"] == "header-session-id"
+    assert "litellm_trace_id" not in data
 
 
 @pytest.mark.parametrize(
@@ -3184,8 +3181,7 @@ def test_add_litellm_metadata_from_anthropic_user_id_dict_ignores_invalid_sessio
     assert data == {"metadata": {"user_id": user_id}}
 
 
-def test_add_litellm_metadata_from_request_headers_explicit_header_beats_generic():
-    """Explicit x-litellm-trace-id wins over a generic x-*-session-id header."""
+def test_add_litellm_metadata_from_request_headers_keeps_explicit_trace_and_generic_session():
     headers = {
         "x-litellm-trace-id": "explicit-trace-id-value",
         "x-claude-code-session-id": "e96634a3-fa28-4083-b354-55542e2dca01",
@@ -3194,7 +3190,7 @@ def test_add_litellm_metadata_from_request_headers_explicit_header_beats_generic
     LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
-    assert data["litellm_session_id"] == "explicit-trace-id-value"
+    assert data["litellm_session_id"] == "e96634a3-fa28-4083-b354-55542e2dca01"
     assert data["litellm_trace_id"] == "explicit-trace-id-value"
 
 
@@ -3340,8 +3336,8 @@ def test_add_litellm_metadata_groups_codex_turns_into_one_session():
 
     for turn in turns:
         assert turn["litellm_session_id"] == CODEX_SESSION_UUID
-        assert turn["litellm_trace_id"] == CODEX_SESSION_UUID
         assert turn["litellm_metadata"]["session_id"] == CODEX_SESSION_UUID
+        assert "litellm_trace_id" not in turn
 
 
 OPENCODE_SESSION_ID = "ses_f91e6e825ffeuhlu5EbglxjAN2"
@@ -3363,9 +3359,9 @@ def test_add_litellm_metadata_groups_opencode_turns_into_one_session():
 
     for turn in turns:
         assert turn["metadata"]["session_id"] == OPENCODE_SESSION_ID
-        assert turn["metadata"]["trace_id"] == OPENCODE_SESSION_ID
         assert turn["litellm_session_id"] == OPENCODE_SESSION_ID
-        assert turn["litellm_trace_id"] == OPENCODE_SESSION_ID
+        assert "trace_id" not in turn["metadata"]
+        assert "litellm_trace_id" not in turn
 
 
 @pytest.mark.parametrize("value", ["short", "has spaces!!", ""])
@@ -3523,7 +3519,7 @@ def test_add_litellm_metadata_from_request_headers_explicit_trace_id_beats_trace
         headers=headers, data=data, _metadata_variable_name="metadata"
     )
     assert data["litellm_trace_id"] == "explicit-trace-id-value"
-    assert data["litellm_session_id"] == "explicit-trace-id-value"
+    assert "litellm_session_id" not in data
 
 
 def test_add_litellm_metadata_from_request_headers_anthropic_metadata_beats_baggage():
@@ -7573,7 +7569,6 @@ def _request_for(path: str) -> MagicMock:
 
 
 def _spend_log_session_id(data: dict[str, object], metadata_key: str = "metadata") -> str | None:
-    """Resolve session_id the way LiteLLM_SpendLogs does, reading the omit decision stamped on the request."""
     from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
     from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
     from litellm.proxy.spend_tracking.spend_tracking_utils import _get_session_id_for_spend_log
@@ -7585,14 +7580,14 @@ def _spend_log_session_id(data: dict[str, object], metadata_key: str = "metadata
         litellm_trace_id=str(data["litellm_trace_id"]) if "litellm_trace_id" in data else None,
         metadata=metadata,
     )
-    trace_id = StandardLoggingPayloadSetup.get_standard_logging_payload_trace_id(
-        logging_obj=SimpleNamespace(litellm_trace_id="per-call-random-trace-id"),
+    session_id = StandardLoggingPayloadSetup.get_standard_logging_payload_session_id(
+        logging_obj=SimpleNamespace(litellm_session_id=""),
         litellm_params=litellm_params,
     )
     return _get_session_id_for_spend_log(
         kwargs={},
         metadata=metadata,
-        standard_logging_payload={"trace_id": trace_id},
+        standard_logging_payload={"session_id": session_id},
         omit_when_missing=bool(metadata.get(SESSION_ID_OMITTED_METADATA_KEY)),
     )
 
@@ -7627,7 +7622,7 @@ async def test_missing_session_id_generate_makes_spend_log_and_callback_session_
 
 
 @pytest.mark.asyncio
-async def test_missing_session_id_unset_keeps_legacy_divergence():
+async def test_missing_session_id_unset_leaves_spend_log_session_id_null():
     updated = await add_litellm_data_to_request(
         data={"model": "gpt-4o", "messages": []},
         request=_request_for("/v1/chat/completions"),
@@ -7638,7 +7633,7 @@ async def test_missing_session_id_unset_keeps_legacy_divergence():
 
     assert "session_id" not in updated["metadata"]
     assert "litellm_session_id" not in updated
-    assert _spend_log_session_id(updated) == "per-call-random-trace-id"
+    assert _spend_log_session_id(updated) is None
 
 
 @pytest.mark.asyncio
@@ -7781,8 +7776,7 @@ async def test_missing_session_id_omit_ignores_empty_body_litellm_session_id():
 
 
 @pytest.mark.asyncio
-async def test_missing_session_id_generate_reuses_traceparent_trace_id():
-    """A W3C traceparent already decides SpendLogs.session_id, so the callback session id must reuse it."""
+async def test_missing_session_id_generate_keeps_traceparent_trace_id_independent():
     request = _request_for("/v1/chat/completions")
     request.headers = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
 
@@ -7794,8 +7788,11 @@ async def test_missing_session_id_generate_reuses_traceparent_trace_id():
         general_settings={"missing_session_id": "generate"},
     )
 
-    assert updated["metadata"]["session_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
-    assert _spend_log_session_id(updated) == "4bf92f3577b34da6a3ce929d0e0e4736"
+    generated_session_id = updated["metadata"]["session_id"]
+    assert isinstance(generated_session_id, str) and len(generated_session_id) == 36
+    assert generated_session_id != "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert updated["litellm_trace_id"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+    assert _spend_log_session_id(updated) == generated_session_id
 
 
 @pytest.mark.asyncio
@@ -7908,7 +7905,7 @@ async def test_client_supplied_omit_marker_never_reaches_the_spend_log(
     assert _spend_log_session_id(updated, metadata_key) == (
         updated[metadata_key]["session_id"]
         if general_settings.get("missing_session_id") == "generate"
-        else "per-call-random-trace-id"
+        else None
     )
 
 

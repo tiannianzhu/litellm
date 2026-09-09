@@ -5942,30 +5942,11 @@ class StandardLoggingPayloadSetup:
         logging_obj: Logging,
         litellm_params: Mapping[str, Any],
     ) -> str:
-        """
-        Returns the `litellm_trace_id` for this request
-
-        This helps link sessions when multiple requests are made in a single session
-
-        Gated behind `litellm.request_correlation_in_logs`:
-        - Off (default): legacy behavior, preserved for backward compatibility -
-          `litellm_session_id` takes priority over `litellm_trace_id` since historically
-          this field doubled as the session-grouping field.
-        - On: `litellm_trace_id` takes priority - trace_id and session_id are independent,
-          see `get_standard_logging_payload_session_id` for session tracking.
-        """
-        dynamic_litellm_session_id: Final = litellm_params.get("litellm_session_id")
         dynamic_litellm_trace_id: Final = litellm_params.get("litellm_trace_id")
         metadata: Final[Mapping[str, object] | None] = litellm_params.get("metadata")
-        metadata_session_id: Final = metadata.get("session_id") if metadata else None
         metadata_trace_id: Final = metadata.get("trace_id") if metadata else None
 
-        ordered_candidates: Final[tuple[object, object, object, object]] = (
-            (dynamic_litellm_trace_id, dynamic_litellm_session_id, metadata_trace_id, metadata_session_id)
-            if litellm.request_correlation_in_logs
-            else (dynamic_litellm_session_id, dynamic_litellm_trace_id, metadata_session_id, metadata_trace_id)
-        )
-        for candidate in ordered_candidates:
+        for candidate in (dynamic_litellm_trace_id, metadata_trace_id):
             if candidate:
                 return str(candidate)
         return logging_obj.litellm_trace_id
@@ -5975,16 +5956,6 @@ class StandardLoggingPayloadSetup:
         logging_obj: Logging,
         litellm_params: Mapping[str, Any],
     ) -> str:
-        """
-        Returns the end-user/conversation `litellm_session_id` for this request, independent of trace_id.
-
-        Only populated when `litellm.request_correlation_in_logs` is enabled - off by default
-        to avoid changing existing StandardLoggingPayload shape for callers who haven't opted in.
-        Unlike `get_standard_logging_payload_trace_id`, this never falls back to a generated
-        per-call trace id: it's empty when the caller never supplied a session id.
-        """
-        if not litellm.request_correlation_in_logs:
-            return ""
         dynamic_litellm_session_id: Final[object] = litellm_params.get("litellm_session_id")
         if dynamic_litellm_session_id:
             return str(dynamic_litellm_session_id)

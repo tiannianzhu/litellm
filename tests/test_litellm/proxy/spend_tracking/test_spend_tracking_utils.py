@@ -20,7 +20,12 @@ from litellm.constants import (
     SESSION_ID_OMITTED_METADATA_KEY,
     UNKNOWN_MODEL_SPEND_LOG_MODEL,
 )
-from litellm.litellm_core_utils.litellm_logging import create_dummy_standard_logging_payload
+from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+from litellm.litellm_core_utils.litellm_logging import (
+    Logging,
+    StandardLoggingPayloadSetup,
+    create_dummy_standard_logging_payload,
+)
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.proxy._types import SpendLogsPayload, UserAPIKeyAuth
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
@@ -151,11 +156,49 @@ def test_get_logging_payload_still_hashes_when_caching_is_on_and_no_preset_key_e
     assert _cache_key_in_spend_log(monkeypatch, _RecordingCache(), None) == "hashed-from-gpt-4o-mini"
 
 
+@pytest.mark.parametrize("correlation_enabled", [False, True])
+@pytest.mark.parametrize("session_id", ["conversation-1", None])
+def test_standard_and_spend_logs_keep_sessions_separate_from_request_traces(
+    monkeypatch: pytest.MonkeyPatch, correlation_enabled: bool, session_id: str | None
+) -> None:
+    monkeypatch.setattr(litellm, "request_correlation_in_logs", correlation_enabled)
+    now: Final = datetime.datetime.now(timezone.utc)
+    for trace_id in ("request-1", "request-2"):
+        params: Final = get_litellm_params(
+            metadata={"trace_id": trace_id, **({"session_id": session_id} if session_id else {})}
+        )
+        logging_obj: Final = Logging(
+            model="test-model",
+            messages=[],
+            stream=False,
+            call_type="acompletion",
+            start_time=now,
+            litellm_call_id=trace_id,
+            function_id=trace_id,
+        )
+        standard_log: Final = create_dummy_standard_logging_payload()
+        standard_log["trace_id"] = StandardLoggingPayloadSetup.get_standard_logging_payload_trace_id(
+            logging_obj=logging_obj, litellm_params=params
+        )
+        standard_log["session_id"] = StandardLoggingPayloadSetup.get_standard_logging_payload_session_id(
+            logging_obj=logging_obj, litellm_params=params
+        )
+        payload: Final = get_logging_payload(
+            kwargs={"model": "test-model", "litellm_params": params, "standard_logging_object": standard_log},
+            response_obj={"id": trace_id},
+            start_time=now,
+            end_time=now,
+        )
+        assert standard_log["trace_id"] == trace_id
+        assert standard_log["session_id"] == (session_id or "")
+        assert payload["session_id"] == session_id
+
+
 _TRACE_ONLY_STANDARD_LOGGING: Final = cast(
     StandardLoggingPayload,
     {
         "trace_id": "trace-abc",
-        "session_id": "trace-abc",
+        "session_id": "",
         "metadata": {},
         "model_map_information": None,
         "request_tags": [],
@@ -163,43 +206,39 @@ _TRACE_ONLY_STANDARD_LOGGING: Final = cast(
 )
 
 
-def _trace_only_session_id(omit_when_missing: bool) -> str | None:
-    """get_litellm_params copies metadata.trace_id into litellm_session_id, so every field echoes the trace id."""
+def _trace_only_session_id() -> str | None:
     return _get_session_id_for_spend_log(
-        kwargs={"litellm_trace_id": "trace-abc", "litellm_session_id": "trace-abc"},
+        kwargs={"litellm_trace_id": "trace-abc"},
         metadata={"trace_id": "trace-abc"},
         standard_logging_payload=_TRACE_ONLY_STANDARD_LOGGING,
-        omit_when_missing=omit_when_missing,
     )
 
 
-def test_omit_leaves_session_id_none_when_only_a_trace_id_exists():
-    assert _trace_only_session_id(omit_when_missing=True) is None
+def test_trace_id_does_not_create_a_session():
+    assert _trace_only_session_id() is None
 
 
-def test_omit_leaves_session_id_none_without_any_ids():
+def test_session_id_is_none_without_any_ids():
     assert (
-        _get_session_id_for_spend_log(kwargs={}, metadata=None, standard_logging_payload=None, omit_when_missing=True)
+        _get_session_id_for_spend_log(kwargs={}, metadata=None, standard_logging_payload=None)
         is None
     )
 
 
-def test_omit_records_metadata_session_id():
+def test_records_metadata_session_id():
     session_id: Final = _get_session_id_for_spend_log(
         kwargs={"litellm_session_id": "chain-1"},
         metadata={"trace_id": "chain-1", "session_id": "chain-1"},
         standard_logging_payload=_TRACE_ONLY_STANDARD_LOGGING,
-        omit_when_missing=True,
     )
     assert session_id == "chain-1"
 
 
-def test_legacy_policy_keeps_trace_id_fallback():
-    assert _trace_only_session_id(omit_when_missing=False) == "trace-abc"
-    generated: Final = _get_session_id_for_spend_log(
-        kwargs={}, metadata=None, standard_logging_payload=None, omit_when_missing=False
+def test_explicit_session_id_is_retained_without_standard_logging():
+    session_id: Final = _get_session_id_for_spend_log(
+        kwargs={"litellm_session_id": "chain-1"}, metadata=None, standard_logging_payload=None
     )
-    assert len(str(generated)) == 36
+    assert session_id == "chain-1"
 
 
 def test_batch_lifecycle_rows_derive_the_same_session_from_the_batch_id():
@@ -267,16 +306,14 @@ def test_get_logging_payload_groups_batch_create_and_cost_rows_in_one_session():
 @pytest.mark.parametrize(
     ("request_metadata", "expected"),
     [
-        ({"trace_id": "trace-abc"}, "trace-abc"),
+        ({"trace_id": "trace-abc"}, None),
         ({"trace_id": "trace-abc", SESSION_ID_OMITTED_METADATA_KEY: True}, None),
         ({"trace_id": "trace-abc", "session_id": "chain-1", SESSION_ID_OMITTED_METADATA_KEY: True}, "chain-1"),
     ],
 )
-def test_get_logging_payload_reads_omit_decision_stamped_on_request(
+def test_get_logging_payload_preserves_session_identity_under_generate_policy(
     request_metadata: dict[str, object], expected: str | None
 ):
-    """The pre-call stamp, not the live general_settings, decides the policy, so a config reload between
-    pre-call and spend logging cannot fabricate a session for a request accepted under `omit`."""
     with patch(  # test-quality-ok: proves log time ignores proxy config; general_settings is yaml, not an HTTP boundary
         "litellm.proxy.proxy_server.general_settings", {"missing_session_id": "generate"}
     ):
@@ -295,11 +332,7 @@ def test_get_logging_payload_reads_omit_decision_stamped_on_request(
 
 
 @pytest.mark.parametrize("policy", ["omit", "generate", None])
-def test_get_logging_payload_applies_omit_to_requests_that_carry_no_stamp(policy: str | None):
-    """Router-model passthrough calls `allm_passthrough_route` directly and never reaches the pre-call helper that
-    stamps the omit decision, so an unstamped request falls back to the configured policy. Without that fallback
-    `missing_session_id: omit` would fabricate a uuid session id on every passthrough spend log while its Langfuse
-    trace has none, which is the divergence the policy exists to remove."""
+def test_spend_writer_does_not_generate_sessions_for_unstamped_requests(policy: str | None):
     with patch(  # test-quality-ok: general_settings is proxy config, loaded from yaml, not an HTTP boundary
         "litellm.proxy.proxy_server.general_settings", {} if policy is None else {"missing_session_id": policy}
     ):
@@ -314,7 +347,7 @@ def test_get_logging_payload_applies_omit_to_requests_that_carry_no_stamp(policy
             start_time=datetime.datetime.now(timezone.utc),
             end_time=datetime.datetime.now(timezone.utc),
         )
-    assert payload["session_id"] == (None if policy == "omit" else "trace-abc")
+    assert payload["session_id"] is None
 
 
 def test_get_logging_payload_preserves_anthropic_cache_read_input_tokens():

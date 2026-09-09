@@ -624,7 +624,7 @@ def _promoted_trace_control_fields(
 
 
 def _extract_generic_session_id_from_headers(
-    normalized: dict[str, str],
+    normalized: Mapping[str, str],
 ) -> str | None:
     """
     Scan a normalised (lower-cased keys) header dict for any header that looks
@@ -785,9 +785,8 @@ def apply_missing_session_id_policy(
         return
     match policy:
         case "generate":
-            session_id: Final = str(data.get("litellm_trace_id") or metadata.get("trace_id") or uuid.uuid4())
+            session_id: Final = str(uuid.uuid4())
             data["litellm_session_id"] = session_id  # rebind-ok: data is an out-param
-            data.setdefault("litellm_trace_id", session_id)
             metadata["session_id"] = session_id
             metadata[SESSION_ID_GENERATED_METADATA_KEY] = True
         case "reject":
@@ -1504,19 +1503,27 @@ class LiteLLMProxyRequestSetup:
         #########################################################################################
 
         agent_id_from_header: Final = headers.get("x-litellm-agent-id")
-        # Explicit litellm headers take precedence; fall back to any x-*-session-id header.
-        chain_id: Final = get_chain_id_from_headers(dict(headers))
+        normalized_headers: Final = MappingProxyType({k.lower(): v for k, v in headers.items() if isinstance(k, str)})
+        trace_id_from_header: Final = normalized_headers.get("x-litellm-trace-id")
+        session_id_from_header: Final = (
+            normalized_headers.get("x-litellm-session-id")
+            or _extract_generic_session_id_from_headers(normalized_headers)
+            or _extract_codex_session_id_from_headers(normalized_headers)
+            or _extract_bare_session_id_from_headers(normalized_headers)
+        )
 
         if agent_id_from_header:
             metadata_from_headers["agent_id"] = agent_id_from_header
             verbose_proxy_logger.debug("Extracted agent_id from header: %s", agent_id_from_header)
 
-        if chain_id:
-            metadata_from_headers["trace_id"] = chain_id
-            metadata_from_headers["session_id"] = chain_id
-            data["litellm_session_id"] = chain_id
-            data["litellm_trace_id"] = chain_id
-            verbose_proxy_logger.debug("Extracted chain_id from header (trace-id/session-id): %s", chain_id)
+        if trace_id_from_header:
+            metadata_from_headers["trace_id"] = trace_id_from_header
+            data["litellm_trace_id"] = trace_id_from_header
+            verbose_proxy_logger.debug("Extracted trace_id from header: %s", trace_id_from_header)
+        if session_id_from_header:
+            metadata_from_headers["session_id"] = session_id_from_header
+            data["litellm_session_id"] = session_id_from_header
+            verbose_proxy_logger.debug("Extracted session_id from header: %s", session_id_from_header)
         else:
             body_metadata: Final = data.get("metadata")
             session_id: Final = _get_anthropic_session_id_from_metadata(body_metadata)
@@ -1534,7 +1541,6 @@ class LiteLLMProxyRequestSetup:
         # anything - but lets a caller's existing traceparent/baggage headers
         # (from real OTel instrumentation) correlate with litellm's own logs
         # instead of generating an unrelated trace_id.
-        normalized_headers: Final = MappingProxyType({k.lower(): v for k, v in headers.items() if isinstance(k, str)})
         if "litellm_trace_id" not in data:
             traceparent: Final = normalized_headers.get("traceparent")
             if isinstance(traceparent, str):
