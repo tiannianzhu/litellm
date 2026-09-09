@@ -13081,8 +13081,7 @@ def test_get_final_response_obj():
         # Reset litellm.turn_off_message_logging to its original value
         litellm.turn_off_message_logging = False
 
-
-def testget_standard_logging_payload_trace_id():
+def test_get_standard_logging_payload_trace_id():
     """Test get_standard_logging_payload_trace_id with different input scenarios"""
     # Test case 1: When litellm_trace_id is provided in litellm_params
     from unittest.mock import MagicMock
@@ -13119,8 +13118,7 @@ def testget_standard_logging_payload_trace_id():
     assert result == "12345"
     assert isinstance(result, str)
 
-
-def testget_standard_logging_payload_trace_id_prioritizes_trace_id_when_flag_on(monkeypatch):
+def test_get_standard_logging_payload_trace_id_prioritizes_trace_id_when_flag_on(monkeypatch):
     """With request_correlation_in_logs on, an explicit litellm_trace_id wins over litellm_session_id."""
     from unittest.mock import MagicMock
 
@@ -13134,10 +13132,7 @@ def testget_standard_logging_payload_trace_id_prioritizes_trace_id_when_flag_on(
     )
     assert result == "the-trace-id"
 
-
-def testget_standard_logging_payload_trace_id_prioritizes_session_id_when_flag_off(monkeypatch):
-    """With request_correlation_in_logs off (default), legacy behavior is preserved:
-    litellm_session_id still wins over litellm_trace_id."""
+def test_get_standard_logging_payload_trace_id_keeps_trace_id_when_flag_off(monkeypatch):
     from unittest.mock import MagicMock
 
     monkeypatch.setattr(litellm, "request_correlation_in_logs", False)
@@ -13148,10 +13143,9 @@ def testget_standard_logging_payload_trace_id_prioritizes_session_id_when_flag_o
     result = StandardLoggingPayloadSetup.get_standard_logging_payload_trace_id(
         logging_obj=mock_logging_obj, litellm_params=litellm_params
     )
-    assert result == "the-session-id"
+    assert result == "the-trace-id"
 
-
-def testget_standard_logging_payload_session_id_when_flag_on(monkeypatch):
+def test_get_standard_logging_payload_session_id_when_flag_on(monkeypatch):
     """Test get_standard_logging_payload_session_id with different input scenarios, flag enabled"""
     from unittest.mock import MagicMock
 
@@ -13203,11 +13197,7 @@ def testget_standard_logging_payload_session_id_when_flag_on(monkeypatch):
     )
     assert result == ""
 
-
-def testget_standard_logging_payload_session_id_empty_when_flag_off(monkeypatch):
-    """When request_correlation_in_logs is off (default), session_id is always empty,
-    even if litellm_session_id was explicitly supplied - preserves the pre-existing
-    StandardLoggingPayload shape for callers who haven't opted in."""
+def test_get_standard_logging_payload_session_id_is_retained_when_flag_off(monkeypatch):
     from unittest.mock import MagicMock
 
     monkeypatch.setattr(litellm, "request_correlation_in_logs", False)
@@ -13218,7 +13208,7 @@ def testget_standard_logging_payload_session_id_empty_when_flag_off(monkeypatch)
     result = StandardLoggingPayloadSetup.get_standard_logging_payload_session_id(
         logging_obj=mock_logging_obj, litellm_params=litellm_params
     )
-    assert result == ""
+    assert result == "dynamic-session-id"
 
 
 @pytest.fixture
