@@ -25,6 +25,54 @@ from litellm.types.utils import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_search_short_circuit_marks_only_outer_logging(stream: bool):
+    from datetime import datetime
+
+    from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.llms.anthropic.experimental_pass_through.messages.fake_stream_iterator import (
+        FakeAnthropicMessagesStreamIterator,
+    )
+    from litellm.llms.anthropic.experimental_pass_through.messages.handler import anthropic_messages
+
+    logging_obj = Logging(
+        model="hosted_vllm/test-model",
+        messages=[],
+        stream=stream,
+        call_type="anthropic_messages",
+        start_time=datetime.now(),
+        litellm_call_id="search-wrapper",
+        function_id="search-wrapper",
+    )
+    callback = WebSearchInterceptionLogger(enabled_providers=["hosted_vllm"])
+    with (
+        patch("litellm.callbacks", [callback]),  # test-quality-ok: TQ008 configures the process callback registry
+        patch.object(callback, "_execute_search", AsyncMock(return_value=("search results", None))) as search,
+    ):
+        response = await anthropic_messages.__wrapped__(
+            max_tokens=100,
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Perform a web search for the query: test"}],
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            stream=stream,
+            litellm_logging_obj=logging_obj,
+        )
+
+    assert logging_obj.model_call_details["websearch_short_circuit"] is True
+    search.assert_awaited_once()
+    assert "websearch_short_circuit" not in search.await_args.kwargs["kwargs"]
+    if stream:
+        assert isinstance(response, FakeAnthropicMessagesStreamIterator)
+        chunks = b"".join([chunk async for chunk in response])
+        assert b"search results" in chunks
+        assert b"event: message_stop" in chunks
+    else:
+        assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
+        assert response["content"][-1]["text"] == "search results"
+
+
 def test_anthropic_experimental_pass_through_messages_handler():
     """
     Test that api key is passed to litellm.responses for OpenAI models.

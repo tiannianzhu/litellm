@@ -2028,8 +2028,9 @@ def client(original_function):
                     and _caching_handler_response.final_embedding_cached_response is None
                 ):
                     if _is_converted_stream_result(_caching_handler_response.cached_result):
-                        logging_obj.stream = True
-                        logging_obj.model_call_details["stream"] = True
+                        if logging_obj._agentic_loop_response is None:
+                            logging_obj.stream = True
+                            logging_obj.model_call_details["stream"] = True
                     return _caching_handler_response.cached_result
 
                 elif _caching_handler_response.embedding_all_elements_cache_hit is True:
@@ -2095,8 +2096,9 @@ def client(original_function):
 
             streaming_requested: Final = _is_streaming_request(kwargs=kwargs, call_type=call_type)
             if streaming_requested or _is_converted_stream_result(result):
-                logging_obj.stream = True
-                logging_obj.model_call_details["stream"] = True
+                if logging_obj._agentic_loop_response is None:
+                    logging_obj.stream = True
+                    logging_obj.model_call_details["stream"] = True
                 if not streaming_requested:
                     await _run_success_deployment_hook_on_converted_chat_stream(
                         result=result, request_data=kwargs, call_type=call_type
