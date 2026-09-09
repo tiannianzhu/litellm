@@ -5833,10 +5833,9 @@ def test_passthrough_client_cannot_forge_session_id_omission(client_metadata_key
         _get_session_id_for_spend_log(
             kwargs={},
             metadata=metadata,
-            standard_logging_payload={"trace_id": "per-call-random-trace-id"},
-            omit_when_missing=bool(metadata.get(SESSION_ID_OMITTED_METADATA_KEY)),
+            standard_logging_payload={"trace_id": "per-call-random-trace-id", "session_id": "conversation-1"},
         )
-        == "per-call-random-trace-id"
+        == "conversation-1"
     )
 
 

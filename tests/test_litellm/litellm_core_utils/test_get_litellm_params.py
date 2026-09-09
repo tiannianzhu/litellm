@@ -197,6 +197,21 @@ class TestMetadataFallsBackToLitellmMetadata:
         assert result["litellm_session_id"] == "session-1"
         assert result["litellm_trace_id"] == "trace-1"
 
+    @pytest.mark.parametrize(
+        ("litellm_metadata", "session_id", "trace_id"),
+        [
+            ({"trace_id": "trace-1"}, None, "trace-1"),
+            ({"session_id": "session-1"}, "session-1", None),
+        ],
+    )
+    def test_metadata_does_not_cross_fill_session_and_trace_ids(
+        self, litellm_metadata: dict[str, str], session_id: str | None, trace_id: str | None
+    ):
+        result = get_litellm_params(litellm_metadata=litellm_metadata)
+
+        assert result["litellm_session_id"] == session_id
+        assert result["litellm_trace_id"] == trace_id
+
     def test_explicit_session_and_trace_id_are_not_overridden(self):
         result = get_litellm_params(
             litellm_session_id="explicit-session",
