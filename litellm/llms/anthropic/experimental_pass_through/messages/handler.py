@@ -333,6 +333,9 @@ async def anthropic_messages(
         kwargs={**kwargs, "metadata": metadata},
     )
     if short_circuit_response is not None:
+        short_circuit_logging_obj: Final = kwargs.get("litellm_logging_obj")
+        if isinstance(short_circuit_logging_obj, LiteLLMLoggingObj):
+            short_circuit_logging_obj.model_call_details["websearch_short_circuit"] = True
         return short_circuit_response
 
     # Run registered MessagesInterceptors (e.g. advisor orchestration loop).

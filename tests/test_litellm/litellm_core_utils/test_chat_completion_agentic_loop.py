@@ -20,31 +20,42 @@ removed, so `test_internal_control_fields_never_leak_into_provider_body` proves
 they stay out of the body even without it.
 """
 
+import asyncio
+import datetime
+import sys
+from types import ModuleType
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-
 import litellm
-from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.code_interpreter_interception.handler import (
     CodeInterpreterInterceptionLogger,
+)
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.integrations.websearch_interception.handler import (
+    WebSearchInterceptionLogger,
 )
 from litellm.litellm_core_utils.chat_completion_agentic_loop import (
     maybe_run_chat_completion_agentic_loop,
 )
+from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.llms.base_llm.search.transformation import SearchResponse, SearchResult
+from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
 from litellm.types.integrations.custom_logger import (
     AgenticLoopPlan,
     AgenticLoopRequestPatch,
 )
 from litellm.types.utils import (
+    ChatCompletionMessageToolCall,
     Choices,
     Function,
-    ChatCompletionMessageToolCall,
     Message,
     ModelResponse,
+    Usage,
 )
+from litellm.utils import CustomStreamWrapper
 
 # The internal control fields that must never reach a provider request body.
 _INTERNAL_CONTROL_FIELDS = (
@@ -57,6 +68,12 @@ _INTERNAL_CONTROL_FIELDS = (
     "_code_interpreter_interception_converted_stream",
     "litellm_metadata",
 )
+
+_WEBSEARCH_TOOLS = [
+    {"type": "function", "function": {"name": "litellm_web_search", "parameters": {"type": "object"}}}
+]
+_WEBSEARCH_MESSAGES = [{"role": "user", "content": "Find current topic"}]
+_OPENAI_REQUEST = "litellm.llms.openai.openai.OpenAIChatCompletion.make_openai_chat_completion_request"
 
 
 @pytest.fixture
@@ -131,6 +148,84 @@ def _plain_model_response(content: str = "The answer is 42") -> ModelResponse:
     )
 
 
+def _websearch_response(
+    request_id: str, prompt_tokens: int, completion_tokens: int, query: str | None = None
+) -> ModelResponse:
+    tool_call = (
+        ChatCompletionMessageToolCall(
+            id=f"call_{request_id}",
+            type="function",
+            function=Function(name="litellm_web_search", arguments=f'{{"query": "{query}"}}'),
+        )
+        if query
+        else None
+    )
+    return ModelResponse(
+        id=request_id,
+        model="gpt-4o-mini",
+        choices=[
+            Choices(
+                finish_reason="tool_calls" if tool_call else "stop",
+                message=Message(
+                    role="assistant",
+                    content=None if tool_call else "The final answer",
+                    tool_calls=[tool_call] if tool_call else None,
+                ),
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+
+
+def _mock_websearch_backend(monkeypatch) -> AsyncMock:
+    search = AsyncMock(
+        return_value=SearchResponse(
+            results=[SearchResult(title="Result", url="https://example.com", snippet="Relevant context")]
+        )
+    )
+    monkeypatch.setattr(litellm, "asearch", search)
+    proxy_server = ModuleType("litellm.proxy.proxy_server")
+    proxy_server.llm_router = None
+    monkeypatch.setitem(sys.modules, "litellm.proxy.proxy_server", proxy_server)
+    return search
+
+
+async def _run_websearch_completion(provider_request: AsyncMock, stream: bool = False) -> ModelResponse | CustomStreamWrapper:
+    with patch(  # test-quality-ok: [TQ008] Provider I/O boundary covers recursive clients without replacing loop logic
+        _OPENAI_REQUEST, provider_request
+    ):
+        return await asyncio.wait_for(
+            litellm.acompletion(
+                model="openai/gpt-4o-mini",
+                messages=_WEBSEARCH_MESSAGES,
+                tools=_WEBSEARCH_TOOLS,
+                stream=stream,
+                api_key="sk-test",
+            ),
+            timeout=5,
+        )
+
+
+class _SuccessCapture(CustomLogger):
+    def __init__(self, response_ids: set[str], expected_count: int) -> None:
+        super().__init__()
+        self.response_ids = response_ids
+        self.expected_count = expected_count
+        self.records: List[Tuple[Any, Dict[str, Any]]] = []
+        self.complete = asyncio.Event()
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        if getattr(response_obj, "id", None) not in self.response_ids:
+            return
+        self.records.append((response_obj, kwargs["standard_logging_object"]))
+        if len(self.records) == self.expected_count:
+            self.complete.set()
+
+
 def _raw_response_for(model_response: ModelResponse) -> MagicMock:
     """Wrap a ModelResponse as the OpenAI `with_raw_response.create` return value
     (an object exposing `.headers` and `.parse()` -> something with model_dump)."""
@@ -199,6 +294,109 @@ async def test_internal_control_fields_never_leak_into_provider_body(restore_cal
 
     # The final response is the post-loop answer, not the tool-call turn.
     assert response.choices[0].message.content == "The answer is 42"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_websearch_agentic_rounds_log_their_own_response_usage_and_cost(
+    restore_callbacks, local_model_cost_map, monkeypatch, stream
+):
+    """Real search loops must log each provider round once, including converted streams."""
+
+    provider_responses = (
+        _websearch_response("request-search-one", 11, 2, "first topic"),
+        _websearch_response("request-search-two", 23, 5, "second topic"),
+        _websearch_response("request-final", 47, 13),
+    )
+    provider_request = AsyncMock(side_effect=[({}, response) for response in provider_responses])
+    search = _mock_websearch_backend(monkeypatch)
+
+    websearch = WebSearchInterceptionLogger(enabled_providers=["openai"])
+    capture = _SuccessCapture({response.id for response in provider_responses}, len(provider_responses))
+    litellm.callbacks = [websearch, capture]
+
+    response = await _run_websearch_completion(provider_request, stream)
+    if stream:
+        assert isinstance(response, CustomStreamWrapper)
+        chunks = [chunk async for chunk in response]
+        assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "The final answer"
+        assert chunks[-1].choices[0].finish_reason == "stop"
+    else:
+        assert response.id == "request-final"
+        assert response.choices[0].message.content == "The final answer"
+    await asyncio.wait_for(capture.complete.wait(), timeout=5)
+
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+
+    assert provider_request.await_count == len(provider_responses)
+    assert search.await_count == 2
+    expected_payloads = {
+        response.id: (
+            response.usage.prompt_tokens,
+            response.usage.completion_tokens,
+            litellm.completion_cost(completion_response=response),
+        )
+        for response in provider_responses
+    }
+    assert len(capture.records) == len(expected_payloads)
+    payloads_by_response_id = {response.id: payload for response, payload in capture.records}
+    for response_id, expected in expected_payloads.items():
+        payload = payloads_by_response_id[response_id]
+        assert payload["response"]["id"] == response_id
+        assert (payload["prompt_tokens"], payload["completion_tokens"], payload["response_cost"]) == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_custom_httpx_websearch_hook_logs_each_round_without_parent_duplicate(monkeypatch, restore_callbacks):
+    initial_response = _websearch_response("request-search", 11, 2, "current topic")
+    final_response = _websearch_response("request-final", 23, 5)
+    provider_request = AsyncMock(side_effect=[({}, final_response)])
+
+    _mock_websearch_backend(monkeypatch)
+    websearch = WebSearchInterceptionLogger(enabled_providers=["openai"])
+    capture = _SuccessCapture({initial_response.id, final_response.id}, expected_count=1)
+    litellm.callbacks = [websearch]
+    logging_obj = Logging(
+        model="gpt-4o-mini",
+        messages=_WEBSEARCH_MESSAGES,
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime.datetime.now(),
+        litellm_call_id="custom-httpx-parent",
+        function_id="custom-httpx-parent",
+        dynamic_async_success_callbacks=[capture],
+    )
+    handler = BaseLLMHTTPHandler()
+    with patch(  # test-quality-ok: [TQ008] Provider I/O boundary preserves real search and logging logic
+        _OPENAI_REQUEST, provider_request
+    ):
+        final = await handler._call_agentic_chat_completion_hooks(
+            response=initial_response,
+            model="gpt-4o-mini",
+            messages=_WEBSEARCH_MESSAGES,
+            optional_params={"tools": _WEBSEARCH_TOOLS},
+            logging_obj=logging_obj,
+            stream=False,
+            custom_llm_provider="openai",
+            kwargs={"api_key": "sk-test"},
+        )
+        await logging_obj.async_success_handler(
+            result=final,
+            start_time=logging_obj.start_time,
+            end_time=datetime.datetime.now(),
+        )
+
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+    assert final.id == final_response.id
+    assert provider_request.await_count == 1
+    assert [
+        (response.id, response.usage.prompt_tokens, response.usage.completion_tokens)
+        for response, _ in capture.records
+    ] == [(initial_response.id, 11, 2)]
 
 
 # ---------------------------------------------------------------------------
