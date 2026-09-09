@@ -1044,31 +1044,21 @@ def _get_session_id_for_spend_log(
     kwargs: Mapping[str, object],
     metadata: Mapping[str, object] | None,
     standard_logging_payload: StandardLoggingPayload | None,
-    omit_when_missing: bool,
+    omit_when_missing: bool = False,
     batch_trace_session_id: str | None = None,
 ) -> str | None:
-    """Resolve the session id for the spend log row: `omit` honors only metadata.session_id,
-    batch sessions outrank everything, then the conversation id the caller sent (also one an x-litellm-trace-id header
-    displaced from the request's session), then trace ids.
-
-    A session minted by `missing_session_id: generate` or copied from the request's trace id is not a conversation, so
-    it yields to the trace id, which the Responses bridge points at the previous turn's session to keep a chain whole."""
     if omit_when_missing:
-        session_id: Final = metadata.get("session_id") if metadata else None
-        return str(session_id) if session_id else None
-
-    from litellm._uuid import uuid
+        explicit_session_id: Final = metadata.get("session_id") if metadata else None
+        return str(explicit_session_id) if explicit_session_id else None
 
     if batch_trace_session_id is not None:
         return batch_trace_session_id
     if litellm.request_correlation_in_logs and (caller_session := _caller_session_for_spend_log(kwargs, metadata)):
         return caller_session
-    match standard_logging_payload:
-        case {"trace_id": trace_id} if trace_id is not None:
-            return str(trace_id)
-        case _:
-            litellm_trace_id: Final = kwargs.get("litellm_trace_id")
-            return str(litellm_trace_id) if litellm_trace_id is not None else str(uuid.uuid4())
+    logged_session_id: Final = standard_logging_payload.get("session_id") if standard_logging_payload else None
+    metadata_session_id: Final = metadata.get("session_id") if metadata else None
+    session_id: Final = str(logged_session_id or metadata_session_id or kwargs.get("litellm_session_id") or "")
+    return session_id if session_id and "\x00" not in session_id else None
 
 
 def _get_request_duration_ms(start_time: datetime, end_time: datetime) -> int | None:

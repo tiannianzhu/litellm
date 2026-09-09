@@ -194,20 +194,6 @@ def _caller_trace_field(data: Mapping[str, object], metadata_variable_name: str,
     return requester_value if isinstance(requester_value, str) and requester_value else None
 
 
-def _caller_body_session_id(data: Mapping[str, object], metadata_variable_name: str) -> str | None:
-    top_level: Final = data.get("litellm_session_id")
-    if isinstance(top_level, str) and top_level:
-        return top_level
-    return _caller_trace_field(data, metadata_variable_name, "session_id")
-
-
-def _caller_session_beside_trace_header(
-    normalized_headers: Mapping[str, str], data: Mapping[str, object], metadata_variable_name: str
-) -> str | None:
-    session_headers: Final = {key: value for key, value in normalized_headers.items() if key != "x-litellm-trace-id"}
-    return get_chain_id_from_headers(session_headers) or _caller_body_session_id(data, metadata_variable_name)
-
-
 def _drop_client_caller_session(request_body: Mapping[str, object]) -> None:
     for metadata_key in ("metadata", "litellm_metadata"):
         if isinstance(metadata := request_body.get(metadata_key), dict):
@@ -848,7 +834,7 @@ def _promoted_trace_control_fields(
 
 
 def _extract_generic_session_id_from_headers(
-    normalized: dict[str, str],
+    normalized: Mapping[str, str],
 ) -> str | None:
     """
     Scan a normalised (lower-cased keys) header dict for any header that looks
@@ -1016,13 +1002,8 @@ def apply_missing_session_id_policy(
         return
     match policy:
         case "generate":
-            session_id: Final = str(
-                data.get("litellm_trace_id")
-                or _caller_trace_field(data, _metadata_variable_name, "trace_id")
-                or uuid.uuid4()
-            )
+            session_id: Final = str(uuid.uuid4())
             data["litellm_session_id"] = session_id  # rebind-ok: data is an out-param
-            data.setdefault("litellm_trace_id", session_id)
             metadata["session_id"] = session_id
             metadata[SESSION_ID_GENERATED_METADATA_KEY] = True
         case "reject":
@@ -1534,7 +1515,7 @@ class LiteLLMProxyRequestSetup:
         return None
 
     @staticmethod
-    def _get_spend_logs_metadata_from_request_headers(headers: dict) -> dict | None:
+    def _get_spend_logs_metadata_from_request_headers(headers: Mapping[str, str]) -> dict | None:
         """
         Get the `spend_logs_metadata` from the request headers.
         """
@@ -1763,7 +1744,7 @@ class LiteLLMProxyRequestSetup:
 
     @staticmethod
     def add_litellm_metadata_from_request_headers(
-        headers: dict,
+        headers: Mapping[str, str],
         data: dict,
         _metadata_variable_name: str,
     ) -> dict:
@@ -1785,28 +1766,28 @@ class LiteLLMProxyRequestSetup:
         # Finally update the requests metadata with the `metadata_from_headers`
         #########################################################################################
 
-        normalized_headers: Final = MappingProxyType(
-            {k.lower(): v for k, v in headers.items() if isinstance(k, str) and isinstance(v, str)}
-        )
+        normalized_headers: Final = MappingProxyType({k.lower(): v for k, v in headers.items()})
         agent_id_from_header: Final = headers.get("x-litellm-agent-id")
-        # Explicit litellm headers take precedence; fall back to any x-*-session-id header.
-        chain_id: Final = get_chain_id_from_headers(dict(headers))
+        trace_id_from_header: Final = normalized_headers.get("x-litellm-trace-id")
+        session_id_from_header: Final = (
+            normalized_headers.get("x-litellm-session-id")
+            or _extract_generic_session_id_from_headers(normalized_headers)
+            or _extract_codex_session_id_from_headers(normalized_headers)
+            or _extract_bare_session_id_from_headers(normalized_headers)
+        )
 
         if agent_id_from_header:
             metadata_from_headers["agent_id"] = agent_id_from_header
             verbose_proxy_logger.debug("Extracted agent_id from header: %s", agent_id_from_header)
 
-        caller_session_beside_trace: Final = (
-            _caller_session_beside_trace_header(normalized_headers, request_body, _metadata_variable_name)
-            if chain_id is not None and chain_id == normalized_headers.get("x-litellm-trace-id")
-            else None
-        )
-        if chain_id:
-            metadata_from_headers["trace_id"] = chain_id
-            metadata_from_headers["session_id"] = chain_id
-            data["litellm_session_id"] = chain_id
-            data["litellm_trace_id"] = chain_id
-            verbose_proxy_logger.debug("Extracted chain_id from header (trace-id/session-id): %s", chain_id)
+        if trace_id_from_header:
+            metadata_from_headers["trace_id"] = trace_id_from_header
+            data["litellm_trace_id"] = trace_id_from_header
+            verbose_proxy_logger.debug("Extracted trace_id from header: %s", trace_id_from_header)
+        if session_id_from_header:
+            metadata_from_headers["session_id"] = session_id_from_header
+            data["litellm_session_id"] = session_id_from_header
+            verbose_proxy_logger.debug("Extracted session_id from header: %s", session_id_from_header)
         else:
             body_metadata: Final = data.get("metadata")
             session_id: Final = _get_anthropic_session_id_from_metadata(body_metadata)
@@ -1859,11 +1840,7 @@ class LiteLLMProxyRequestSetup:
                     verbose_proxy_logger.debug("Extracted session_id from W3C baggage header")
 
         if isinstance(data[_metadata_variable_name], dict):
-            data[_metadata_variable_name].update(
-                {**metadata_from_headers, CALLER_SESSION_ID_METADATA_KEY: caller_session_beside_trace}
-                if caller_session_beside_trace
-                else metadata_from_headers
-            )
+            data[_metadata_variable_name].update(metadata_from_headers)
         return data
 
     @staticmethod
