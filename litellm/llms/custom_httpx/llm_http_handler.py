@@ -1,6 +1,7 @@
 import asyncio
 import json
 import ssl
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Coroutine, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -2772,6 +2773,8 @@ class BaseLLMHTTPHandler:
 
         result: Final = final_response if final_response is not None else initial_response
         if converted_stream_requested(agentic_kwargs) and not agentic_kwargs.get("_agentic_loop_depth"):
+            if agentic_kwargs.get("_websearch_interception_converted_stream") is True:
+                logging_obj.record_agentic_loop_response(initial_response, time.time())
             return self._wrap_responses_response_as_fake_stream(
                 result=result,
                 model=model,
@@ -5583,6 +5586,11 @@ class BaseLLMHTTPHandler:
             return FakeAnthropicMessagesStreamIterator(response=cast(AnthropicMessagesResponse, response))
         return response
 
+    @staticmethod
+    def _record_responses_agentic_round(response: object, logging_obj: LiteLLMLoggingObj, completed_at: float) -> None:
+        if isinstance(response, ResponsesAPIResponse):
+            logging_obj.record_agentic_loop_response(response, completed_at)
+
     async def _call_agentic_completion_hooks(
         self,
         response: object,
@@ -5612,6 +5620,7 @@ class BaseLLMHTTPHandler:
         depth, max_loops, fingerprints = self._get_agentic_loop_settings(kwargs=kwargs)
 
         hook_kwargs: Final = {**kwargs, "_agentic_loop_api_surface": api_surface}
+        completed_at: Final = time.time()
 
         for callback in callbacks:
             if not isinstance(callback, CustomLogger):
@@ -5679,6 +5688,7 @@ class BaseLLMHTTPHandler:
                     callback.__class__.async_build_agentic_loop_plan is not CustomLogger.async_build_agentic_loop_plan
                 )
                 if not build_plan_overridden:
+                    self._record_responses_agentic_round(response, logging_obj, completed_at)
                     agentic_result: object = await callback.async_run_agentic_loop(
                         tools=tool_calls,
                         model=model,
@@ -5725,6 +5735,7 @@ class BaseLLMHTTPHandler:
                     continue
 
                 if api_surface == "responses":
+                    self._record_responses_agentic_round(response, logging_obj, completed_at)
                     return await self._execute_responses_agentic_plan(
                         plan=plan,
                         model=model,
@@ -5802,6 +5813,7 @@ class BaseLLMHTTPHandler:
         tools: Final = optional_params.get("tools", [])
         depth, max_loops, fingerprints = self._get_agentic_loop_settings(kwargs=kwargs)
 
+        completed_at: Final = time.time()
         for callback in callbacks:
             if not isinstance(callback, CustomLogger):
                 continue
@@ -5851,6 +5863,7 @@ class BaseLLMHTTPHandler:
                     is not CustomLogger.async_build_chat_completion_agentic_loop_plan
                 )
                 if not build_plan_overridden:
+                    logging_obj.record_agentic_loop_response(response, completed_at)
                     return await callback.async_run_chat_completion_agentic_loop(
                         tools=tool_calls,
                         model=model,
@@ -5885,6 +5898,7 @@ class BaseLLMHTTPHandler:
                 if not plan.run_agentic_loop:
                     continue
 
+                logging_obj.record_agentic_loop_response(response, completed_at)
                 return await self._execute_chat_completion_agentic_plan(
                     plan=plan,
                     model=model,
