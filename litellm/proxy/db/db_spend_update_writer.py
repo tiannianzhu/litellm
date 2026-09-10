@@ -13,16 +13,17 @@ import os
 import random
 import time
 import traceback
-from collections.abc import AsyncGenerator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from itertools import chain
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeAlias, TypeVar, cast, overload
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from typing_extensions import LiteralString, ReadOnly, TypedDict
 
 import litellm
@@ -55,8 +56,10 @@ from litellm.proxy._types import (
     ToolDiscoveryQueueItem,
 )
 from litellm.proxy.common_utils.user_api_key_cache import AUTH_OBJECTS_TARGET, project_cache_key
+from litellm.proxy.db.create_views import SupportsRawQueries
 from litellm.proxy.db.daily_spend_bulk_upsert import (
     DAILY_SPEND_TABLES,
+    DailySpendEntity,
     build_bulk_upsert,
     daily_spend_entity_ids,
     merge_by_conflict_key,
@@ -79,6 +82,15 @@ from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.db.model_usage_rollup import build_model_usage_transaction
 from litellm.proxy.db.request_error_tracking import request_error_accumulator
 from litellm.proxy.db.rollup_lock_timeout import apply_rollup_lock_timeout
+from litellm.proxy.db.spend_accounting import (
+    AccountingEffects,
+    AccountingEvent,
+    DailyCharge,
+    EntityCharge,
+    SpendAccountingStore,
+    WindowCharge,
+    apply_accounting_events,
+)
 from litellm.proxy.route_llm_request import ROUTE_ENDPOINT_MAPPING
 from litellm.proxy.spend_tracking.compression_savings import (
     extract_compression_saved_tokens,
@@ -95,7 +107,7 @@ from litellm.types.utils import CallTypes
 
 if TYPE_CHECKING:
     from litellm.proxy.db.autorouter_session_rollup import AutoRouterTurnTransaction
-    from litellm.proxy.db.baseline_accounting import DailyBaselineAttribution
+    from litellm.proxy.db.baseline_accounting import BaselineAccountingRecord, DailyBaselineAttribution
     from litellm.proxy.utils import PrismaClient, ProxyLogging
 else:
     PrismaClient = Any
@@ -104,6 +116,133 @@ else:
 
 RESPONSES_SESSION_CALL_TYPES: Final = frozenset({CallTypes.responses.value, CallTypes.aresponses.value})
 _SPEND_METADATA_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+_SPEND_JSON: Final[TypeAdapter[JsonValue]] = TypeAdapter(JsonValue)
+accounting_windows_persisted: Final[ContextVar[bool]] = ContextVar("durable_window_accounting", default=False)
+_SPEND_LOG_COLUMNS: Final = frozenset(
+    {
+        "request_id",
+        "call_type",
+        "api_key",
+        "spend",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "startTime",
+        "endTime",
+        "request_duration_ms",
+        "completionStartTime",
+        "model",
+        "model_id",
+        "model_group",
+        "custom_llm_provider",
+        "api_base",
+        "user",
+        "metadata",
+        "cache_hit",
+        "cache_key",
+        "request_tags",
+        "team_id",
+        "organization_id",
+        "end_user",
+        "requester_ip_address",
+        "messages",
+        "response",
+        "session_id",
+        "status",
+        "mcp_namespaced_tool_name",
+        "billing_agent_id",
+        "agent_id",
+        "proxy_server_request",
+        "litellm_call_id",
+    }
+)
+_SPEND_LOG_JSON_COLUMNS: Final = frozenset({"metadata", "request_tags", "messages", "response", "proxy_server_request"})
+
+
+class _StoredSpendLog(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    call_type: str
+    status: str | None
+    spend: float
+
+
+class _AccountingWindow(BaseModel):
+    model_config = ConfigDict(frozen=True, from_attributes=True)
+    budget_duration: str
+    reset_at: datetime | str | None = None
+
+
+_ACCOUNTING_WINDOWS: Final = TypeAdapter(tuple[_AccountingWindow, ...])
+
+
+def _spend_log_json_value(column: str, value: object) -> object:
+    if column in _SPEND_LOG_JSON_COLUMNS and isinstance(value, str):
+        return _SPEND_JSON.validate_json(value)
+    return value
+
+
+def _accounting_mapping(value: object) -> Mapping[str, object] | None:
+    return _SPEND_METADATA_ADAPTER.validate_python(value) if isinstance(value, Mapping) else None
+
+
+async def _invalidate_accounting_counters(effects: AccountingEffects) -> None:
+    from litellm.proxy.proxy_server import invalidate_spend_counter
+
+    def counter(charge: EntityCharge) -> str:
+        if charge.entity == "team_member":
+            return f"spend:team_member:{charge.user_id}:{charge.entity_id}"
+        return f"spend:{charge.entity}:{charge.entity_id}"
+
+    keys: Final = frozenset(
+        (
+            *(counter(charge) for charge in effects.charges),
+            *(
+                f"spend:{window.entity_type}:{window.entity_id}:window:{window.window_duration}"
+                for window in effects.windows
+            ),
+        )
+    )
+    await asyncio.gather(*(invalidate_spend_counter(key) for key in keys))
+
+
+async def _accept_accounting_spend_log(
+    db: SupportsRawQueries, event: AccountingEvent, row: Mapping[str, object], keep_log: bool
+) -> bool:
+    if not keep_log and event.call_type != CallTypes.aretrieve_batch.value:
+        return True
+    columns: Final = tuple(sorted(column for column in row if column in _SPEND_LOG_COLUMNS))
+    names: Final = ", ".join(f'"{column}"' for column in columns)
+    encoded: Final = json.dumps(
+        {column: _spend_log_json_value(column, row[column]) for column in columns}, default=str, allow_nan=False
+    )
+    inserted: Final = await db.query_raw(
+        f'INSERT INTO "LiteLLM_SpendLogs" ({names}) SELECT {names} '
+        'FROM jsonb_populate_record(NULL::"LiteLLM_SpendLogs", $1::jsonb) '
+        "ON CONFLICT (request_id) DO NOTHING RETURNING request_id",
+        encoded,
+    )
+    if inserted:
+        return True
+    existing_rows: Final = await db.query_raw(
+        'SELECT call_type, status, spend FROM "LiteLLM_SpendLogs" WHERE request_id = $1', event.request_id
+    )
+    if not existing_rows:
+        raise RuntimeError("Spend log disappeared during accounting admission")
+    existing: Final = _StoredSpendLog.model_validate(existing_rows[0])
+    if event.call_type != CallTypes.aretrieve_batch.value or event.status != "success":
+        return existing.status != event.status
+    if existing.call_type != event.call_type or existing.status != "success":
+        return True
+    if existing.spend > 0 or event.spend <= 0:
+        return False
+    assignments: Final = ", ".join(f'"{column}" = incoming."{column}"' for column in columns if column != "request_id")
+    await db.execute_raw(
+        f'UPDATE "LiteLLM_SpendLogs" SET {assignments}, updated_at = CURRENT_TIMESTAMP '
+        'FROM jsonb_populate_record(NULL::"LiteLLM_SpendLogs", $1::jsonb) AS incoming '
+        'WHERE "LiteLLM_SpendLogs".request_id = incoming.request_id',
+        encoded,
+    )
+    return True
 
 
 def _org_member_transaction_key(org_id: str, user_id: str) -> str:
@@ -519,6 +658,10 @@ class DBSpendUpdateWriter:
         self.daily_tag_spend_update_queue = DailySpendUpdateQueue()
         self.window_spend_update_queue = WindowSpendUpdateQueue()
         self.interrupted_tag_commits: set[asyncio.Task[None]] = set()
+        self._batch_database_update_tasks: set[asyncio.Task[None]] = set()
+        self._batch_database_update_failure: BaseException | None = None
+        self._spend_update_commit_lock = asyncio.Lock()
+        self._daily_tag_spend_commit_lock = asyncio.Lock()
         self._spend_log_admission_lock = asyncio.Lock()
         self._recent_spend_log_admissions = InMemoryCache(max_size_in_memory=10_000, default_ttl=600)
 
@@ -537,6 +680,7 @@ class DBSpendUpdateWriter:
         end_time: datetime,
         response_cost: float | None,
         project_id: str | None = None,
+        on_accounting_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> bool:
         """Record the request's spend, answering whether its cost still needs charging.
 
@@ -597,13 +741,107 @@ class DBSpendUpdateWriter:
             if team_id is not None and team_id != "":
                 payload["team_id"] = team_id
 
+            if prisma_client is not None:
+                logging_disabled: Final = disable_spend_logs is True
+                accounting_kwargs: Final = (
+                    _SPEND_METADATA_ADAPTER.validate_python(kwargs) if kwargs is not None else None
+                )
+                effects: Final = await self._accounting_effects(
+                    payload=payload,
+                    prisma_client=prisma_client,
+                    token=hashed_token,
+                    user_id=user_id,
+                    end_user_id=end_user_id,
+                    team_id=team_id,
+                    org_id=org_id,
+                    project_id=project_id,
+                    global_budget_user=litellm_proxy_budget_name if litellm.max_budget > 0 else None,
+                    request_model_access_groups=get_request_model_access_groups(accounting_kwargs),
+                    completion_response=completion_response,
+                    kwargs=accounting_kwargs,
+                    keep_log=not logging_disabled,
+                )
+                from litellm.proxy.spend_tracking.spend_tracking_utils import (
+                    configured_spend_logs_metadata_fields,
+                    spend_log_row_with_retained_metadata,
+                )
+
+                durable_row: Final = spend_log_row_with_retained_metadata(
+                    _batch_cost_row_to_write(payload, logging_disabled), configured_spend_logs_metadata_fields()
+                )
+                phase: Final = "paid" if _is_batch_cost_row(payload) and payload["spend"] > 0 else "ordinary"
+                event: Final = AccountingEvent(
+                    event_key=json.dumps((payload["request_id"], payload["status"], phase)),
+                    request_id=payload["request_id"],
+                    status=payload["status"],
+                    call_type=payload["call_type"],
+                    spend=payload["spend"],
+                    payload_json=effects.model_dump_json(),
+                )
+
+                async def accept(db: SupportsRawQueries, candidate: AccountingEvent) -> bool:
+                    accepted: Final = await _accept_accounting_spend_log(
+                        db, candidate, durable_row, not logging_disabled
+                    )
+                    if accepted and on_accounting_admitted is not None:
+                        try:
+                            await on_accounting_admitted()
+                        except Exception as cache_error:  # noqa: BLE001  # cache failures must not discard accounting
+                            spend_log_error(
+                                "Spend counters unavailable during durable accounting admission", exc=cache_error
+                            )
+                    return accepted
+
+                try:
+                    admitted: Final = await SpendAccountingStore.from_client(prisma_client).append(event, accept)
+                except BaseException:
+                    await _invalidate_accounting_counters(effects)
+                    raise
+                if admitted:
+                    from litellm.proxy.utils import request_spend_log_flush
+
+                    request_spend_log_flush(prisma_client)
+                    self._record_request_error(payload=payload, prisma_client=prisma_client)
+                    self._enqueue_tool_registry_upsert(
+                        kwargs=kwargs,
+                        completion_response=completion_response,
+                        hashed_token=hashed_token,
+                        team_id=team_id,
+                    )
+                    if not logging_disabled:
+                        try:
+                            from litellm.proxy.guardrails.usage_tracking import process_spend_logs_guardrail_usage
+
+                            await process_spend_logs_guardrail_usage(prisma_client, (payload,))
+                        except Exception as metrics_error:  # noqa: BLE001  # metrics failures must not undo accounting
+                            verbose_proxy_logger.warning(
+                                "Guardrail usage tracking failed after accounting admission: %s", metrics_error
+                            )
+                return admitted
+
             if not await self._record_spend_log(
                 payload=payload, prisma_client=prisma_client, disable_spend_logs=disable_spend_logs
             ):
                 return False
 
-            # The auto-router router-day rollup is an aggregate like the daily spend tables, so it is
-            # written whether or not per-request spend logs are kept; per-session rows are not.
+            task: Final = asyncio.create_task(
+                self._batch_database_updates(
+                    response_cost=response_cost,
+                    user_id=user_id,
+                    hashed_token=hashed_token,
+                    team_id=team_id,
+                    org_id=org_id,
+                    end_user_id=end_user_id,
+                    prisma_client=prisma_client,
+                    litellm_proxy_budget_name=litellm_proxy_budget_name,
+                    payload=payload,
+                    project_id=project_id,
+                    request_model_access_groups=get_request_model_access_groups(kwargs),
+                )
+            )
+            self._batch_database_update_tasks.add(task)
+            task.add_done_callback(self._record_batch_database_update_task_result)
+
             await self._enqueue_autorouter_turn_transaction(
                 payload=payload,
                 prisma_client=prisma_client,
@@ -620,23 +858,6 @@ class DBSpendUpdateWriter:
                 verbose_proxy_logger.debug(
                     "disable_spend_logs=True. Skipping writing spend logs to db. Other spend updates - Key/User/Team table will still occur."
                 )
-
-            # Single task replaces 11 create_task() calls
-            asyncio.create_task(
-                self._batch_database_updates(
-                    response_cost=response_cost,
-                    user_id=user_id,
-                    hashed_token=hashed_token,
-                    team_id=team_id,
-                    org_id=org_id,
-                    project_id=project_id,
-                    end_user_id=end_user_id,
-                    prisma_client=prisma_client,
-                    litellm_proxy_budget_name=litellm_proxy_budget_name,
-                    payload=payload,
-                    request_model_access_groups=get_request_model_access_groups(kwargs),
-                )
-            )
 
             self._enqueue_tool_registry_upsert(
                 kwargs=kwargs,
@@ -659,7 +880,166 @@ class DBSpendUpdateWriter:
                 org_id,
                 end_user_id,
             )
+            if prisma_client is not None:
+                raise
             return True
+
+    async def flush_accounting(self, prisma_client: PrismaClient) -> int:
+        return await SpendAccountingStore.from_client(prisma_client).flush(apply_accounting_events)
+
+    async def _accounting_effects(
+        self,
+        *,
+        payload: SpendLogsPayload,
+        prisma_client: PrismaClient,
+        token: str | None,
+        user_id: str | None,
+        end_user_id: str | None,
+        team_id: str | None,
+        org_id: str | None,
+        project_id: str | None,
+        global_budget_user: str | None,
+        request_model_access_groups: Sequence[str],
+        completion_response: object,
+        kwargs: Mapping[str, object] | None,
+        keep_log: bool,
+    ) -> AccountingEffects:
+        from litellm.proxy.db.spend_log_tool_index import build_tool_usage_transaction
+
+        cost: Final = payload["spend"]
+        groups: Final = debitable_model_access_groups(
+            request_model_access_groups, payload.get("model_id"), get_llm_router()
+        )
+        scalar_targets: Final = (
+            ("key", token),
+            ("user", user_id),
+            ("user", global_budget_user),
+            ("end_user", end_user_id),
+            ("team", team_id),
+            ("org", org_id),
+            ("project", project_id),
+            ("agent", payload.get("agent_id")),
+        )
+        charges: Final = (
+            *(
+                EntityCharge.model_validate({"entity": kind, "entity_id": identity, "spend": cost})
+                for kind, identity in scalar_targets
+                if identity is not None
+            ),
+            *(
+                EntityCharge(entity="tag", entity_id=tag, spend=cost)
+                for tag in daily_spend_entity_ids(payload, "tag")
+                if tag
+            ),
+            *(EntityCharge(entity="model_access_group", entity_id=group, spend=cost) for group in groups),
+            *(
+                (EntityCharge(entity="team_member", entity_id=team_id, user_id=user_id, spend=cost),)
+                if team_id is not None and user_id is not None
+                else ()
+            ),
+            *(
+                (EntityCharge(entity="org_member", entity_id=org_id, user_id=user_id, spend=cost),)
+                if org_id is not None and user_id is not None
+                else ()
+            ),
+        )
+        base: Final = await self._common_add_spend_log_transaction_to_daily_transaction(payload, prisma_client)
+        daily: Final = (
+            (tuple(self._accounting_daily_rows(payload, base, entity)) for entity in DAILY_SPEND_TABLES)
+            if base is not None
+            else ()
+        )
+        autorouter, baseline = await self._accounting_autorouter(payload, prisma_client, keep_log)
+        tools: Final = (
+            build_tool_usage_transaction(
+                request_id=payload["request_id"],
+                start_time_iso=str(payload["startTime"]),
+                mcp_namespaced_tool_name=payload["mcp_namespaced_tool_name"],
+                spend=cost,
+                total_tokens=payload["total_tokens"],
+                completion_response=completion_response,
+                realtime_tool_calls=None if kwargs is None else kwargs.get("realtime_tool_calls"),
+            )
+            if keep_log
+            else None
+        )
+        return AccountingEffects(
+            charges=charges,
+            daily=tuple(chain.from_iterable(daily)),
+            windows=await self._accounting_windows(prisma_client, token, team_id, cost, payload["startTime"]),
+            model_usage=build_model_usage_transaction(payload),
+            tools=tools,
+            autorouter=autorouter,
+            baseline=baseline,
+        )
+
+    @staticmethod
+    def _accounting_daily_rows(
+        payload: SpendLogsPayload, base: BaseDailySpendTransaction, entity: DailySpendEntity
+    ) -> tuple[DailyCharge, ...]:
+        table: Final = DAILY_SPEND_TABLES[entity]
+        return tuple(
+            DailyCharge(
+                entity=entity,
+                row_json=json.dumps(
+                    {
+                        **base,
+                        table.entity_id_column: identity,
+                        **({"request_id": payload["request_id"]} if entity == "tag" else {}),
+                    },
+                    allow_nan=False,
+                ),
+            )
+            for identity in daily_spend_entity_ids(payload, entity)
+        )
+
+    async def _accounting_windows(
+        self,
+        prisma_client: PrismaClient,
+        token: str | None,
+        team_id: str | None,
+        cost: float,
+        started_at: datetime | str,
+    ) -> tuple[WindowCharge, ...]:
+        if not cost:
+            return ()
+        from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import to_naive_utc
+        from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
+
+        async with SpendAccountingStore.from_client(prisma_client).transaction_factory() as db:
+            scopes: Final = await db.query_raw(
+                "SELECT 'key' AS entity, token AS identity, budget_limits FROM \"LiteLLM_VerificationToken\" "
+                "WHERE token = $1 UNION ALL SELECT 'team' AS entity, team_id AS identity, budget_limits "
+                'FROM "LiteLLM_TeamTable" WHERE team_id = $2',
+                token,
+                team_id,
+            )
+
+        def scope(row: Mapping[str, object]) -> tuple[WindowCharge, ...]:
+            stored: Final = row.get("budget_limits")
+            entity: Final = row["entity"]
+            identity: Final = row["identity"]
+            definitions: Final = (
+                _ACCOUNTING_WINDOWS.validate_json(stored)
+                if isinstance(stored, str)
+                else _ACCOUNTING_WINDOWS.validate_python(stored or ())
+            )
+            return tuple(
+                WindowCharge.model_validate(
+                    {
+                        "entity_type": entity,
+                        "entity_id": identity,
+                        "window_duration": window.budget_duration,
+                        "window_start": to_naive_utc(start).isoformat(),
+                        "spend": cost,
+                        "started_at": str(started_at),
+                    }
+                )
+                for window in definitions
+                if window.reset_at and (start := get_budget_window_start(window)) is not None
+            )
+
+        return tuple(chain.from_iterable(scope(row) for row in scopes))
 
     async def _record_spend_log(
         self, payload: SpendLogsPayload, prisma_client: "PrismaClient | None", disable_spend_logs: bool
@@ -816,6 +1196,39 @@ class DBSpendUpdateWriter:
         except Exception as e:
             verbose_proxy_logger.debug("_enqueue_model_usage_transaction error (non-blocking): %s", e)
 
+    async def _accounting_autorouter(
+        self, payload: SpendLogsPayload, prisma_client: PrismaClient, keep_log: bool
+    ) -> tuple["AutoRouterTurnTransaction | None", "BaselineAccountingRecord | None"]:
+        from litellm.proxy.db.autorouter_session_rollup import build_autorouter_turn_transaction
+
+        metadata: Final = _SPEND_METADATA_ADAPTER.validate_json(payload["metadata"])
+        decision: Final = _accounting_mapping(metadata.get("routing_decision"))
+        if not decision:
+            return None, None
+        savings: Final = compute_savings_spend(
+            model=payload["model"],
+            custom_llm_provider=payload["custom_llm_provider"],
+            compression_saved_tokens=0,
+            gateway_injected_cache=marks_gateway_injection(metadata, payload["model_id"]),
+            routing_decision=decision,
+            usage_object=_accounting_mapping(metadata.get("usage_object")),
+            model_id=payload["model_id"],
+            llm_router=get_llm_router,
+            cost_breakdown=_accounting_mapping(metadata.get("cost_breakdown")),
+            recorded_autorouter_savings=metadata.get("autorouter_savings"),
+            recorded_autorouter_savings_estimate=_accounting_mapping(metadata.get("autorouter_savings_estimate")),
+            billed_at=payload["endTime"],
+        )
+        turn: Final = build_autorouter_turn_transaction(
+            payload=payload, metadata=metadata, saved_spend=savings.autorouter
+        )
+        baseline: Final = (
+            await self._build_baseline_accounting(payload, metadata, turn, prisma_client) if keep_log else None
+        )
+        if baseline is not None:
+            return None, baseline
+        return (turn if keep_log or turn is None else dataclasses.replace(turn, session_id="")), None
+
     async def _enqueue_autorouter_turn_transaction(
         self,
         payload: SpendLogsPayload,
@@ -886,36 +1299,9 @@ class DBSpendUpdateWriter:
         turn: "AutoRouterTurnTransaction | None",
         prisma_client: "PrismaClient",
     ) -> bool:
-        from litellm.proxy.db.baseline_accounting import (
-            BaselineAccountingRecord,
-        )
-        from litellm.proxy.hooks.autorouter_baseline_cache import CapturedBaselineObservation
-        from litellm.proxy.spend_tracking.savings import baseline_cost_snapshot
-
-        serialized: Final = metadata.get("autorouter_baseline_observation")
-        if not isinstance(serialized, str):
+        record: Final = await self._build_baseline_accounting(payload, metadata, turn, prisma_client)
+        if record is None:
             return False
-        captured: Final = CapturedBaselineObservation.model_validate_json(serialized)
-        if captured.api_key != payload["api_key"] or captured.session_id != payload["session_id"]:
-            return False
-        decision: Final = _SPEND_METADATA_ADAPTER.validate_python(
-            metadata.get("routing_decision") or MappingProxyType({})
-        )
-        breakdown: Final = _SPEND_METADATA_ADAPTER.validate_python(
-            metadata.get("cost_breakdown") or MappingProxyType({})
-        )
-        daily: Final = await self._baseline_daily_attribution(payload, prisma_client)
-        record: Final = BaselineAccountingRecord(
-            scope=captured.scope,
-            api_key=captured.api_key,
-            session_id=captured.session_id,
-            router_name=captured.router_name,
-            baseline_model=captured.baseline_model,
-            observation=captured.observation.model_copy(update=MappingProxyType({"request_id": payload["request_id"]})),
-            pricing=baseline_cost_snapshot(captured.model, captured.prices, payload["spend"], breakdown, decision),
-            turn=turn,
-            daily=daily,
-        )
         async with prisma_client.baseline_accounting_lock:
             if len(prisma_client.baseline_accounting_transactions) >= 10000:
                 verbose_proxy_logger.warning("Auto-router baseline observation queue is full")
@@ -926,12 +1312,53 @@ class DBSpendUpdateWriter:
         request_spend_log_flush(prisma_client)
         return True
 
+    async def _build_baseline_accounting(
+        self,
+        payload: SpendLogsPayload,
+        metadata: Mapping[str, object],
+        turn: "AutoRouterTurnTransaction | None",
+        prisma_client: "PrismaClient",
+    ) -> "BaselineAccountingRecord | None":
+        from litellm.proxy.db.baseline_accounting import (
+            BaselineAccountingRecord,
+        )
+        from litellm.proxy.hooks.autorouter_baseline_cache import CapturedBaselineObservation
+        from litellm.proxy.spend_tracking.savings import baseline_cost_snapshot
+
+        serialized: Final = metadata.get("autorouter_baseline_observation")
+        if not isinstance(serialized, str):
+            return None
+        captured: Final = CapturedBaselineObservation.model_validate_json(serialized)
+        if captured.api_key != payload["api_key"] or captured.session_id != payload["session_id"]:
+            return None
+        decision: Final = _SPEND_METADATA_ADAPTER.validate_python(
+            metadata.get("routing_decision") or MappingProxyType({})
+        )
+        breakdown: Final = _SPEND_METADATA_ADAPTER.validate_python(
+            metadata.get("cost_breakdown") or MappingProxyType({})
+        )
+        daily: Final = await self._baseline_daily_attribution(payload, prisma_client)
+        return BaselineAccountingRecord(
+            scope=captured.scope,
+            api_key=captured.api_key,
+            session_id=captured.session_id,
+            router_name=captured.router_name,
+            baseline_model=captured.baseline_model,
+            observation=captured.observation.model_copy(update=MappingProxyType({"request_id": payload["request_id"]})),
+            pricing=baseline_cost_snapshot(captured.model, captured.prices, payload["spend"], breakdown, decision),
+            turn=turn,
+            daily=daily,
+        )
+
     async def _baseline_daily_attribution(
         self,
         payload: SpendLogsPayload,
         prisma_client: "PrismaClient",
     ) -> "DailyBaselineAttribution | None":
-        from litellm.proxy.db.baseline_accounting import DailyBaselineAttribution, DailyBaselineTarget
+        from litellm.proxy.db.baseline_accounting import (
+            DailyBaselineAttribution,
+            DailyBaselineTarget,
+        )
 
         normalized: Final = cast(SpendLogsPayload, MappingProxyType({**payload, "end_user_id": payload["end_user"]}))
         bases: Final = tuple(
@@ -1065,7 +1492,7 @@ class DBSpendUpdateWriter:
         payload: SpendLogsPayload,
         request_model_access_groups: Sequence[str] = (),
         project_id: str | None = None,
-    ):
+    ) -> None:
         """
         Runs all 13 spend-update helpers sequentially inside a single asyncio task.
 
@@ -1248,6 +1675,15 @@ class DBSpendUpdateWriter:
             )
 
         await self._enqueue_model_usage_transaction(payload=payload_copy, prisma_client=prisma_client)
+
+    def _record_batch_database_update_task_result(self, task: asyncio.Task[None]) -> None:
+        self._batch_database_update_tasks.discard(task)
+        if task.cancelled():
+            self._batch_database_update_failure = RuntimeError("Spend rollup enqueue was cancelled")
+        else:
+            task_exception: Final = task.exception()
+            if task_exception is not None:
+                self._batch_database_update_failure = task_exception
 
     async def _update_key_db(
         self,
@@ -1585,7 +2021,7 @@ class DBSpendUpdateWriter:
         prisma_client: PrismaClient,
         n_retry_times: int,
         proxy_logging_obj: ProxyLogging,
-    ):
+    ) -> None:
         """
         Handles commiting update spend transactions to db
 
@@ -1603,19 +2039,43 @@ class DBSpendUpdateWriter:
         else:
             - Regular flow of this method
         """
-        if RedisUpdateBuffer.should_commit_spend_updates_to_redis():
-            await self._commit_spend_updates_to_db_with_redis(
-                prisma_client=prisma_client,
-                n_retry_times=n_retry_times,
-                proxy_logging_obj=proxy_logging_obj,
-            )
+        async with self._spend_update_commit_lock:
+            if RedisUpdateBuffer.should_commit_spend_updates_to_redis():
+                await self._commit_spend_updates_to_db_with_redis(
+                    prisma_client=prisma_client,
+                    n_retry_times=n_retry_times,
+                    proxy_logging_obj=proxy_logging_obj,
+                )
+            else:
+                await self._commit_spend_updates_to_db_without_redis_buffer(
+                    prisma_client=prisma_client,
+                    n_retry_times=n_retry_times,
+                    proxy_logging_obj=proxy_logging_obj,
+                )
 
-        else:
-            await self._commit_spend_updates_to_db_without_redis_buffer(
+    async def flush_spend_updates_on_shutdown(
+        self,
+        prisma_client: PrismaClient,
+        proxy_logging_obj: ProxyLogging,
+    ) -> None:
+        while self._batch_database_update_tasks:
+            for task_result in await asyncio.gather(*tuple(self._batch_database_update_tasks), return_exceptions=True):
+                if isinstance(task_result, BaseException):
+                    self._batch_database_update_failure = task_result
+
+        from litellm.proxy.utils import update_daily_tag_spend
+
+        try:
+            await self.db_update_spend_transaction_handler(
                 prisma_client=prisma_client,
-                n_retry_times=n_retry_times,
+                n_retry_times=3,
                 proxy_logging_obj=proxy_logging_obj,
             )
+        finally:
+            await update_daily_tag_spend(prisma_client=prisma_client, proxy_logging_obj=proxy_logging_obj)
+
+        if self._batch_database_update_failure is not None:
+            raise RuntimeError("Spend rollup enqueue failed before shutdown") from self._batch_database_update_failure
 
     async def _commit_spend_updates_to_db_with_redis(
         self,
@@ -1952,14 +2412,15 @@ class DBSpendUpdateWriter:
         Commit only tag spend updates to database.
         This is called by a separate scheduler job at a longer interval.
         """
-        await self._flush_daily_spend_queue(
-            queue=self.daily_tag_spend_update_queue,
-            entity_type="tag",
-            commit=DBSpendUpdateWriter.update_daily_tag_spend,
-            n_retry_times=n_retry_times,
-            prisma_client=prisma_client,
-            proxy_logging_obj=proxy_logging_obj,
-        )
+        async with self._daily_tag_spend_commit_lock:
+            await self._flush_daily_spend_queue(
+                queue=self.daily_tag_spend_update_queue,
+                entity_type="tag",
+                commit=DBSpendUpdateWriter.update_daily_tag_spend,
+                n_retry_times=n_retry_times,
+                prisma_client=prisma_client,
+                proxy_logging_obj=proxy_logging_obj,
+            )
 
     _commit_daily_tag_spend_to_db = commit_daily_tag_spend_to_db
 
@@ -1975,31 +2436,32 @@ class DBSpendUpdateWriter:
         This lets the dedicated daily tag scheduler drain both in-memory and
         Redis-backed tag transactions.
         """
-        await self.redis_update_buffer.store_in_memory_daily_tag_spend_updates_in_redis(
-            daily_tag_spend_update_queue=self.daily_tag_spend_update_queue,
-        )
+        async with self._daily_tag_spend_commit_lock:
+            await self.redis_update_buffer.store_in_memory_daily_tag_spend_updates_in_redis(
+                daily_tag_spend_update_queue=self.daily_tag_spend_update_queue,
+            )
 
-        if await self.pod_lock_manager.acquire_lock(
-            cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
-        ):
-            verbose_proxy_logger.debug("acquired lock for daily tag spend updates")
-            try:
-                await self._drain_and_commit_daily_tag_spend_from_redis(
-                    prisma_client=prisma_client,
-                    n_retry_times=n_retry_times,
-                    proxy_logging_obj=proxy_logging_obj,
-                )
-            except Exception as e:
-                spend_log_error(
-                    "Spend tracking - failed to commit daily tag spend updates from Redis to DB. "
-                    "Re-queuing to Redis for retry on next tick. Error: %s",
-                    str(e),
-                    exc=e,
-                )
-            finally:
-                await self.pod_lock_manager.release_lock(
-                    cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
-                )
+            if await self.pod_lock_manager.acquire_lock(
+                cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
+            ):
+                verbose_proxy_logger.debug("acquired lock for daily tag spend updates")
+                try:
+                    await self._drain_and_commit_daily_tag_spend_from_redis(
+                        prisma_client=prisma_client,
+                        n_retry_times=n_retry_times,
+                        proxy_logging_obj=proxy_logging_obj,
+                    )
+                except Exception as e:
+                    spend_log_error(
+                        "Spend tracking - failed to commit daily tag spend updates from Redis to DB. "
+                        "Re-queuing to Redis for retry on next tick. Error: %s",
+                        str(e),
+                        exc=e,
+                    )
+                finally:
+                    await self.pod_lock_manager.release_lock(
+                        cronjob_id=DB_DAILY_TAG_SPEND_UPDATE_JOB_NAME,
+                    )
 
     _commit_daily_tag_spend_to_db_with_redis = commit_daily_tag_spend_to_db_with_redis
 

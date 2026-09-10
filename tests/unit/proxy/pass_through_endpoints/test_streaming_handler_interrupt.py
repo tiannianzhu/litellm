@@ -42,6 +42,7 @@ def _unarmed_logging_obj():
     and would spuriously trigger the deferral branch."""
     obj = MagicMock()
     obj._on_deferred_stream_complete = None
+    obj.requires_success_await = False
     return obj
 
 

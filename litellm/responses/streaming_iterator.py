@@ -189,6 +189,11 @@ def _log_background_task_failure(task: asyncio.Task[object], *, task_name: str) 
 _PENDING_LOGGING_TASKS: Final[set[asyncio.Task[object]]] = set()  # mutable-ok: strong refs to pending logging tasks
 
 
+async def drain_pending_responses_logging_tasks() -> None:
+    while _PENDING_LOGGING_TASKS:
+        await asyncio.wait(tuple(_PENDING_LOGGING_TASKS))
+
+
 def _running_loop() -> asyncio.AbstractEventLoop | None:
     try:
         return asyncio.get_running_loop()
@@ -362,6 +367,7 @@ class BaseResponsesAPIStreamingIterator:
     """
 
     _pending_logging_tasks: tuple[asyncio.Task[object], ...] = ()
+    _pending_success_logging_task: asyncio.Task[object] | None = None
 
     def __init__(
         self,
@@ -622,6 +628,10 @@ class BaseResponsesAPIStreamingIterator:
                 # End-of-stream guardrail scans write guardrail_information after
                 # the terminal event; dispatching now would snapshot metadata early.
                 self.logging_obj._deferred_stream_complete_args = (logging_coroutine,)
+            elif self.logging_obj.requires_success_await is True:
+                self._pending_success_logging_task = _spawn_logging_task(
+                    asyncio.get_running_loop(), logging_coroutine, task_name="Responses stream accounting"
+                )
             else:
                 asyncio.create_task(logging_coroutine)
         else:
@@ -1040,6 +1050,15 @@ class BaseResponsesAPIStreamingIterator:
         if pending:
             await asyncio.wait(pending)
 
+    async def _await_pending_success_logging(self) -> None:
+        pending: Final = self._pending_success_logging_task
+        if pending is not None:
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                await asyncio.shield(pending)
+                raise
+
     def _note_yielded_event(self, event: ResponsesAPIStreamingResponse) -> None:
         self._yielded_first_chunk = True
         if event.type not in PRE_OUTPUT_LIFECYCLE_EVENT_TYPES:
@@ -1128,10 +1147,12 @@ class ResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
 
     async def __anext__(self) -> ResponsesAPIStreamingResponse:
         try:
-            return await self._next_event()
+            event: Final = await self._next_event()
         except Exception:
             await self._await_pending_logging()
             raise
+        await self._await_pending_success_logging()
+        return event
 
     async def _next_event(self) -> ResponsesAPIStreamingResponse:
         try:
@@ -1331,6 +1352,7 @@ class MockResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         if getattr(evt, "type", None) == openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
             self.completed_response = evt
             self._log_completed_response(is_async=True)
+            await self._await_pending_success_logging()
         return evt
 
     def __iter__(self):
@@ -1398,6 +1420,7 @@ class CachedResponsesAPIStreamingIterator(BaseResponsesAPIStreamingIterator):
         if getattr(evt, "type", None) == openai_types.ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
             self.completed_response = evt
             self._log_completed_response(is_async=True)
+            await self._await_pending_success_logging()
         return evt
 
     def __iter__(self):

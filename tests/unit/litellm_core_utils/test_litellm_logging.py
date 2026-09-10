@@ -22,7 +22,7 @@ import pytest_asyncio
 from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
 from openai import AsyncOpenAI
 from openai._legacy_response import HttpxBinaryResponseContent
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 import litellm
 from litellm._internal_context import in_post_response_phase
@@ -12319,6 +12319,101 @@ class _BlockedSuccessLogger(CustomLogger):
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         self.responses.append(response_obj.id)
+
+
+@pytest.mark.usefixtures("isolate_litellm_state", "drain_logging_worker")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", (False, True))
+@pytest.mark.parametrize("logging_only", (False, True))
+async def test_durable_success_includes_logging_hook_audit_before_background_sends(
+    stream: bool, logging_only: bool
+) -> None:
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    class AuditGuardrail(CustomGuardrail):
+        hook_calls: int = 0
+
+        async def async_logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            self.hook_calls += 1
+            payload: Final = TypeAdapter(dict[str, object]).validate_python(kwargs["standard_logging_object"])
+            return {
+                **kwargs,
+                "standard_logging_object": {
+                    **payload,
+                    "guardrail_information": [{"guardrail_name": self.guardrail_name, "guardrail_status": "success"}],
+                },
+            }, result
+
+    class CapturingLogger(CustomLogger):
+        def __init__(self, durable: bool) -> None:
+            super().__init__()
+            self.durable = durable
+            self.hook_calls = 0
+            self.audit_json: str | None = None
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        @property
+        def requires_success_await(self) -> bool:
+            return self.durable
+
+        async def async_logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            self.hook_calls += 1
+            return kwargs, result
+
+        async def async_log_success_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            self.audit_json = json.dumps(kwargs["standard_logging_object"], default=str)
+            self.entered.set()
+            if not self.durable:
+                await self.release.wait()
+            self.finished.set()
+
+    durable: Final = CapturingLogger(durable=True)
+    external: Final = CapturingLogger(durable=False)
+    guardrail: Final = AuditGuardrail(
+        guardrail_name="audit-fixture",
+        default_on=True,
+        event_hook=GuardrailEventHooks.logging_only if logging_only else GuardrailEventHooks.pre_call,
+    )
+    logging_obj: Final = LitellmLogging(
+        model="hosted_vllm/logging-fixture",
+        messages=[],
+        stream=stream,
+        call_type=CallTypes.acompletion.value,
+        start_time=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+        litellm_call_id="durable-hook-order",
+        function_id="durable-hook-order",
+        dynamic_async_success_callbacks=[durable, guardrail, external],
+    )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="hosted_vllm")
+    response: Final = ModelResponse(
+        model="hosted_vllm/logging-fixture",
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    response._hidden_params["response_cost"] = 0.01
+    try:
+        await asyncio.wait_for(logging_obj.async_success_handler(result=response), timeout=5)
+        await asyncio.wait_for(external.entered.wait(), timeout=5)
+        assert durable.finished.is_set()
+        assert not external.finished.is_set()
+        assert durable.audit_json is not None
+        payload: Final = TypeAdapter(dict[str, object]).validate_json(durable.audit_json)
+        assert payload.get("guardrail_information") == (
+            [{"guardrail_name": "audit-fixture", "guardrail_status": "success"}] if logging_only else None
+        )
+    finally:
+        external.release.set()
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+    assert (durable.hook_calls, guardrail.hook_calls, external.hook_calls) == (1, int(logging_only), 1)
+    assert external.finished.is_set()
 
 
 @pytest.mark.asyncio

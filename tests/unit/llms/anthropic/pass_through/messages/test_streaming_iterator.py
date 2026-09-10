@@ -1,12 +1,13 @@
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
-from datetime import datetime
+from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Final, Literal
 from unittest.mock import patch
 
 import pytest
-
+from pydantic import TypeAdapter
 
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -18,6 +19,7 @@ from litellm.llms.anthropic.pass_through.messages.streaming_iterator import (
     BaseAnthropicMessagesStreamingIterator,
     SafeguardedAnthropicSSEStream,
     _incomplete_stream_error_sse_event,
+    aclose_if_supported,
     anthropic_messages_response_as_sse_events,
     is_anthropic_content_delta_chunk,
     is_anthropic_ping_chunk,
@@ -26,7 +28,7 @@ from litellm.llms.anthropic.pass_through.messages.streaming_iterator import (
     parse_anthropic_error_event,
 )
 from litellm.llms.anthropic.pass_through.safeguards import SafeguardsEvaluator
-from litellm.types.utils import Choices, Message, ModelResponse
+from litellm.types.utils import Choices, Message, ModelResponse, Usage
 
 
 class _RecordingLoggingIterator(BaseAnthropicMessagesStreamingIterator):
@@ -1395,6 +1397,104 @@ async def test_client_disconnect_enqueues_immediately_even_when_deferred_dispatc
     assert len(worker.enqueued) == 1
     assert getattr(iterator.litellm_logging_obj, "_deferred_stream_complete_args", None) is None
     worker.close_enqueued()
+
+
+class _DurableMessagesRecorder(CustomLogger):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.fail = fail
+        self.calls = 0
+        self.usage: Usage | None = None
+
+    @property
+    def requires_success_await(self) -> bool:
+        return True
+
+    async def async_log_success_event(
+        self, kwargs: Mapping[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        self.calls += 1
+        self.usage = TypeAdapter(Usage).validate_python(kwargs.get("standard_logging_object"))
+        self.started.set()
+        await self.release.wait()
+        if self.fail:
+            raise RuntimeError("controlled accounting failure")
+        self.finished.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("connected", "cancel", "disconnect", "deferred_disconnect"))
+@pytest.mark.parametrize("fail", (False, True))
+async def test_messages_stream_termination_waits_for_obtained_usage_accounting(mode: str, fail: bool) -> None:
+    recorder: Final = _DurableMessagesRecorder(fail=fail)
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="controlled-accounting-model",
+        messages=[],
+        stream=True,
+        call_type="anthropic_messages",
+        start_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="messages-accounting",
+        function_id="messages-accounting",
+        dynamic_async_success_callbacks=[recorder],
+    )
+    iterator: Final = BaseAnthropicMessagesStreamingIterator(
+        litellm_logging_obj=logging_obj, request_body={"model": "controlled-accounting-model"}
+    )
+    upstream_exhausted: Final = asyncio.Event()
+
+    async def stream() -> AsyncIterator[Mapping[str, object]]:
+        for event in (*_STREAM_PREFIX, *_STREAM_TAIL):
+            yield event
+        upstream_exhausted.set()
+
+    async def dispatch_deferred(logging_coroutine: Coroutine[None, None, None]) -> None:
+        await logging_coroutine
+
+    if mode == "deferred_disconnect":
+        logging_obj._on_deferred_stream_complete = dispatch_deferred
+    wrapped: Final = iterator.async_sse_wrapper(stream())
+
+    async def terminate() -> None:
+        if mode in ("connected", "cancel"):
+            async for _ in wrapped:
+                pass
+        else:
+            await aclose_if_supported(wrapped)
+
+    if mode not in ("connected", "cancel"):
+        await wrapped.__anext__()
+        await asyncio.wait_for(upstream_exhausted.wait(), timeout=5)
+    pending: Final = asyncio.create_task(terminate())
+    try:
+        await asyncio.wait_for(recorder.started.wait(), timeout=5)
+        assert not pending.done()
+        if mode == "cancel":
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+        recorder.release.set()
+        if fail:
+            with pytest.raises(RuntimeError, match="controlled accounting failure"):
+                await asyncio.wait_for(pending, timeout=5)
+        elif mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=5)
+            assert recorder.finished.is_set()
+        else:
+            await asyncio.wait_for(pending, timeout=5)
+            assert recorder.finished.is_set()
+        assert recorder.calls == 1
+        assert recorder.usage is not None
+        assert (recorder.usage.prompt_tokens, recorder.usage.completion_tokens) == (52, 64)
+    finally:
+        recorder.release.set()
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
 
 
 @pytest.mark.asyncio

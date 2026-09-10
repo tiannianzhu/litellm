@@ -268,9 +268,16 @@ class PassThroughStreamingHandler:
             if not logging_scheduled and raw_bytes and response.status_code < 400:
                 logging_scheduled = True
                 try:
-                    GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=_build_logging_coroutine())
+                    success: Final = _build_logging_coroutine()
+                    if litellm_logging_obj.requires_success_await is True:
+                        bind_budget_reservation_to_callbacks(litellm_logging_obj.litellm_params)
+                        await success
+                    else:
+                        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
                 except Exception as e:
                     verbose_proxy_logger.error("Error scheduling chunk_processor logging: %s", e)
+                    if litellm_logging_obj.requires_success_await is True:
+                        raise
                 else:
                     bind_budget_reservation_to_callbacks(litellm_logging_obj.litellm_params)
 
@@ -372,6 +379,8 @@ class PassThroughStreamingHandler:
             )
         except Exception as e:
             verbose_proxy_logger.error("Error in _route_streaming_logging_to_handler: %s", e)
+            if litellm_logging_obj.requires_success_await is True:
+                raise
 
     _route_streaming_logging_to_handler = route_streaming_logging_to_handler
 

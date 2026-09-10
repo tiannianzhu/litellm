@@ -2777,9 +2777,9 @@ class ProxyBaseLLMRequestProcessing:
         # so _enqueue_deferred_logging is never stored — the finally
         # block is a no-op.  The CSW path handles this correctly via
         # _on_deferred_stream_complete, which fires its own logging.
-        if _post_call_guardrails_active and not self._is_streaming_request(
-            data=self.data, is_streaming_request=is_streaming_request
-        ):
+        if (
+            _post_call_guardrails_active or logging_obj.requires_success_await is True
+        ) and not self._is_streaming_request(data=self.data, is_streaming_request=is_streaming_request):
             logging_obj.defer_async_logging = True
 
         tasks: Final = []
@@ -3055,6 +3055,10 @@ class ProxyBaseLLMRequestProcessing:
                 logging_obj=logging_obj,
                 exception_raised=_exception_raised,
             )
+            if not _exception_raised and logging_obj.requires_success_await is True:
+                if logging_obj.call_type in ("ocr", "aocr"):
+                    await logging_obj.async_success_handler(response)
+                await logging_obj.await_success_accounting()
 
             # Streaming cleanup: if an exception occurred AND the deferred
             # streaming closure is still set, no streaming route will
@@ -3679,7 +3683,10 @@ class ProxyBaseLLMRequestProcessing:
         async def _on_deferred_native_stream_complete(*args: object) -> None:
             match args:
                 case (logging_coroutine,) if asyncio.iscoroutine(logging_coroutine):
-                    GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
+                    if _captured_native_logging_obj.requires_success_await is True:
+                        await logging_coroutine
+                    else:
+                        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
                 case (assembled_response, cache_hit):
                     await _as_success_dispatcher(_captured_native_logging_obj).dispatch_success_handlers(
                         assembled_response,
@@ -3788,20 +3795,24 @@ class ProxyBaseLLMRequestProcessing:
                 # callbacks fire regardless of the call-type heuristic in
                 # _is_sync_litellm_request (which only recognizes a subset of
                 # async markers stored in litellm_params).
-                asyncio.create_task(
-                    _as_success_dispatcher(captured_logging_obj).dispatch_success_handlers(
-                        _response,
-                        cache_hit=cache_hit,
-                        start_time=None,
-                        end_time=None,
-                        prefer_async_handlers=True,
-                    )
+                success: Final = _as_success_dispatcher(captured_logging_obj).dispatch_success_handlers(
+                    _response,
+                    cache_hit=cache_hit,
+                    start_time=None,
+                    end_time=None,
+                    prefer_async_handlers=True,
                 )
+                if captured_logging_obj.requires_success_await is True:
+                    await success
+                else:
+                    asyncio.create_task(success)
             except Exception as e:
                 verbose_proxy_logger.exception(
                     "Error in deferred streaming success logging: %s",
                     e,
                 )
+                if captured_logging_obj.requires_success_await is True:
+                    raise
 
     def _apply_router_cooldown_retry_after(self, headers: dict, e: Exception) -> None:
         if isinstance(e, RouterRateLimitError) and e.cooldown_time > 0:
@@ -4013,7 +4024,7 @@ class ProxyBaseLLMRequestProcessing:
                 )
             if recorded_client_disconnect:
                 deferred_stream_logging_armed: Final = _deferred_stream_logging_is_armed(request_data)
-                ProxyLogging.fire_deferred_stream_logging(request_data)
+                await ProxyLogging.await_deferred_stream_logging(request_data)
                 # A disconnect-time success event (the deferred-guardrail flush
                 # above, or the partial-spend billing below) releases the
                 # request's max_parallel_requests slot through the limiter's

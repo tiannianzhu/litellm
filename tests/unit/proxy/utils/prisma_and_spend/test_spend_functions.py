@@ -40,6 +40,7 @@ async def test_update_spend_invokes_writer_and_skips_empty_queue(
     proxy_logging = MagicMock()
     proxy_logging.db_spend_update_writer = MagicMock()
     proxy_logging.db_spend_update_writer.db_update_spend_transaction_handler = AsyncMock()
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
     mock_prisma_client.spend_log_transactions = []
 
     await update_spend(
@@ -71,6 +72,7 @@ async def test_update_spend_processes_logs_when_queue_nonempty(
     proxy_logging = MagicMock()
     proxy_logging.db_spend_update_writer = MagicMock()
     proxy_logging.db_spend_update_writer.db_update_spend_transaction_handler = AsyncMock()
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
     mock_prisma_client.spend_log_transactions = [make_spend_log_row(request_id="r1")]
 
     import litellm.proxy.utils as utils_mod
@@ -95,6 +97,7 @@ async def test_update_spend_handler_failure_propagates(
     proxy_logging.db_spend_update_writer.db_update_spend_transaction_handler = AsyncMock(
         side_effect=RuntimeError("handler down")
     )
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
     with pytest.raises(RuntimeError, match="handler down"):
         await update_spend(
             prisma_client=mock_prisma_client,
@@ -461,6 +464,7 @@ async def test_monitor_spend_logs_queue_invokes_job_when_queue_nonempty(
     monkeypatch.setattr(constants_mod, "SPEND_LOG_QUEUE_POLL_INTERVAL", 0.0, raising=False)
     monkeypatch.setattr(constants_mod, "SPEND_LOG_QUEUE_SIZE_THRESHOLD", 1, raising=False)
     proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
     mock_prisma_client.spend_log_transactions = [make_spend_log_row(request_id="r1")]
 
     cancel_after = {"n": 0}
@@ -503,6 +507,7 @@ async def test_monitor_spend_logs_queue_swallows_errors_and_backs_off(
 
     monkeypatch.setattr(utils_mod.asyncio, "sleep", _short_sleep)
     proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
 
     bad_lock = MagicMock()
     bad_lock.__aenter__ = AsyncMock(side_effect=RuntimeError("lock broken"))
@@ -542,11 +547,13 @@ async def test_monitor_spend_logs_queue_flushes_as_soon_as_one_is_requested(
 
     monkeypatch.setattr(utils_mod, "update_spend_logs_job", _fake_job)
 
+    proxy_logging: Final = MagicMock()
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
     monitor: Final = asyncio.create_task(
         monitor_spend_logs_queue(
             prisma_client=mock_prisma_client,
             db_writer_client=None,
-            proxy_logging_obj=MagicMock(),
+            proxy_logging_obj=proxy_logging,
         )
     )
     try:
@@ -588,11 +595,13 @@ def test_monitor_spend_logs_queue_flush_survives_an_earlier_event_loop(
         monkeypatch.setattr(utils_mod, "update_spend_logs_job", _fake_job)
         mock_prisma_client.spend_log_transactions = []
 
+        proxy_logging: Final = MagicMock()
+        proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
         monitor: Final = asyncio.create_task(
             monitor_spend_logs_queue(
                 prisma_client=mock_prisma_client,
                 db_writer_client=None,
-                proxy_logging_obj=MagicMock(),
+                proxy_logging_obj=proxy_logging,
             )
         )
         try:
@@ -640,11 +649,13 @@ async def test_flush_requested_before_the_monitor_starts_costs_the_row_nothing(
     request_spend_log_flush(mock_prisma_client)
     assert mock_prisma_client.spend_log_flush_requested is None
 
+    proxy_logging: Final = MagicMock()
+    proxy_logging.db_spend_update_writer.flush_accounting = AsyncMock(return_value=0)
     monitor: Final = asyncio.create_task(
         monitor_spend_logs_queue(
             prisma_client=mock_prisma_client,
             db_writer_client=None,
-            proxy_logging_obj=MagicMock(),
+            proxy_logging_obj=proxy_logging,
         )
     )
     try:

@@ -2,14 +2,16 @@ import asyncio
 import json
 import threading
 import time
-from typing import Final, NoReturn, Optional
+from datetime import datetime
+from typing import Final, Literal, NoReturn, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 import litellm
-from litellm import verbose_logger
+from litellm import completion, verbose_logger
 from litellm._logging import session_id_var, trace_id_var
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.streaming_handler import (
     CustomStreamWrapper,
@@ -27,8 +29,6 @@ from litellm.types.utils import (
     Usage,
 )
 from litellm.utils import ModelResponseListIterator
-from litellm import completion
-from typing import Tuple
 
 
 @pytest.mark.parametrize("async_stream", [False, True])
@@ -6435,6 +6435,121 @@ async def test_no_synthetic_finish_reason_logged_when_provider_sent_none(sync_mo
 
     assert response.received_finish_reason is None
     assert all(not (c.choices and c.choices[0].finish_reason) for c in response.chunks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_stream_completion_waits_for_known_usage_accounting(
+    monkeypatch: pytest.MonkeyPatch, deferred: bool, outcome: Literal["success", "failure", "cancel"]
+) -> None:
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.utils import ProxyLogging
+
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+
+    class AccountingLogger(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.total_tokens: int | None = None
+            self.failure_calls: int = 0
+
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: object, response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            entered.set()
+            await release.wait()
+            if outcome == "failure":
+                raise RuntimeError("accounting unavailable")
+            assert isinstance(response_obj, ModelResponse)
+            self.total_tokens = response_obj.usage.total_tokens
+
+        async def async_log_failure_event(
+            self, kwargs: object, response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            self.failure_calls += 1
+
+    callback: Final = AccountingLogger()
+    monkeypatch.setattr(litellm, "_async_success_callback", [])
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    logger: Final = Logging(
+        model="openai/contract-model",
+        messages=[{"role": "user", "content": "contract"}],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime.now(),
+        litellm_call_id="accounting-stream-contract",
+        function_id="accounting-stream-contract",
+        dynamic_async_success_callbacks=[callback],
+        dynamic_async_failure_callbacks=[callback],
+    )
+    stream: Final = CustomStreamWrapper(
+        model="openai/contract-model",
+        custom_llm_provider="openai",
+        logging_obj=logger,
+        completion_stream=ModelResponseListIterator(
+            model_responses=[
+                ModelResponseStream(
+                    choices=[StreamingChoices(index=0, delta=Delta(content="ok"))],
+                ),
+                ModelResponseStream(
+                    choices=[StreamingChoices(index=0, delta=Delta(), finish_reason="stop")],
+                    usage=Usage(prompt_tokens=7, completion_tokens=4, total_tokens=11),
+                ),
+            ]
+        ),
+    )
+    request_data: Final = {"litellm_logging_obj": logger}
+    if deferred:
+        ProxyBaseLLMRequestProcessing(data=request_data)._arm_deferred_stream_dispatch(
+            response=stream,
+            route_type="acompletion",
+            user_api_key_dict=UserAPIKeyAuth(),
+            logging_obj=logger,
+        )
+
+    async def consume() -> None:
+        async for _chunk in stream:
+            pass
+        if deferred:
+            await ProxyLogging.await_deferred_stream_logging(request_data)
+
+    pending: Final = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not pending.done()
+        if outcome == "cancel":
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+        release.set()
+        if outcome == "failure":
+            with pytest.raises(RuntimeError, match="accounting unavailable"):
+                await pending
+            assert callback.total_tokens is None
+        elif outcome == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert callback.total_tokens == 11
+        else:
+            await pending
+            assert callback.total_tokens == 11
+        assert callback.failure_calls == 0
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        await GLOBAL_LOGGING_WORKER.flush()
 
 
 def streaming_format_tests(idx, chunk) -> Tuple[str, bool]:

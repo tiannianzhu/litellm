@@ -5366,7 +5366,7 @@ class TestStreamingClientDisconnectLogging:
             ProxyBaseLLMRequestProcessing,
         )
 
-        fire_spy = MagicMock()
+        fire_spy = MagicMock(return_value=None)
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
             fire_spy,
@@ -5400,7 +5400,7 @@ class TestStreamingClientDisconnectLogging:
             ProxyBaseLLMRequestProcessing,
         )
 
-        fire_spy = MagicMock()
+        fire_spy = MagicMock(return_value=None)
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
             fire_spy,
@@ -5434,7 +5434,7 @@ class TestStreamingClientDisconnectLogging:
 
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
-            MagicMock(),
+            MagicMock(return_value=None),
         )
 
         async def mock_streaming_iterator(*_args, **_kwargs):

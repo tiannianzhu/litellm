@@ -17,6 +17,7 @@ Pins covered:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
@@ -275,7 +276,15 @@ async def test_flush_spend_logs_queue_on_shutdown_drains_before_disconnect(monke
     monkeypatch.setattr(ps, "prisma_client", fake_prisma, raising=False)
     monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
 
+    calls: list[str] = []  # mutable-ok: records shutdown ordering
+    writer = MagicMock()
+    writer.flush_spend_updates_on_shutdown = AsyncMock(side_effect=lambda **_: calls.append("rollups"))
+    proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer = writer
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging, raising=False)
+
     drain = AsyncMock()
+    drain.side_effect = lambda **_: calls.append("spend_logs")
     import litellm.proxy.utils as utils_mod
 
     monkeypatch.setattr(utils_mod, "drain_spend_logs_queue", drain)
@@ -290,12 +299,19 @@ async def test_flush_spend_logs_queue_on_shutdown_drains_before_disconnect(monke
         "drain_calls": 1,
         "drain_prisma": True,
     }
+    assert calls == ["rollups", "spend_logs"]
 
 
 @pytest.mark.asyncio
 async def test_flush_spend_logs_queue_on_shutdown_swallows_drain_errors(monkeypatch):
     monkeypatch.setattr(ps, "prisma_client", MagicMock(), raising=False)
     monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+
+    writer = MagicMock()
+    writer.flush_spend_updates_on_shutdown = AsyncMock()
+    proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer = writer
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging, raising=False)
 
     import litellm.proxy.utils as utils_mod
 

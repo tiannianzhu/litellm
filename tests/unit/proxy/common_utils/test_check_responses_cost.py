@@ -12,10 +12,16 @@ from typing import Final
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from litellm_enterprise.proxy.common_utils.check_responses_cost import (
+    BilledBackgroundResponse,
+    BilledCharge,
+    BilledResponseLogger,
+    log_billed_background_response,
+)
 from prisma.errors import UniqueViolationError
-from litellm_enterprise.proxy.common_utils.check_responses_cost import BilledBackgroundResponse, BilledCharge
 
 from litellm.constants import MAX_OBJECTS_PER_POLL_CYCLE
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.router import Deployment, LiteLLM_Params, ModelInfo
 
@@ -127,7 +133,7 @@ class _InMemoryManagedObjectTable:
         return len(matched)
 
 
-def _poller_over(table: _InMemoryManagedObjectTable, billed_logger: _RecordingBilledLogger):
+def _poller_over(table: _InMemoryManagedObjectTable, billed_logger: BilledResponseLogger):
     from litellm_enterprise.proxy.common_utils.check_responses_cost import CheckResponsesCost
 
     prisma_client: Final = MagicMock()
@@ -1600,9 +1606,9 @@ async def _bill_through_a_priced_deployment(
     litellm_params: Mapping[str, object] = _PRICED_LITELLM_PARAMS,
     model_info: Mapping[str, object] = MappingProxyType({}),
 ) -> _PricedBilling:
-    import litellm
     from litellm_enterprise.proxy.common_utils.check_responses_cost import CheckResponsesCost
 
+    import litellm
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
     from litellm.responses.utils import ResponsesAPIRequestUtils
 
@@ -1748,3 +1754,90 @@ async def test_the_billing_event_keys_its_spend_row_apart_from_the_read_it_bills
     assert billed_request_id != billing.response_id
     assert billed_request_id.startswith(billing.response_id)
 
+
+
+class _BillingAdmissionLogger(CustomLogger):
+    def __init__(self, durable: bool, fail_once: bool = False) -> None:
+        super().__init__()
+        self._durable = durable
+        self._fail_once = fail_once
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.accepted: tuple[str, ...] = ()
+
+    @property
+    def requires_success_await(self) -> bool:
+        return self._durable
+
+    async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: ResponsesAPIResponse, start_time: datetime, end_time: datetime
+    ) -> None:
+        self.entered.set()
+        await self.release.wait()
+        if self._fail_once:
+            self._fail_once = False
+            raise RuntimeError("durable billing unavailable")
+        self.accepted = (*self.accepted, response_obj.id)
+
+
+@pytest.mark.asyncio
+async def test_background_billing_waits_for_durable_admission_without_waiting_on_the_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    admission: Final = _BillingAdmissionLogger(durable=True)
+    destination: Final = _BillingAdmissionLogger(durable=False)
+    monkeypatch.setattr(litellm, "_async_success_callback", [admission, destination])
+    billed: Final = BilledBackgroundResponse(
+        response=_terminal_response(), model="openai/gpt-5.6", custom_llm_provider="openai",
+        litellm_params=MappingProxyType({}),
+        metadata={INTERNAL_CALL_ORIGIN_METADATA_KEY: "background_response_cost_poll"},
+    )
+    task: Final = asyncio.create_task(log_billed_background_response(billed))
+    try:
+        await asyncio.wait_for(admission.entered.wait(), timeout=5)
+        assert not task.done()
+        admission.release.set()
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        await asyncio.wait_for(destination.entered.wait(), timeout=5)
+        assert admission.accepted == (billed.response.id,)
+        assert destination.accepted == ()
+    finally:
+        admission.release.set()
+        destination.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_failed_durable_background_admission_releases_the_claim_for_the_next_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    admission: Final = _BillingAdmissionLogger(durable=True, fail_once=True)
+    admission.release.set()
+    monkeypatch.setattr(litellm, "_async_success_callback", [admission])
+    table: Final = _InMemoryManagedObjectTable(
+        rows=(_StoredResponse(id="job-admission", unified_object_id="resp_admission", status="queued"),)
+    )
+    poller: Final = _poller_over(table, log_billed_background_response)
+    response: Final = _terminal_response().model_copy(update={"model": "openai/gpt-5.6"})
+    try:
+        with pytest.raises(RuntimeError, match="durable billing unavailable"):
+            await poller.bill_if_finished("resp_admission", response)
+        assert table.statuses == {"job-admission": "queued"}
+        assert admission.accepted == ()
+
+        charge: Final = await poller.bill_if_finished("resp_admission", response)
+        assert charge is not None
+        assert table.statuses == {"job-admission": "completed"}
+        assert admission.accepted == ("resp_admission",)
+        assert await poller.bill_if_finished("resp_admission", response) is None
+        assert admission.accepted == ("resp_admission",)
+    finally:
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)

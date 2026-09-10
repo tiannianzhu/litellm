@@ -1,7 +1,7 @@
 import asyncio
 import json
 import re
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
@@ -485,6 +485,7 @@ class BaseAnthropicMessagesStreamingIterator:
         self.request_body = request_body
         self.start_time = datetime.now()
         self.completion_start_time: datetime | None = None
+        self._success_logging_task: asyncio.Task[None] | None = None
 
     async def _handle_streaming_logging(self, collected_chunks: list[bytes], *, stream_teardown: bool = False):
         """Handle the logging after all chunks have been collected."""
@@ -513,6 +514,10 @@ class BaseAnthropicMessagesStreamingIterator:
         )
         if deferred_dispatch_armed and not stream_teardown:
             self.litellm_logging_obj._deferred_stream_complete_args = (logging_coroutine,)
+            return
+        if self.litellm_logging_obj.requires_success_await is True:
+            self._success_logging_task = asyncio.create_task(logging_coroutine)
+            await asyncio.shield(self._success_logging_task)
             return
         # Enqueue on the rooted logging worker rather than asyncio.create_task:
         # this also runs during generator teardown after a client disconnect,
@@ -613,9 +618,11 @@ class BaseAnthropicMessagesStreamingIterator:
         finally:
             client_detached.set()
             if not reached_end:
-                self._dispatch_pending_deferred_logging()
+                await self._dispatch_pending_deferred_logging()
+                if self._success_logging_task is not None:
+                    await asyncio.shield(self._success_logging_task)
 
-    def _dispatch_pending_deferred_logging(self) -> None:
+    async def _dispatch_pending_deferred_logging(self) -> None:
         """Fire deferred billing that a torn-down response would otherwise drop.
 
         When the pump finishes draining while the client is still connected it
@@ -624,13 +631,19 @@ class BaseAnthropicMessagesStreamingIterator:
         disconnect (GeneratorExit / CancelledError) re-raises past it. Without
         this dispatch that window loses the spend row entirely.
         """
-        deferred_cb: Final = getattr(self.litellm_logging_obj, "_on_deferred_stream_complete", None)
+        deferred_cb: Final[Callable[..., Coroutine[object, object, object]] | None] = getattr(
+            self.litellm_logging_obj, "_on_deferred_stream_complete", None
+        )
         deferred_args: Final = getattr(self.litellm_logging_obj, "_deferred_stream_complete_args", None)
         if deferred_cb is None or deferred_args is None:
             return
         self.litellm_logging_obj._on_deferred_stream_complete = None
         self.litellm_logging_obj._deferred_stream_complete_args = None
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=deferred_cb(*deferred_args))
+        logging_coroutine: Final = deferred_cb(*deferred_args)
+        if self.litellm_logging_obj.requires_success_await is True:
+            await logging_coroutine
+        else:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
 
     async def _bill_collected_chunks(
         self,
@@ -642,7 +655,9 @@ class BaseAnthropicMessagesStreamingIterator:
 
         try:
             await self._handle_streaming_logging(collected_chunks, stream_teardown=stream_teardown)
-        except Exception as exc:  # noqa: BLE001  # billing is best-effort; never crash the pump
+        except Exception as exc:  # noqa: BLE001  # legacy billing remains best-effort
+            if self.litellm_logging_obj.requires_success_await is True:
+                raise
             verbose_proxy_logger.warning(
                 "async_sse_wrapper billing failed after %d chunks: %s(%s)",
                 len(collected_chunks),
@@ -737,25 +752,32 @@ class BaseAnthropicMessagesStreamingIterator:
                             ANTHROPIC_MESSAGES_MAX_DETACHED_STREAM_DRAINS,
                             len(collected_chunks),
                         )
-                        await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                        if self.litellm_logging_obj.requires_success_await is not True:
+                            await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                            await self._abort_upstream(completion_stream)
+                            return
                         await self._abort_upstream(completion_stream)
-                        return
+                        break
                     draining_detached = True
         except Exception as exc:  # noqa: BLE001  # upstream errors are handled/forwarded by _handle_pump_upstream_error
             await self._handle_pump_upstream_error(queue, client_detached, collected_chunks, exc)
             return
 
-        if client_detached.is_set():
-            await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
-            return
-        if not saw_terminal_event and not await self._enqueue_for_client(
-            queue, client_detached, _incomplete_stream_error_sse_event()
-        ):
-            await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
-            return
-        await self._bill_collected_chunks(collected_chunks, stream_teardown=False)
-        if not await self._enqueue_for_client(queue, client_detached, None):
-            self._dispatch_pending_deferred_logging()
+        try:
+            if client_detached.is_set():
+                await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                return
+            if not saw_terminal_event and not await self._enqueue_for_client(
+                queue, client_detached, _incomplete_stream_error_sse_event()
+            ):
+                await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                return
+            await self._bill_collected_chunks(collected_chunks, stream_teardown=False)
+            if not await self._enqueue_for_client(queue, client_detached, None):
+                await self._dispatch_pending_deferred_logging()
+        except Exception as exc:  # noqa: BLE001  # admission errors reach the relay without provider failure logging
+            if not await self._enqueue_for_client(queue, client_detached, exc):
+                raise
 
     async def _handle_pump_upstream_error(
         self,

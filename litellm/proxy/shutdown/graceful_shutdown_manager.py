@@ -86,6 +86,12 @@ class GracefulShutdownManager:
         )
 
     @classmethod
+    def get_remaining_timeout(cls) -> float:
+        started_at: Final = cls._shutdown_started_at
+        elapsed: Final = 0.0 if started_at is None else time.monotonic() - started_at
+        return max(0.0, cls.get_timeout() - elapsed)
+
+    @classmethod
     async def wait_for_drain(
         cls,
         timeout: float | None = None,
@@ -120,7 +126,7 @@ class GracefulShutdownManager:
         cls._drain_performed = True
 
         if timeout is None:
-            timeout = cls.get_timeout()
+            timeout = cls.get_remaining_timeout()
         if count_fn is None:
             count_fn = get_in_flight_requests
 

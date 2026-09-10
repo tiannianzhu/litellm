@@ -1,7 +1,9 @@
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,17 +20,17 @@ from litellm.proxy.db.db_lookup_gate import DBLookupDeadlineExceeded
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
 from litellm.proxy.db.spend_log_tool_index import response_tool_call_names
 from litellm.proxy.hooks.proxy_track_cost_callback import (
-    _get_budget_reservation_from_metadata,
     ProxyDBLogger,
+    _get_budget_reservation_from_metadata,
     _should_track_cost_callback,
     _update_database_and_spend_counters,
     run_spend_event,
 )
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
-from litellm.proxy.utils import ProxyUpdateSpend
 from litellm.proxy.spend_tracking.spend_event import SpendEventDecodeError, build_spend_event, decode_spend_event
 from litellm.proxy.spend_tracking.spend_event_producer import SpendEventProducer, UnixAddress
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+from litellm.proxy.utils import ProxyUpdateSpend
 from litellm.types.utils import CallTypes, LiteLLMBatch, ModelResponse, Usage
 
 
@@ -2702,7 +2704,10 @@ async def _no_fallback(line: bytes) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_log_success_event_hands_the_sidecar_a_compact_event_and_skips_the_pipeline(tmp_path):
+@pytest.mark.parametrize("has_postgres", [False, True])
+async def test_async_log_success_event_uses_postgres_pipeline_or_compact_sidecar_event(
+    tmp_path: Path, has_postgres: bool
+) -> None:
     handler = _RecordingHandler()
     consumer = SpendEventConsumer(handler)
     address = UnixAddress(path=str(tmp_path / "spend.sock"))
@@ -2713,6 +2718,7 @@ async def test_async_log_success_event_hands_the_sidecar_a_compact_event_and_ski
     logger = ProxyDBLogger(producer)
 
     with (
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock() if has_postgres else None),
         patch(  # test-quality-ok: the callback imports this from proxy_server inside its body, so there is no injection seam
             "litellm.proxy.proxy_server.proxy_logging_obj"
         ) as mock_proxy_logging,
@@ -2720,12 +2726,27 @@ async def test_async_log_success_event_hands_the_sidecar_a_compact_event_and_ski
             "litellm.proxy.proxy_server.increment_spend_counters", new_callable=AsyncMock
         ) as counters,
     ):
-        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+
+        async def admitted_database_update(
+            *, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **kwargs: object
+        ) -> bool:
+            if on_accounting_admitted is not None:
+                await on_accounting_admitted()
+            return True
+
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(side_effect=admitted_database_update)
+        mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
         await logger.async_log_success_event(_offload_kwargs(), _offload_response(), datetime.now(), datetime.now())
         await producer.close(drain_timeout=5.0)
         server.close()
         assert await consumer.drain(timeout=5.0) == 0
 
+    if has_postgres:
+        mock_proxy_logging.db_spend_update_writer.update_database.assert_awaited_once()
+        counters.assert_awaited_once()
+        assert producer.stats().sent == 0
+        assert handler.lines == []
+        return
     mock_proxy_logging.db_spend_update_writer.update_database.assert_not_awaited()
     counters.assert_not_awaited()
     assert producer.stats().sent == 1

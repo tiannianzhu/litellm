@@ -1,5 +1,4 @@
 import asyncio
-import copy
 import json
 import logging
 import re
@@ -14,7 +13,7 @@ import httpx
 import pytest
 from prisma.errors import DataError as PrismaDataError
 from prisma.errors import RawQueryError
-from redis.exceptions import DataError
+from pydantic import BaseModel, JsonValue, TypeAdapter
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -25,9 +24,9 @@ from litellm.proxy.db.db_spend_update_writer import (
     _TEAM_ADVISORY_LOCK_SQL,
     _TEAM_MEMBER_SPEND_SQL,
     DBSpendUpdateWriter,
-    _SpendTableName,
     _get_daily_spend_date,
     _spend_tables_left_to_send,
+    _SpendTableName,
 )
 from litellm.proxy.db.db_transaction_queue.daily_spend_update_queue import DailySpendUpdateQueue
 from litellm.proxy.db.db_transaction_queue.redis_update_buffer import RedisUpdateBuffer
@@ -36,6 +35,7 @@ from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import (
     build_window_spend_transaction,
 )
 from litellm.proxy.db.rollup_lock_timeout import ROLLUP_LOCK_TIMEOUT_SQL
+from litellm.proxy.db.spend_accounting import AccountingEffects, AccountingEvent
 from tests.unit.proxy.db.fake_prisma_engine import engine_call
 
 
@@ -77,8 +77,9 @@ async def test_search_wrapper_does_not_duplicate_spend_records(
     prisma = _tool_usage_prisma()
     with (
         patch("litellm.proxy.proxy_server.disable_spend_logs", False),  # test-quality-ok: TQ008 process configuration
-        patch("litellm.proxy.proxy_server.prisma_client", prisma),  # test-quality-ok: TQ008 injects an in-memory DB client
-        patch.object(writer, "_batch_database_updates", AsyncMock()) as daily_updates,
+        patch(
+            "litellm.proxy.proxy_server.prisma_client", prisma
+        ),  # test-quality-ok: TQ008 injects an in-memory DB client
     ):
         await writer.update_database(
             token="test-token",
@@ -99,71 +100,30 @@ async def test_search_wrapper_does_not_duplicate_spend_records(
         )
         await asyncio.sleep(0)
 
-    assert len(prisma.spend_log_transactions) == expected_rows
-    assert daily_updates.await_count == expected_rows
+    assert len(prisma.accounting_db.rows) == expected_rows
+    assert len(prisma.accounting_db.events) == expected_rows
     if expected_rows:
-        assert prisma.spend_log_transactions[0]["spend"] == response_cost
+        assert prisma.accounting_db.rows[0]["spend"] == response_cost
 
 
 @pytest.mark.asyncio
 async def test_daily_spend_tracking_with_disabled_spend_logs():
-    """
-    Test that add_spend_log_transaction_to_daily_user_transaction is still called
-    even when disable_spend_logs is True
-    """
-    # Setup
-    db_writer = DBSpendUpdateWriter()
-
-    # Mock the methods we want to track
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock()
-
-    # Mock the imported modules/variables
-    with (
-        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
-        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
-        patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
-        patch("litellm.proxy.proxy_server.litellm_proxy_budget_name", "test-budget"),
-    ):
-        # Test data
-        test_data = {
-            "token": "test-token",
-            "user_id": "test-user",
-            "end_user_id": "test-end-user",
-            "start_time": datetime.now(),
-            "end_time": datetime.now(),
-            "team_id": "test-team",
-            "org_id": "test-org",
-            "completion_response": MagicMock(),
-            "response_cost": 0.1,
-            "kwargs": {"model": "gpt-4", "custom_llm_provider": "openai"},
-        }
-
-        # Call the method
-        await db_writer.update_database(**test_data)
-
-        # Let the single batched task run
-        await asyncio.sleep(0)
-
-        # Verify that _insert_spend_log_to_db was NOT called (since disable_spend_logs is True)
-        db_writer._insert_spend_log_to_db.assert_not_called()
-
-        # Verify that add_spend_log_transaction_to_daily_user_transaction WAS called
-        assert db_writer.add_spend_log_transaction_to_daily_user_transaction.called
-
-        # Verify the payload passed to add_spend_log_transaction_to_daily_user_transaction
-        call_args = db_writer.add_spend_log_transaction_to_daily_user_transaction.call_args[1]
-        assert "payload" in call_args
-        assert call_args["payload"]["spend"] == 0.1
-        assert call_args["payload"]["model"] == "gpt-4"
-        assert call_args["payload"]["custom_llm_provider"] == "openai"
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = _tool_usage_prisma()
+    payload: Final = _minimal_spend_payload()
+    assert await _update_database_with(writer, prisma, payload, True, response_cost=0.1)
+    effects: Final = _accounted_effects(prisma)
+    (daily_user,) = (json.loads(item.row_json) for item in effects.daily if item.entity == "user")
+    assert daily_user["spend"] == 0.1
+    assert daily_user["model"] == payload["model"]
+    assert daily_user["custom_llm_provider"] == payload["custom_llm_provider"]
+    assert prisma.accounting_db.rows == ()
 
 
 @pytest.mark.asyncio
 async def test_update_database_attributes_router_rejected_failure_to_model_group_provider():
     db_writer = DBSpendUpdateWriter()
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock()
+    prisma: Final = _tool_usage_prisma()
     llm_router: Final = litellm.Router(
         model_list=[
             {"model_name": "openai-outage", "litellm_params": {"model": "openai/gpt-4o-mini", "api_key": "sk-a"}},
@@ -176,7 +136,7 @@ async def test_update_database_attributes_router_rejected_failure_to_model_group
             "litellm.proxy.proxy_server.disable_spend_logs", True
         ),  # test-quality-ok: update_database reads this proxy_server module global at call time; no injection seam
         patch(
-            "litellm.proxy.proxy_server.prisma_client", MagicMock()
+            "litellm.proxy.proxy_server.prisma_client", prisma
         ),  # test-quality-ok: update_database reads this proxy_server module global at call time; no injection seam
         patch(
             "litellm.proxy.proxy_server.user_api_key_cache", MagicMock()
@@ -196,6 +156,7 @@ async def test_update_database_attributes_router_rejected_failure_to_model_group
             org_id=None,
             kwargs={
                 "model": "openai-outage",
+                "call_type": "acompletion",
                 "litellm_params": {
                     "metadata": {"user_api_key": "test-token", "model_group": "openai-outage", "status": "failure"}
                 },
@@ -207,7 +168,8 @@ async def test_update_database_attributes_router_rejected_failure_to_model_group
         )
         await asyncio.sleep(0)
 
-    payload: Final = db_writer.add_spend_log_transaction_to_daily_user_transaction.call_args[1]["payload"]
+    (daily_user,) = (item for item in _accounted_effects(prisma).daily if item.entity == "user")
+    payload: Final = json.loads(daily_user.row_json)
     assert payload["model_group"] == "openai-outage"
     assert payload["custom_llm_provider"] == "openai"
 
@@ -219,18 +181,95 @@ def _tool_call_response(*names: str) -> object:
     return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(tool_calls=tool_calls))])
 
 
+_ACCOUNTING_ROW: Final = TypeAdapter(dict[str, JsonValue])
+
+
+class _AccountingDB:
+    def __init__(self) -> None:
+        self.events: tuple[AccountingEvent, ...] = ()
+        self.rows: tuple[dict[str, JsonValue], ...] = ()
+
+    @asynccontextmanager
+    async def tx(self, timeout: timedelta | None = None) -> AsyncIterator["_AccountingDB"]:
+        original_events: Final = self.events
+        original_rows: Final = self.rows
+        try:
+            yield self
+        except BaseException:
+            self.events = original_events
+            self.rows = original_rows
+            raise
+
+    def _query_rows(self, query: str, args: tuple[object, ...]) -> tuple[dict[str, JsonValue], ...]:
+        if "AS duplicate" in query:
+            return (
+                {
+                    "duplicate": any(event.event_key == args[0] for event in self.events),
+                    "succeeded": any(
+                        event.request_id == args[1] and event.status == "success" for event in self.events
+                    ),
+                },
+            )
+        if query.startswith('INSERT INTO "LiteLLM_SpendLogs"'):
+            incoming: Final = _ACCOUNTING_ROW.validate_json(str(args[0]))
+            if any(row["request_id"] == incoming["request_id"] for row in self.rows):
+                return ()
+            self.rows = (*self.rows, incoming)
+            return ({"request_id": incoming["request_id"]},)
+        if "SELECT call_type, status, spend" in query:
+            return tuple(row for row in self.rows if row["request_id"] == args[0])
+        return ()
+
+    async def query_raw(self, query: str, *args: object, model: type[BaseModel] | None = None) -> tuple[object, ...]:
+        rows: Final = self._query_rows(query, args)
+        return tuple(model.model_validate(row) for row in rows) if model is not None else rows
+
+    async def execute_raw(self, query: str, *args: object) -> int:
+        if query.lstrip().startswith('INSERT INTO "LiteLLM_SpendAccountingEvent"'):
+            self.events = (
+                *self.events,
+                AccountingEvent.model_validate(
+                    dict(
+                        zip(
+                            ("event_key", "request_id", "status", "call_type", "spend", "version", "payload_json"), args
+                        )
+                    )
+                ),
+            )
+        elif query.startswith('UPDATE "LiteLLM_SpendLogs"'):
+            incoming: Final = _ACCOUNTING_ROW.validate_json(str(args[0]))
+            self.rows = tuple(incoming if row["request_id"] == incoming["request_id"] else row for row in self.rows)
+        return 1
+
+
 def _tool_usage_prisma() -> MagicMock:
-    prisma = MagicMock()
+    prisma: Final = MagicMock()
     prisma.tool_usage_transactions = []
     prisma._tool_usage_transactions_lock = asyncio.Lock()
     prisma.spend_log_transactions = []
     prisma._spend_log_transactions_lock = asyncio.Lock()
+    prisma.accounting_db = _AccountingDB()
+    prisma.tx = prisma.accounting_db.tx
+    prisma.get_request_status = lambda payload: payload["status"]
+    prisma.jsonify_object = lambda data: dict(data)
     return prisma
 
 
 def _minimal_spend_payload() -> dict:
     return {
         "request_id": "req-tool-1",
+        "call_type": "acompletion",
+        "status": "success",
+        "api_key": "test-key",
+        "user": "test-user",
+        "model": "fixture-model",
+        "model_group": "fixture-group",
+        "model_id": "fixture-deployment",
+        "custom_llm_provider": "fixture-provider",
+        "metadata": "{}",
+        "request_tags": "[]",
+        "prompt_tokens": 30,
+        "completion_tokens": 12,
         "startTime": datetime(2026, 7, 25, 10, 0, tzinfo=timezone.utc),
         "endTime": datetime(2026, 7, 25, 10, 0, 1, tzinfo=timezone.utc),
         "spend": 0.0,
@@ -239,11 +278,14 @@ def _minimal_spend_payload() -> dict:
     }
 
 
+def _accounted_effects(prisma: MagicMock) -> AccountingEffects:
+    (event,) = prisma.accounting_db.events
+    return AccountingEffects.model_validate_json(event.payload_json)
+
+
 @pytest.mark.asyncio
 async def test_update_database_enqueues_tool_usage_for_invoked_tools():
     db_writer = DBSpendUpdateWriter()
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _tool_usage_prisma()
 
     with (
@@ -269,8 +311,8 @@ async def test_update_database_enqueues_tool_usage_for_invoked_tools():
         )
         await asyncio.sleep(0)
 
-    assert len(prisma.tool_usage_transactions) == 1
-    transaction = prisma.tool_usage_transactions[0]
+    transaction: Final = _accounted_effects(prisma).tools
+    assert transaction is not None
     assert transaction.request_id == "req-tool-1"
     assert transaction.tool_names == ("get_weather",)
     assert transaction.spend == 0.1
@@ -281,8 +323,6 @@ async def test_update_database_enqueues_tool_usage_for_invoked_tools():
 @pytest.mark.asyncio
 async def test_update_database_enqueues_realtime_tool_usage():
     db_writer = DBSpendUpdateWriter()
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _tool_usage_prisma()
 
     with (
@@ -313,8 +353,9 @@ async def test_update_database_enqueues_realtime_tool_usage():
         )
         await asyncio.sleep(0)
 
-    assert len(prisma.tool_usage_transactions) == 1
-    assert prisma.tool_usage_transactions[0].tool_names == ("rt_tool",)
+    transaction: Final = _accounted_effects(prisma).tools
+    assert transaction is not None
+    assert transaction.tool_names == ("rt_tool",)
 
 
 def test_enqueue_tool_registry_upsert_reads_every_choice():
@@ -338,8 +379,6 @@ def test_enqueue_tool_registry_upsert_reads_every_choice():
 @pytest.mark.asyncio
 async def test_update_database_skips_tool_usage_when_spend_logs_disabled():
     db_writer = DBSpendUpdateWriter()
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _tool_usage_prisma()
 
     with (
@@ -365,7 +404,7 @@ async def test_update_database_skips_tool_usage_when_spend_logs_disabled():
         )
         await asyncio.sleep(0)
 
-    assert prisma.tool_usage_transactions == []
+    assert _accounted_effects(prisma).tools is None
 
 
 @pytest.mark.asyncio
@@ -375,8 +414,6 @@ async def test_a_routed_request_reaches_the_auto_router_rollup_whether_or_not_sp
     disable_spend_logs: bool, session_id: str | None
 ) -> None:
     db_writer = DBSpendUpdateWriter()
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _tool_usage_prisma()
     prisma.autorouter_turn_transactions = []
     prisma._autorouter_turn_transactions_lock = asyncio.Lock()
@@ -422,11 +459,13 @@ async def test_a_routed_request_reaches_the_auto_router_rollup_whether_or_not_sp
             response_cost=0.25,
         )
 
-    (turn,) = prisma.autorouter_turn_transactions
+    effects: Final = _accounted_effects(prisma)
+    turn: Final = effects.autorouter
+    assert turn is not None
     stored_session: Final = session_id if session_id and not disable_spend_logs else ""
     assert (turn.router_name, turn.router_type, turn.session_id) == ("smart-router", "complexity", stored_session)
     assert (turn.spend, turn.saved_spend) == (0.25, 1.5)
-    assert (prisma.tool_usage_transactions == []) is disable_spend_logs
+    assert (effects.tools is None) is disable_spend_logs
 
 
 Statement = tuple[str, tuple[object, ...]]
@@ -885,8 +924,6 @@ async def test_update_tag_db_with_valid_tags():
     """
     Test that _update_tag_db correctly processes valid tags and adds them to the spend update queue.
     """
-    from litellm.proxy._types import Litellm_EntityType
-
     writer = DBSpendUpdateWriter()
     mock_prisma = MagicMock()
     response_cost = 0.05
@@ -2227,42 +2264,6 @@ async def test_commit_spend_updates_to_db_increments_key_total_spend_alongside_s
 
 
 @pytest.mark.asyncio
-async def test_update_database_creates_single_task():
-    """
-    Test that update_database() fires exactly 1 asyncio.create_task() call
-    (the batched task) instead of the previous 11.
-    """
-    db_writer = DBSpendUpdateWriter()
-
-    # Mock all helpers so nothing real runs
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer._batch_database_updates = AsyncMock()
-
-    with (
-        patch("litellm.proxy.proxy_server.disable_spend_logs", False),
-        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
-        patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
-        patch("litellm.proxy.proxy_server.litellm_proxy_budget_name", "test-budget"),
-        patch("litellm.proxy.db.db_spend_update_writer.asyncio.create_task") as mock_create_task,
-    ):
-        await db_writer.update_database(
-            token="test-token",
-            user_id="test-user",
-            end_user_id="test-end-user",
-            start_time=datetime.now(),
-            end_time=datetime.now(),
-            team_id="test-team",
-            org_id="test-org",
-            completion_response=MagicMock(),
-            response_cost=0.1,
-            kwargs={"model": "gpt-4", "custom_llm_provider": "openai"},
-        )
-
-        # Exactly 1 create_task call (the batch), not 11
-        assert mock_create_task.call_count == 1
-
-
-@pytest.mark.asyncio
 async def test_batch_database_updates_isolation_on_failure():
     """
     Test that if one helper inside _batch_database_updates raises,
@@ -2314,84 +2315,17 @@ async def test_batch_database_updates_isolation_on_failure():
 
 
 @pytest.mark.asyncio
-async def test_daily_agent_receives_deepcopied_payload():
-    """
-    Test that the daily agent handler receives a deepcopied payload (not the original).
-
-    Previously, add_spend_log_transaction_to_daily_agent_transaction received the raw
-    payload without a deepcopy, which was a mutation bug. This test goes through
-    update_database() to verify the production deepcopy path.
-    """
-    db_writer = DBSpendUpdateWriter()
-
-    # Capture the payload object that get_logging_payload returns (the "original")
-    # and the payload the agent handler receives (should be a deepcopy)
-    original_payload_ref = {}
-    captured_agent_payloads = []
-
-    async def capture_agent_payload(**kwargs):
-        captured_agent_payloads.append(kwargs.get("payload"))
-
-    # Mock all helpers
-    db_writer._insert_spend_log_to_db = AsyncMock()
-    db_writer._update_user_db = AsyncMock()
-    db_writer._update_key_db = AsyncMock()
-    db_writer._update_team_db = AsyncMock()
-    db_writer._update_org_db = AsyncMock()
-    db_writer._update_tag_db = AsyncMock()
-    db_writer._update_agent_db = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_end_user_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_agent_transaction = AsyncMock(side_effect=capture_agent_payload)
-    db_writer.add_spend_log_transaction_to_daily_team_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_org_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_tag_transaction = AsyncMock()
-
-    # Mock get_logging_payload to return a known dict and capture its identity
-    fake_payload = {
-        "request_id": "req-deepcopy-agent",
-        "startTime": "2024-01-01T00:00:00",
-        "endTime": "2024-01-01T00:01:00",
-        "model": "gpt-4",
-        "custom_llm_provider": "openai",
-        "spend": 0.0,
-        "nested": {"a": 1},
-    }
-    original_payload_ref["obj"] = fake_payload  # store reference to the original
-
-    with (
-        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
-        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
-        patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
-        patch("litellm.proxy.proxy_server.litellm_proxy_budget_name", "test-budget"),
-        patch(
-            "litellm.proxy.spend_tracking.spend_tracking_utils.get_logging_payload",
-            return_value=fake_payload,
-        ),
-    ):
-        await db_writer.update_database(
-            token="test-token",
-            user_id="test-user",
-            end_user_id="test-end-user",
-            team_id="test-team",
-            org_id="test-org",
-            kwargs={"model": "gpt-4", "custom_llm_provider": "openai"},
-            completion_response=MagicMock(),
-            start_time=datetime.now(),
-            end_time=datetime.now(),
-            response_cost=0.1,
-        )
-
-        # Let the single batched task run
-        await asyncio.sleep(0)
-
-    # The agent handler should have been called
-    assert len(captured_agent_payloads) == 1
-    # The payload must NOT be the same object as the original (deepcopy occurred)
-    assert captured_agent_payloads[0] is not original_payload_ref["obj"]
-    # But it should have equivalent content
-    assert captured_agent_payloads[0]["model"] == "gpt-4"
-    assert captured_agent_payloads[0]["spend"] == 0.1
+async def test_daily_agent_accounting_keeps_the_admitted_identity_and_amount():
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = _tool_usage_prisma()
+    payload: Final = {**_minimal_spend_payload(), "agent_id": "original-agent"}
+    assert await _update_database_with(writer, prisma, payload, response_cost=0.1)
+    payload["agent_id"] = "replacement-agent"
+    effects: Final = _accounted_effects(prisma)
+    (agent,) = (charge for charge in effects.charges if charge.entity == "agent")
+    assert (agent.entity_id, agent.spend) == ("original-agent", 0.1)
+    (daily_agent,) = (json.loads(item.row_json) for item in effects.daily if item.entity == "agent")
+    assert (daily_agent["agent_id"], daily_agent["spend"]) == ("original-agent", 0.1)
 
 
 @pytest.mark.asyncio
@@ -2789,174 +2723,34 @@ async def test_commit_spend_updates_iterates_in_sorted_order(
 
 
 @pytest.mark.asyncio
-async def test_update_database_does_not_deepcopy_on_request_path():
-    """
-    Regression for LIT-4088: copy.deepcopy must not run while the caller awaits
-    update_database(). The deepcopy used to isolate the daily-spend helpers is
-    relocated into the _batch_database_updates background task, and the spend-log
-    insert receives the payload directly (all consumers are read-only).
-
-    Asserts:
-    - zero copy.deepcopy calls happen on the awaited request path
-    - the batch background task still hands the daily helpers an isolated copy
-      (mutating the original after the task ran does not bleed into it)
-    - the spend-log insert receives the payload on the request path with the
-      correct content
-    """
-    db_writer = DBSpendUpdateWriter()
-
-    captured_batch_payloads = []
-    captured_spend_log = {}
-
-    async def capture_batch_payload(**kwargs):
-        captured_batch_payloads.append(kwargs.get("payload"))
-
-    async def capture_spend_log(**kwargs):
-        payload = kwargs.get("payload")
-        captured_spend_log["ref"] = payload
-        captured_spend_log["model_at_call"] = payload["model"]
-
-    db_writer._insert_spend_log_to_db = AsyncMock(side_effect=capture_spend_log)
-    db_writer._update_user_db = AsyncMock()
-    db_writer._update_key_db = AsyncMock()
-    db_writer._update_team_db = AsyncMock()
-    db_writer._update_org_db = AsyncMock()
-    db_writer._update_tag_db = AsyncMock()
-    db_writer._update_agent_db = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_user_transaction = AsyncMock(side_effect=capture_batch_payload)
-    db_writer.add_spend_log_transaction_to_daily_end_user_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_agent_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_team_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_org_transaction = AsyncMock()
-    db_writer.add_spend_log_transaction_to_daily_tag_transaction = AsyncMock()
-
-    fake_payload = {
-        "request_id": "req-deepcopy-background",
-        "startTime": "2024-01-01T00:00:00",
-        "endTime": "2024-01-01T00:01:00",
-        "model": "gpt-4",
-        "custom_llm_provider": "openai",
-        "request_tags": '["prod-tag"]',
-        "spend": 0.0,
-        "nested": {"a": 1},
-    }
-
-    deepcopy_calls = []
-    real_deepcopy = copy.deepcopy
-
-    def counting_deepcopy(obj, *args, **kwargs):
-        deepcopy_calls.append(obj)
-        return real_deepcopy(obj, *args, **kwargs)
-
-    with (
-        patch("litellm.proxy.proxy_server.disable_spend_logs", False),
-        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
-        patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
-        patch("litellm.proxy.proxy_server.litellm_proxy_budget_name", "test-budget"),
-        patch(
-            "litellm.proxy.spend_tracking.spend_tracking_utils.get_logging_payload",
-            return_value=fake_payload,
-        ),
-        patch(
-            "litellm.proxy.db.db_spend_update_writer.copy.deepcopy",
-            counting_deepcopy,
-        ),
-    ):
-        await db_writer.update_database(
-            token="test-token",
-            user_id="test-user",
-            end_user_id="test-end-user",
-            team_id="test-team",
-            org_id="test-org",
-            kwargs={"model": "gpt-4", "custom_llm_provider": "openai"},
-            completion_response=MagicMock(),
-            start_time=datetime.now(),
-            end_time=datetime.now(),
-            response_cost=0.1,
-        )
-
-        # Request path is clean: nothing was deepcopied while the caller awaited.
-        assert len(deepcopy_calls) == 0
-
-        # The spend-log insert ran inline on the request path with the real payload.
-        assert captured_spend_log["ref"] is fake_payload
-        assert captured_spend_log["model_at_call"] == "gpt-4"
-        assert fake_payload["spend"] == 0.1
-
-        # Now let the batch background task run; the deepcopy happens here.
-        await asyncio.sleep(0)
-
-    assert len(deepcopy_calls) >= 1
-    assert len(captured_batch_payloads) == 1
-    batch_payload = captured_batch_payloads[0]
-    assert batch_payload is not fake_payload
-    assert batch_payload["model"] == "gpt-4"
-    assert batch_payload["spend"] == 0.1
-
-    # Mutating the original after the batch task captured its snapshot must not
-    # leak into the daily helper's isolated copy.
-    fake_payload["model"] = "MUTATED"
-    fake_payload["nested"]["a"] = 999
-    assert batch_payload["model"] == "gpt-4"
-    assert batch_payload["nested"]["a"] == 1
+async def test_update_database_freezes_accounting_before_the_payload_changes():
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = _tool_usage_prisma()
+    payload: Final = {**_minimal_spend_payload(), "request_tags": '["original-tag"]'}
+    assert await _update_database_with(writer, prisma, payload)
+    payload["spend"] = 99.0
+    payload["request_tags"] = '["replacement-tag"]'
+    effects: Final = _accounted_effects(prisma)
+    (tag,) = (charge for charge in effects.charges if charge.entity == "tag")
+    assert (tag.entity_id, tag.spend) == ("original-tag", 0.25)
+    assert prisma.accounting_db.rows[0]["spend"] == 0.25
 
 
 @pytest.mark.asyncio
 async def test_spend_update_path_never_queries_user_cache_with_none_user_id():
-    """
-    When user_id is None, the spend-update path must not perform a user-cache
-    lookup at all. With a Redis-backed auth cache (enable_redis_auth_cache),
-    a lookup with key=None raises redis.exceptions.DataError, which aborted
-    _update_user_db before any spend updates were enqueued.
-
-    This test fails on the old code twice over: the cache mock records the
-    forbidden lookup, and the DataError it raises kills the end-user spend
-    update that must survive.
-    """
-    db_writer = DBSpendUpdateWriter()
-
-    strict_redis_backed_cache = MagicMock()
-    strict_redis_backed_cache.async_get_cache = AsyncMock(side_effect=DataError("Invalid input of type: 'NoneType'"))
-
-    with (
-        patch.object(litellm, "max_budget", 0),
-        patch("litellm.proxy.proxy_server.disable_spend_logs", True),
-        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
-        patch("litellm.proxy.proxy_server.user_api_key_cache", strict_redis_backed_cache),
-        patch("litellm.proxy.proxy_server.litellm_proxy_budget_name", "litellm-proxy-budget"),
-        patch(
-            "litellm.proxy.spend_tracking.spend_tracking_utils.get_logging_payload",
-            return_value={
-                "request_id": "req-no-user-id",
-                "startTime": "2024-01-01T00:00:00",
-                "endTime": "2024-01-01T00:01:00",
-                "model": "gpt-4",
-                "custom_llm_provider": "openai",
-                "spend": 0.0,
-            },
-        ),
-    ):
-        await db_writer.update_database(
-            token=None,
-            user_id=None,
-            end_user_id="end-user-1",
-            team_id=None,
-            org_id=None,
-            kwargs={"model": "gpt-4", "custom_llm_provider": "openai"},
-            completion_response=MagicMock(),
-            start_time=datetime.now(),
-            end_time=datetime.now(),
+    writer: Final = DBSpendUpdateWriter()
+    with patch.object(litellm, "max_budget", 0):
+        await writer._update_user_db(
             response_cost=0.1,
+            user_id=None,
+            prisma_client=_tool_usage_prisma(),
+            litellm_proxy_budget_name="fixture-budget",
+            end_user_id="end-user-1",
         )
-        await asyncio.sleep(0)
-
-    strict_redis_backed_cache.async_get_cache.assert_not_called()
-
-    queued = await db_writer.spend_update_queue.flush_all_updates_from_in_memory_queue()
-    end_user_updates = [u for u in queued if u["entity_type"] == Litellm_EntityType.END_USER]
-    assert len(end_user_updates) == 1
-    assert end_user_updates[0]["entity_id"] == "end-user-1"
-    assert all(u["entity_type"] != Litellm_EntityType.USER for u in queued)
+    queued: Final = await writer.spend_update_queue.flush_all_updates_from_in_memory_queue()
+    assert tuple((item["entity_type"], item["entity_id"], item["response_cost"]) for item in queued) == (
+        (Litellm_EntityType.END_USER, "end-user-1", 0.1),
+    )
 
 
 @pytest.mark.asyncio
@@ -4249,7 +4043,7 @@ def _spend_logs_prisma(inserted: int, existing: object, taken_over: int = 1) -> 
 
 async def _update_database_with(
     db_writer: DBSpendUpdateWriter,
-    prisma: MagicMock,
+    prisma: MagicMock | None,
     payload: dict,
     disable_spend_logs: bool = False,
     response_cost: float = 0.25,
@@ -4285,6 +4079,18 @@ async def _update_database_with(
         return charged
 
 
+async def _record_legacy_batch_with(
+    writer: DBSpendUpdateWriter,
+    prisma: MagicMock,
+    payload: dict[str, object],
+    disable_spend_logs: bool = False,
+    response_cost: float = 0.25,
+) -> bool:
+    return await writer._record_spend_log(
+        cast(SpendLogsPayload, {**payload, "spend": response_cost}), prisma, disable_spend_logs
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("disable_spend_logs", [False, True])
 async def test_ordinary_callbacks_charge_each_response_and_status_once(disable_spend_logs: bool):
@@ -4301,10 +4107,9 @@ async def test_ordinary_callbacks_charge_each_response_and_status_once(disable_s
     assert await _update_database_with(writer, prisma, successful, disable_spend_logs) is False
     assert await _update_database_with(writer, prisma, next_round, disable_spend_logs) is True
 
-    assert writer._batch_database_updates.await_count == 3
-    assert sum(update.kwargs["response_cost"] for update in writer._batch_database_updates.await_args_list) == 0.5
-    assert len(prisma.spend_log_transactions) == (0 if disable_spend_logs else 3)
-    prisma.db.litellm_spendlogs.create_many.assert_not_called()
+    assert len(prisma.accounting_db.events) == 3
+    assert sum(event.spend for event in prisma.accounting_db.events) == 0.5
+    assert len(prisma.accounting_db.rows) == (0 if disable_spend_logs else 2)
 
 
 @pytest.mark.asyncio
@@ -4348,12 +4153,8 @@ async def test_completed_response_usage_is_not_added_again_by_an_unbilled_failur
 
     assert await _update_database_with(writer, prisma, successful, disable_spend_logs) is True
     assert await _update_database_with(writer, prisma, failed, disable_spend_logs, response_cost=0.0) is False
-    transactions: Final = (
-        await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
-    )
-
-    assert len(transactions) == 1
-    transaction: Final = next(iter(transactions.values()))
+    effects: Final = _accounted_effects(prisma)
+    (transaction,) = (json.loads(item.row_json) for item in effects.daily if item.entity == "user")
     assert transaction["prompt_tokens"] == successful["prompt_tokens"]
     assert transaction["completion_tokens"] == successful["completion_tokens"]
     assert transaction["cache_read_input_tokens"] == 8
@@ -4361,7 +4162,7 @@ async def test_completed_response_usage_is_not_added_again_by_an_unbilled_failur
     assert transaction["api_requests"] == transaction["successful_requests"] == 1
     assert transaction["failed_requests"] == 0
     assert transaction["spend"] == successful["spend"]
-    assert len(prisma.spend_log_transactions) == (0 if disable_spend_logs else 1)
+    assert len(prisma.accounting_db.rows) == (0 if disable_spend_logs else 1)
 
 
 @pytest.mark.asyncio
@@ -4395,6 +4196,19 @@ async def test_ordinary_spend_admission_can_retry_failed_or_cancelled_enqueue(en
 
 
 @pytest.mark.asyncio
+async def test_tool_metrics_are_frozen_with_admitted_accounting():
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = _tool_usage_prisma()
+    payload: Final = {**_minimal_spend_payload(), "mcp_namespaced_tool_name": "test_tool"}
+    assert await _update_database_with(writer, prisma, payload)
+    effects: Final = _accounted_effects(prisma)
+    assert effects.tools is not None
+    assert effects.tools.tool_names == ("test_tool",)
+    assert effects.tools.spend == 0.25
+    assert any(charge.entity == "user" and charge.entity_id == "test-user" for charge in effects.charges)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("inserted", "existing", "charged"),
     [
@@ -4414,7 +4228,7 @@ async def test_ordinary_spend_admission_can_retry_failed_or_cancelled_enqueue(en
         "row_gone_between_insert_and_lookup",
     ],
 )
-async def test_update_database_charges_a_batch_only_from_the_retrieve_that_wrote_its_row(
+async def test_legacy_spend_log_admission_charges_a_batch_only_from_the_retrieve_that_wrote_its_row(
     inserted: int, existing: object, charged: bool
 ):
     """
@@ -4425,16 +4239,14 @@ async def test_update_database_charges_a_batch_only_from_the_retrieve_that_wrote
     time it polled the batch while it was still running.
     """
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(inserted, existing)
 
-    assert await _update_database_with(db_writer, prisma, _batch_cost_payload()) is charged
+    assert await _record_legacy_batch_with(db_writer, prisma, _batch_cost_payload()) is charged
 
     claimed_rows = prisma.db.litellm_spendlogs.create_many.await_args.kwargs
     assert claimed_rows["skip_duplicates"] is True
     assert [(row["request_id"], row["spend"]) for row in claimed_rows["data"]] == [("batch_abc_batch_cost", 0.25)]
     assert prisma.spend_log_transactions == []
-    assert db_writer._batch_database_updates.await_count == (1 if charged else 0)
 
 
 @pytest.mark.asyncio
@@ -4443,7 +4255,7 @@ async def test_update_database_charges_a_batch_only_from_the_retrieve_that_wrote
     [(1, True), (0, False)],
     ids=["this_retrieve_takes_it_over", "another_one_got_there_first"],
 )
-async def test_update_database_charges_a_batch_whose_row_a_pre_upgrade_poll_left_at_zero(
+async def test_legacy_spend_log_admission_charges_a_batch_whose_row_a_pre_upgrade_poll_left_at_zero(
     taken_over: int, charged: bool
 ):
     """
@@ -4452,11 +4264,10 @@ async def test_update_database_charges_a_batch_whose_row_a_pre_upgrade_poll_left
     without writing it there would charge again on every later retrieve (LIT-7048).
     """
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     existing = SimpleNamespace(call_type="aretrieve_batch", status="success", spend=0.0)
     prisma = _spend_logs_prisma(0, existing, taken_over)
 
-    assert await _update_database_with(db_writer, prisma, _batch_cost_payload()) is charged
+    assert await _record_legacy_batch_with(db_writer, prisma, _batch_cost_payload()) is charged
 
     taken = prisma.db.litellm_spendlogs.update_many.await_args.kwargs
     assert taken["where"] == {
@@ -4467,43 +4278,37 @@ async def test_update_database_charges_a_batch_whose_row_a_pre_upgrade_poll_left
     }
     assert taken["data"]["spend"] == 0.25
     assert "request_id" not in taken["data"]
-    assert db_writer._batch_database_updates.await_count == (1 if charged else 0)
 
 
 @pytest.mark.asyncio
-async def test_update_database_leaves_a_batch_whose_zero_row_it_could_not_take_over_to_the_next_retrieve():
+async def test_legacy_spend_log_admission_leaves_a_batch_whose_zero_row_it_could_not_take_over_to_the_next_retrieve():
     """
     A DB that refuses the takeover leaves the row reading $0, so charging here would charge
     the batch again on every later retrieve. The retrieve that does take the row over is the
     one that charges.
     """
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     existing = SimpleNamespace(call_type="aretrieve_batch", status="success", spend=0.0)
     prisma = _spend_logs_prisma(0, existing)
     prisma.db.litellm_spendlogs.update_many = AsyncMock(side_effect=RuntimeError("db unreachable"))
 
-    assert await _update_database_with(db_writer, prisma, _batch_cost_payload()) is False
-
-    assert db_writer._batch_database_updates.await_count == 0
+    assert await _record_legacy_batch_with(db_writer, prisma, _batch_cost_payload()) is False
 
 
 @pytest.mark.asyncio
-async def test_update_database_leaves_a_batch_that_cost_nothing_to_the_retrieve_that_wrote_its_row():
+async def test_legacy_spend_log_admission_leaves_a_batch_that_cost_nothing_to_the_retrieve_that_wrote_its_row():
     """
     A batch every line of which failed costs $0, so its row reads $0 for the honest reason
     and the retrieve that wrote it is still the one that accounted it. Taking that row over
     on every later retrieve would count one batch as many requests.
     """
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     existing = SimpleNamespace(call_type="aretrieve_batch", status="success", spend=0.0)
     prisma = _spend_logs_prisma(0, existing)
 
-    assert await _update_database_with(db_writer, prisma, _batch_cost_payload(), response_cost=0.0) is False
+    assert await _record_legacy_batch_with(db_writer, prisma, _batch_cost_payload(), response_cost=0.0) is False
 
     prisma.db.litellm_spendlogs.update_many.assert_not_called()
-    assert db_writer._batch_database_updates.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -4515,7 +4320,7 @@ async def test_update_database_leaves_a_batch_that_cost_nothing_to_the_retrieve_
     ],
     ids=["first_retrieve_owns_the_row", "another_retrieve_already_charged"],
 )
-async def test_update_database_charges_a_batch_once_even_with_spend_logs_disabled(
+async def test_legacy_spend_log_admission_charges_a_batch_once_even_with_spend_logs_disabled(
     inserted: int, existing: object, charged: bool
 ):
     """
@@ -4523,28 +4328,24 @@ async def test_update_database_charges_a_batch_once_even_with_spend_logs_disable
     that makes a batch chargeable exactly once is still written and still read back.
     """
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(inserted, existing)
 
-    assert await _update_database_with(db_writer, prisma, _batch_cost_payload(), True) is charged
+    assert await _record_legacy_batch_with(db_writer, prisma, _batch_cost_payload(), True) is charged
 
     assert prisma.db.litellm_spendlogs.create_many.await_count == 1
-    assert db_writer._batch_database_updates.await_count == (1 if charged else 0)
 
 
 @pytest.mark.asyncio
-async def test_update_database_writes_no_ordinary_spend_row_with_spend_logs_disabled():
+async def test_legacy_spend_log_admission_writes_no_ordinary_spend_row_with_spend_logs_disabled():
     """The batch carve-out above stays a carve-out: every other row still goes unwritten."""
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(1, None)
     payload = {**_batch_cost_payload(), "call_type": "acompletion"}
 
-    assert await _update_database_with(db_writer, prisma, payload, True) is True
+    assert await _record_legacy_batch_with(db_writer, prisma, payload, True) is True
 
     prisma.db.litellm_spendlogs.create_many.assert_not_called()
     assert prisma.spend_log_transactions == []
-    assert db_writer._batch_database_updates.await_count == 1
 
 
 _BATCH_CLAIM_FIELDS = {"request_id", "call_type", "status", "spend", "startTime", "endTime"}
@@ -4568,7 +4369,7 @@ def _logged_batch_cost_payload() -> dict:
     [(False, True), (True, False)],
     ids=["spend_logs_on", "spend_logs_off"],
 )
-async def test_update_database_claims_a_batch_without_logging_the_request_that_polled_it(
+async def test_legacy_spend_log_admission_claims_a_batch_without_logging_the_request_that_polled_it(
     disable_spend_logs: bool, logs_the_request: bool
 ):
     """
@@ -4577,44 +4378,38 @@ async def test_update_database_claims_a_batch_without_logging_the_request_that_p
     the retrieves apart: no metadata, no requester IP, no key, model, or token counts.
     """
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(1, None)
     payload = _logged_batch_cost_payload()
 
-    assert await _update_database_with(db_writer, prisma, payload, disable_spend_logs) is True
+    assert await _record_legacy_batch_with(db_writer, prisma, payload, disable_spend_logs) is True
 
     claimed = prisma.db.litellm_spendlogs.create_many.await_args.kwargs["data"][0]
     assert set(claimed) == (set(payload) if logs_the_request else _BATCH_CLAIM_FIELDS)
     assert claimed["spend"] == 0.25
-    assert db_writer._batch_database_updates.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_update_database_queues_only_the_claim_for_a_batch_it_could_not_write_with_logs_disabled():
+async def test_legacy_spend_log_admission_queues_only_the_claim_for_a_batch_it_could_not_write_with_logs_disabled():
     """A refused claim is retried through the queue, so what it queues has to stay unlogged too."""
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(0, None)
     prisma.db.litellm_spendlogs.create_many = AsyncMock(side_effect=RuntimeError("db unreachable"))
 
-    assert await _update_database_with(db_writer, prisma, _logged_batch_cost_payload(), True) is True
+    assert await _record_legacy_batch_with(db_writer, prisma, _logged_batch_cost_payload(), True) is True
 
     assert [set(row) for row in prisma.spend_log_transactions] == [_BATCH_CLAIM_FIELDS]
-    assert db_writer._batch_database_updates.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_update_database_queues_a_batch_cost_row_it_could_not_claim():
+async def test_legacy_spend_log_admission_queues_a_batch_cost_row_it_could_not_claim():
     """An unreachable DB must not drop the batch's only spend row, nor its charge."""
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(0, None)
     prisma.db.litellm_spendlogs.create_many = AsyncMock(side_effect=RuntimeError("db unreachable"))
 
-    assert await _update_database_with(db_writer, prisma, _batch_cost_payload()) is True
+    assert await _record_legacy_batch_with(db_writer, prisma, _batch_cost_payload()) is True
 
     assert [row["request_id"] for row in prisma.spend_log_transactions] == ["batch_abc_batch_cost"]
-    assert db_writer._batch_database_updates.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -4623,16 +4418,131 @@ async def test_update_database_queues_a_batch_cost_row_it_could_not_claim():
     [{**_batch_cost_payload(), "call_type": "acompletion"}, {**_batch_cost_payload(), "status": "failure"}],
     ids=["not_a_batch_retrieve", "failed_batch_retrieve"],
 )
-async def test_update_database_queues_every_other_spend_row_for_the_next_flush(payload: dict):
+async def test_legacy_spend_log_admission_queues_every_other_spend_row_for_the_next_flush(payload: dict):
     db_writer = DBSpendUpdateWriter()
-    db_writer._batch_database_updates = AsyncMock()
     prisma = _spend_logs_prisma(1, None)
 
-    assert await _update_database_with(db_writer, prisma, payload) is True
+    assert await _record_legacy_batch_with(db_writer, prisma, payload) is True
 
     prisma.db.litellm_spendlogs.create_many.assert_not_called()
-    assert prisma.spend_log_transactions == [payload]
-    assert db_writer._batch_database_updates.await_count == 1
+    assert prisma.spend_log_transactions == [{**payload, "spend": 0.25}]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flush_waits_for_pending_enqueue_before_flushing_rollups():
+    db_writer = DBSpendUpdateWriter()
+    prisma = _spend_logs_prisma(1, None)
+    enqueue_started = asyncio.Event()
+    allow_enqueue = asyncio.Event()
+    calls: list[str] = []  # mutable-ok: records shutdown ordering
+
+    async def delayed_enqueue(**kwargs):
+        enqueue_started.set()
+        await allow_enqueue.wait()
+        calls.append("enqueue")
+
+    db_writer._batch_database_updates = AsyncMock(side_effect=delayed_enqueue)
+    assert await _update_database_with(db_writer, None, _logged_batch_cost_payload()) is True
+    await enqueue_started.wait()
+
+    db_writer.db_update_spend_transaction_handler = AsyncMock(side_effect=lambda **_: calls.append("rollups"))
+    import litellm.proxy.utils as utils_mod
+
+    with patch.object(  # test-quality-ok: [TQ008] Isolate scheduler dispatch while exercising the real enqueue/shutdown race
+        utils_mod, "update_daily_tag_spend", AsyncMock(side_effect=lambda **_: calls.append("tags"))
+    ):
+        shutdown_task = asyncio.create_task(
+            db_writer.flush_spend_updates_on_shutdown(prisma_client=prisma, proxy_logging_obj=MagicMock())
+        )
+        await asyncio.sleep(0)
+        assert calls == []
+
+        allow_enqueue.set()
+        await shutdown_task
+
+    assert calls == ["enqueue", "rollups", "tags"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flush_reports_a_completed_enqueue_failure():
+    db_writer = DBSpendUpdateWriter()
+    prisma = _spend_logs_prisma(1, None)
+
+    async def failed_enqueue(**kwargs):
+        raise RuntimeError("enqueue failed")
+
+    db_writer._batch_database_updates = AsyncMock(side_effect=failed_enqueue)
+    assert await _update_database_with(db_writer, None, _logged_batch_cost_payload()) is True
+    await asyncio.sleep(0)
+
+    db_writer.db_update_spend_transaction_handler = AsyncMock()
+    import litellm.proxy.utils as utils_mod
+
+    with patch.object(  # test-quality-ok: [TQ008] Observe whether enqueue failure prevents the independent tag drain
+        utils_mod, "update_daily_tag_spend", AsyncMock()
+    ) as tags:
+        with pytest.raises(RuntimeError, match="before shutdown"):
+            await db_writer.flush_spend_updates_on_shutdown(prisma_client=prisma, proxy_logging_obj=MagicMock())
+
+    db_writer.db_update_spend_transaction_handler.assert_awaited_once()
+    tags.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flush_still_drains_tags_when_other_rollups_fail():
+    import litellm.proxy.utils as utils_mod
+
+    db_writer = DBSpendUpdateWriter()
+    db_writer.db_update_spend_transaction_handler = AsyncMock(side_effect=RuntimeError("rollup write failed"))
+    with patch.object(  # test-quality-ok: [TQ008] Observe the independent tag drain after the regular writer raises
+        utils_mod, "update_daily_tag_spend", AsyncMock()
+    ) as tags:
+        with pytest.raises(RuntimeError, match="rollup write failed"):
+            await db_writer.flush_spend_updates_on_shutdown(
+                prisma_client=MagicMock(), proxy_logging_obj=MagicMock()
+            )
+
+    tags.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_spend_update_commits_do_not_overlap():
+    from litellm.proxy.db.db_transaction_queue.redis_update_buffer import RedisUpdateBuffer
+
+    db_writer = DBSpendUpdateWriter()
+    commit_started = asyncio.Event()
+    allow_commit = asyncio.Event()
+    calls: list[str] = []  # mutable-ok: records concurrent commits
+
+    async def blocked_commit(**kwargs):
+        calls.append("start")
+        commit_started.set()
+        await allow_commit.wait()
+        calls.append("finish")
+
+    db_writer._commit_spend_updates_to_db_without_redis_buffer = AsyncMock(side_effect=blocked_commit)
+
+    with patch.object(  # test-quality-ok: [TQ008] Select the in-memory configuration while exercising real commit serialization
+        RedisUpdateBuffer, "should_commit_spend_updates_to_redis", return_value=False
+    ):
+        first = asyncio.create_task(
+            db_writer.db_update_spend_transaction_handler(
+                prisma_client=MagicMock(), n_retry_times=3, proxy_logging_obj=MagicMock()
+            )
+        )
+        await commit_started.wait()
+        second = asyncio.create_task(
+            db_writer.db_update_spend_transaction_handler(
+                prisma_client=MagicMock(), n_retry_times=3, proxy_logging_obj=MagicMock()
+            )
+        )
+        await asyncio.sleep(0)
+        assert calls == ["start"]
+
+        allow_commit.set()
+        await asyncio.gather(first, second)
+
+    assert calls == ["start", "finish", "start", "finish"]
 
 
 @pytest.mark.asyncio

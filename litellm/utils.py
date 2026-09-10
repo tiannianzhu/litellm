@@ -1411,7 +1411,7 @@ def _schedule_async_success_logging(
         return
 
     def _enqueue_async_logging() -> None:
-        asyncio.create_task(
+        task: Final = asyncio.create_task(
             _client_async_logging_helper(
                 logging_obj=logging_obj,
                 result=result,
@@ -1420,6 +1420,8 @@ def _schedule_async_success_logging(
                 is_completion_with_fallbacks=is_completion_with_fallbacks,
             )
         )
+        if logging_obj.requires_success_await is True:
+            logging_obj.success_accounting_task = task
 
     if not logging_obj.defer_async_logging:
         _enqueue_async_logging()
@@ -1431,11 +1433,11 @@ def _schedule_async_success_logging(
 
 async def _client_async_logging_helper(
     logging_obj: LiteLLMLoggingObject,
-    result,
-    start_time,
-    end_time,
+    result: object,
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
     is_completion_with_fallbacks: bool,
-):
+) -> None:
     if (
         is_completion_with_fallbacks is False
     ):  # don't log the parent event litellm.completion_with_fallbacks as a 'log_success_event', this will lead to double logging the same call - https://github.com/BerriAI/litellm/issues/7477
@@ -1447,9 +1449,11 @@ async def _client_async_logging_helper(
         ################################################
         from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-            async_coroutine=logging_obj.async_success_handler(result=result, start_time=start_time, end_time=end_time)
-        )
+        success: Final = logging_obj.async_success_handler(result=result, start_time=start_time, end_time=end_time)
+        if logging_obj.requires_success_await is True:
+            await success
+        else:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
 
 
 def _get_wrapper_num_retries(kwargs: dict[str, Any], exception: Exception) -> tuple[int | None, dict[str, Any]]:
@@ -2219,31 +2223,30 @@ def client(original_function):
                     is_completion_with_fallbacks=is_completion_with_fallbacks,
                     is_litellm_internal_call=_is_litellm_internal_call,
                 )
-                return _llm_caching_handler.combine_cached_embedding_response_with_api_result(
+                result = _llm_caching_handler.combine_cached_embedding_response_with_api_result(
                     _caching_handler_response=_caching_handler_response,
                     embedding_response=result,
                     start_time=start_time,
                     end_time=end_time,
                 )
 
-            _update_response_metadata(
-                result=result,
-                logging_obj=logging_obj,
-                model=model,
-                kwargs=kwargs,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            _dispatch_success_logging(
-                logging_obj=logging_obj,
-                result=result,
-                start_time=start_time,
-                end_time=end_time,
-                is_completion_with_fallbacks=is_completion_with_fallbacks,
-                is_litellm_internal_call=_is_litellm_internal_call,
-            )
-
-            return result
+            else:
+                _update_response_metadata(
+                    result=result,
+                    logging_obj=logging_obj,
+                    model=model,
+                    kwargs=kwargs,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                _dispatch_success_logging(
+                    logging_obj=logging_obj,
+                    result=result,
+                    start_time=start_time,
+                    end_time=end_time,
+                    is_completion_with_fallbacks=is_completion_with_fallbacks,
+                    is_litellm_internal_call=_is_litellm_internal_call,
+                )
         except Exception as e:
             traceback_exception: Final = traceback.format_exc()
             # Reuse the timestamp taken right when the deployment call itself failed, before
@@ -2339,6 +2342,11 @@ def client(original_function):
             # streaming genuinely finishes; aclose()/__del__ cover early termination.
             if not _is_streaming_response_for_correlation(result):
                 _restore_correlation_context_if_supported(logging_obj)
+
+        assert logging_obj is not None
+        if logging_obj.requires_success_await is True:
+            await logging_obj.await_success_accounting()
+        return result
 
     get_coroutine_checker: Final = litellm_utils.get_coroutine_checker
     is_coroutine: Final = get_coroutine_checker().is_async_callable(original_function)

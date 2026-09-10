@@ -1822,21 +1822,23 @@ async def pass_through_request(
         passthrough_logging_payload["response_body"] = response_body
         end_time: Final = datetime.now()
         if response.status_code < 400:
-            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-                async_coroutine=pass_through_endpoint_logging.pass_through_async_success_handler(
-                    httpx_response=response,
-                    response_body=response_body,
-                    url_route=str(url),
-                    result="",
-                    start_time=start_time,
-                    end_time=end_time,
-                    logging_obj=logging_obj,
-                    cache_hit=False,
-                    request_body=_parsed_body or {},
-                    custom_llm_provider=custom_llm_provider,
-                    **kwargs,
-                )
+            success: Final = pass_through_endpoint_logging.pass_through_async_success_handler(
+                httpx_response=response,
+                response_body=response_body,
+                url_route=str(url),
+                result="",
+                start_time=start_time,
+                end_time=end_time,
+                logging_obj=logging_obj,
+                cache_hit=False,
+                request_body=_parsed_body or {},
+                custom_llm_provider=custom_llm_provider,
+                **kwargs,
             )
+            if logging_obj.requires_success_await is True:
+                await success
+            else:
+                GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
             bind_budget_reservation_to_callbacks(logging_obj.litellm_params)
 
         ## CUSTOM HEADERS - `x-litellm-*`
@@ -2767,20 +2769,22 @@ async def websocket_passthrough_request(
             mock_response: Final = MockWebSocketResponse(target)
 
             # Use the same success handler as HTTP passthrough endpoints
-            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-                async_coroutine=pass_through_endpoint_logging.pass_through_async_success_handler(
-                    httpx_response=mock_response,
-                    response_body=websocket_messages,
-                    url_route=endpoint or "",
-                    result="websocket_connection_successful",
-                    start_time=start_time,
-                    end_time=end_time,
-                    logging_obj=logging_obj,
-                    cache_hit=False,
-                    request_body={},
-                    **success_kwargs,
-                )
+            success: Final = pass_through_endpoint_logging.pass_through_async_success_handler(
+                httpx_response=mock_response,
+                response_body=websocket_messages,
+                url_route=endpoint or "",
+                result="websocket_connection_successful",
+                start_time=start_time,
+                end_time=end_time,
+                logging_obj=logging_obj,
+                cache_hit=False,
+                request_body={},
+                **success_kwargs,
             )
+            if logging_obj.requires_success_await is True:
+                await success
+            else:
+                GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
             bind_budget_reservation_to_callbacks(logging_obj.litellm_params)
 
             # Call the proxy logging success hook
@@ -2945,21 +2949,23 @@ async def _relay_passthrough_response_bytes(
                 bytes_relayed,
             )
         await response.aclose()
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-            async_coroutine=pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=response,
-                response_body=None,
-                url_route=url_route,
-                result="",
-                start_time=start_time,
-                end_time=datetime.now(),
-                logging_obj=logging_obj,
-                cache_hit=False,
-                request_body=request_body,
-                custom_llm_provider=custom_llm_provider,
-                **success_handler_kwargs,
-            )
+        success: Final = pass_through_endpoint_logging.pass_through_async_success_handler(
+            httpx_response=response,
+            response_body=None,
+            url_route=url_route,
+            result="",
+            start_time=start_time,
+            end_time=datetime.now(),
+            logging_obj=logging_obj,
+            cache_hit=False,
+            request_body=request_body,
+            custom_llm_provider=custom_llm_provider,
+            **success_handler_kwargs,
         )
+        if logging_obj.requires_success_await is True:
+            await success
+        else:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
         bind_budget_reservation_to_callbacks(logging_obj.litellm_params)
 
 
