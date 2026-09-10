@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime
 from typing import Final
@@ -13,6 +13,7 @@ import litellm
 from litellm.integrations.argilla import ArgillaLogger
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.litellm_logging import Logging
+from litellm.llms.anthropic.messages.native.streaming_iterator import aclose_if_supported
 from litellm.types.integrations.argilla import ArgillaItem
 from litellm.types.utils import ModelResponse, StandardLoggingPayload
 from tests.test_litellm_rust.messages.data import (
@@ -68,6 +69,305 @@ async def test_success_hook_fires_the_expected_number_of_times(
 
     assert_served_natively(server, response)
     assert recorder.names.count(hook) == expected
+
+
+class _DurableMessagesCallback(CustomLogger):
+    def __init__(self, *, fail: bool) -> None:
+        super().__init__()
+        self.started: Final = asyncio.Event()
+        self.release: Final = asyncio.Event()
+        self.calls: Final[asyncio.Queue[object]] = asyncio.Queue()
+        self.failures: Final[asyncio.Queue[object]] = asyncio.Queue()
+        self.payloads: Final[asyncio.Queue[StandardLoggingPayload]] = asyncio.Queue()
+        self.error: Final = RuntimeError("controlled native accounting failure") if fail else None
+
+    @property
+    def requires_success_await(self) -> bool:
+        return True
+
+    async def async_log_success_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        self.calls.put_nowait(response_obj)
+        payload: Final = TypeAdapter(StandardLoggingPayload).validate_python(kwargs.get("standard_logging_object"))
+        self.payloads.put_nowait(payload)
+        self.started.set()
+        await self.release.wait()
+        if self.error is not None:
+            raise self.error
+
+    async def async_log_failure_event(
+        self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        self.failures.put_nowait(response_obj)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, supplied_logger",
+    (("complete", False), ("complete", True), ("stream", False), ("close", False), ("cancel", False)),
+)
+@pytest.mark.parametrize("fail", (False, True))
+async def test_public_native_messages_waits_for_durable_accounting(
+    server: RecordingServer, mode: str, supplied_logger: bool, fail: bool
+) -> None:
+    recorder: Final = _DurableMessagesCallback(fail=fail)
+    logger: Final = Logging(
+        model=REQUEST["model"],
+        messages=[],
+        stream=mode != "complete",
+        call_type="anthropic_messages",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id=CALL_ID,
+        function_id=CALL_ID,
+        dynamic_async_success_callbacks=[recorder],
+        dynamic_async_failure_callbacks=[recorder],
+    )
+    callback_kwargs: Final = {"litellm_logging_obj": logger} if supplied_logger else {"callbacks": [recorder]}
+    if mode != "complete":
+        server.enqueue(ResponseSpec(body=None, events=MESSAGES_EVENTS, burst=True))
+
+    async def consume() -> None:
+        response: Final = await call(server, stream=mode != "complete", **callback_kwargs)
+        if mode == "complete":
+            return
+        assert isinstance(response, AsyncIterator)
+        if mode == "close":
+            await anext(response)
+            await aclose_if_supported(response)
+            return
+        async for _ in response:
+            pass
+
+    pending: Final = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(recorder.started.wait(), timeout=5)
+        assert not pending.done()
+        if mode == "cancel":
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+        recorder.release.set()
+        if recorder.error is not None:
+            with pytest.raises(RuntimeError) as raised:
+                await asyncio.wait_for(pending, timeout=5)
+            assert raised.value is recorder.error
+        elif mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=5)
+        else:
+            await asyncio.wait_for(pending, timeout=5)
+        logged: Final = recorder.calls.get_nowait()
+        assert isinstance(logged, ModelResponse)
+        assert logged.usage.prompt_tokens == MESSAGES_RESPONSE["usage"]["input_tokens"]
+        assert logged.usage.completion_tokens == MESSAGES_RESPONSE["usage"]["output_tokens"]
+        assert recorder.calls.empty()
+        assert recorder.failures.empty()
+        assert_served_natively(server)
+    finally:
+        recorder.release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", (False, True))
+async def test_cancelled_native_proxy_stream_marks_499_before_durable_accounting(
+    server: RecordingServer, fail: bool
+) -> None:
+    recorder: Final = _DurableMessagesCallback(fail=fail)
+    logger: Final = Logging(
+        model=REQUEST["model"],
+        messages=[],
+        stream=True,
+        call_type="anthropic_messages",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id=CALL_ID,
+        function_id=CALL_ID,
+        dynamic_async_success_callbacks=[recorder],
+        dynamic_async_failure_callbacks=[recorder],
+    )
+    logger.update_environment_variables(
+        litellm_params={"metadata": {}, "proxy_server_request": {"url": "/v1/messages"}}, optional_params={},
+    )
+    server.enqueue(ResponseSpec(body=None, events=MESSAGES_EVENTS, chunk_delay=1))
+    stream: Final = await call(server, stream=True, litellm_logging_obj=logger)
+    assert isinstance(stream, AsyncIterator)
+    await anext(stream)
+    reading: Final = asyncio.Event()
+
+    async def read_next() -> object:
+        reading.set()
+        return await anext(stream)
+
+    pending: Final = asyncio.create_task(read_next())
+    try:
+        await reading.wait()
+        assert not pending.done()
+        pending.cancel()
+        await asyncio.wait_for(recorder.started.wait(), timeout=5)
+        assert not pending.done()
+        recorder.release.set()
+        if recorder.error is not None:
+            with pytest.raises(RuntimeError) as raised:
+                await asyncio.wait_for(pending, timeout=5)
+            assert raised.value is recorder.error
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=5)
+        payload: Final = recorder.payloads.get_nowait()
+        assert payload["error_information"] is not None
+        assert payload["error_information"].get("error_code") == "499"
+        assert payload["prompt_tokens"] == MESSAGES_RESPONSE["usage"]["input_tokens"]
+        assert recorder.payloads.empty()
+        assert recorder.failures.empty()
+        assert_served_natively(server)
+    finally:
+        recorder.release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_deferred_success_publishes_durable_accounting_before_proxy_release_returns(
+    server: RecordingServer,
+) -> None:
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    accepted: Final[asyncio.Queue[object]] = asyncio.Queue()
+
+    class Admission(CustomLogger):
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            entered.set()
+            await release.wait()
+            accepted.put_nowait(response_obj)
+
+    logging_obj: Final = Logging(
+        model=REQUEST["model"],
+        messages=[],
+        stream=False,
+        call_type="anthropic_messages",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id=CALL_ID,
+        function_id=CALL_ID,
+        dynamic_async_success_callbacks=[Admission()],
+    )
+    logging_obj.defer_async_logging = True
+    response: Final = await call(server, litellm_logging_obj=logging_obj)
+    ProxyBaseLLMRequestProcessing._flush_deferred_async_logging(logging_obj, exception_raised=False)
+    waiter: Final = asyncio.create_task(logging_obj.await_success_accounting())
+    try:
+        assert logging_obj.success_accounting_task is not None
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not waiter.done()
+        release.set()
+        await asyncio.wait_for(asyncio.shield(waiter), timeout=5)
+        logged: Final = accepted.get_nowait()
+        assert isinstance(logged, ModelResponse)
+        assert logged.id == response_id(response)
+        assert accepted.empty()
+        assert_served_natively(server, response)
+    finally:
+        release.set()
+        await asyncio.gather(waiter, return_exceptions=True)
+        await GLOBAL_LOGGING_WORKER.flush()
+
+
+@pytest.mark.asyncio
+async def test_proxy_messages_stream_waits_for_durable_accounting_without_guardrails(
+    server: RecordingServer,
+) -> None:
+    from fastapi import Request, Response
+    from fastapi.responses import StreamingResponse
+
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.proxy_server import ProxyConfig
+    from litellm.proxy.utils import ProxyLogging
+
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    accepted: Final[asyncio.Queue[object]] = asyncio.Queue()
+
+    class Admission(CustomLogger):
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            entered.set()
+            await release.wait()
+            accepted.put_nowait(response_obj)
+
+    logging_obj: Final = Logging(
+        model=REQUEST["model"],
+        messages=[],
+        stream=True,
+        call_type="anthropic_messages",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id=CALL_ID,
+        function_id=CALL_ID,
+        dynamic_async_success_callbacks=[Admission()],
+    )
+    processor: Final = ProxyBaseLLMRequestProcessing(
+        data={
+            **REQUEST,
+            "stream": True,
+            "api_key": "test-key",
+            "api_base": server.base_url,
+            "litellm_logging_obj": logging_obj,
+        }
+    )
+    server.enqueue(ResponseSpec(body=None, events=MESSAGES_EVENTS))
+
+    async def receive() -> dict[str, object]:
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    response: Final = await processor.base_process_llm_request(
+        request=Request(scope={"type": "http", "headers": [], "path": "/v1/messages"}, receive=receive),
+        fastapi_response=Response(),
+        user_api_key_dict=UserAPIKeyAuth(),
+        route_type="anthropic_messages",
+        proxy_logging_obj=ProxyLogging(user_api_key_cache=UserApiKeyCache()),
+        general_settings={},
+        proxy_config=ProxyConfig(),
+        user_model=REQUEST["model"],
+        skip_pre_call_logic=True,
+    )
+    assert isinstance(response, StreamingResponse)
+
+    async def drain() -> bytes:
+        return b"".join([chunk.encode() if isinstance(chunk, str) else chunk async for chunk in response.body_iterator])
+
+    draining: Final = asyncio.create_task(drain())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not draining.done()
+        release.set()
+        wire: Final = await asyncio.wait_for(asyncio.shield(draining), timeout=5)
+        assert b"event: message_stop" in wire
+        logged: Final = accepted.get_nowait()
+        assert isinstance(logged, ModelResponse)
+        assert logged.usage.prompt_tokens == MESSAGES_RESPONSE["usage"]["input_tokens"]
+        assert logged.usage.completion_tokens == MESSAGES_RESPONSE["usage"]["output_tokens"]
+        assert accepted.empty()
+        assert_served_natively(server)
+    finally:
+        release.set()
+        await asyncio.gather(draining, return_exceptions=True)
+        await GLOBAL_LOGGING_WORKER.flush()
 
 
 @pytest.mark.asyncio

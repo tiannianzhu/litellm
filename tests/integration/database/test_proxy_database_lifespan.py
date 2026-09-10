@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
 
@@ -64,6 +65,7 @@ async def _assert_lifespan_closed() -> None:
 async def _exercise_lifespans(mode: Mode) -> None:
     from litellm.proxy import proxy_server
     from litellm.proxy.auth.master_key_boot_check import UnsafeMasterKeyError
+    from litellm.types.utils import ModelResponse, Usage
 
     expected: Final = UnsafeMasterKeyError if mode == "unsafe" else ValueError
     match: Final = "master key" if mode == "unsafe" else "use_redis_transaction_buffer"
@@ -76,6 +78,8 @@ async def _exercise_lifespans(mode: Mode) -> None:
     with pytest.MonkeyPatch.context() as environment:
         environment.setenv("LITELLM_MASTER_KEY", f"sk-{uuid.uuid4().hex}")
         for cancel in (False, True, False):
+            request_id: Final = f"lifespan-{uuid.uuid4().hex}"
+            attempt_id: Final = f"{request_id}-attempt"
             try:
                 async with proxy_server.proxy_startup_event(proxy_server.app) as state:
                     database: Final = state["database"]
@@ -84,12 +88,40 @@ async def _exercise_lifespans(mode: Mode) -> None:
                     assert await database.prisma.writer_db.query_raw("SELECT 42 AS answer") == [{"answer": 42}]
                     assert await database.prisma.read_db.query_raw("SELECT 43 AS answer") == [{"answer": 43}]
                     assert psutil.Process().children(recursive=True)
+                    assert await proxy_server.proxy_logging_obj.db_spend_update_writer.update_database(
+                        token=None,
+                        user_id=None,
+                        end_user_id=None,
+                        team_id=None,
+                        org_id=None,
+                        kwargs={
+                            "model": "lifespan-fixture",
+                            "custom_llm_provider": "openai",
+                            "call_type": "acompletion",
+                            "litellm_call_id": request_id,
+                            "litellm_params": {},
+                        },
+                        completion_response=ModelResponse(
+                            id=attempt_id,
+                            model="lifespan-fixture",
+                            usage=Usage(prompt_tokens=2, completion_tokens=1, total_tokens=3),
+                        ),
+                        start_time=datetime(2026, 1, 1),
+                        end_time=datetime(2026, 1, 1),
+                        response_cost=0.25,
+                    )
                     if cancel:
                         raise asyncio.CancelledError
             except asyncio.CancelledError:
                 if not cancel:
                     raise
             await _assert_lifespan_closed()
+            persisted: Final = await asyncio.to_thread(
+                read_rows,
+                'SELECT request_id, state::text AS state FROM "LiteLLM_SpendLogDelivery" WHERE request_id = %s',
+                (attempt_id,),
+            )
+            assert persisted == [{"request_id": attempt_id, "state": "applied"}]
 
 
 @pytest.mark.parametrize("mode", ("late", "unsafe"))

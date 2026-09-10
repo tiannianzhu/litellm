@@ -24,6 +24,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Protocol, TypeAlias, TypedDict, TypeVar, cast
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import anyio
 import httpx
 import orjson
 from fastapi import (
@@ -3413,6 +3414,7 @@ async def websocket_passthrough_request(
         ),
         started=start_time,
     )
+    success_logging_tasks: tuple[asyncio.Task[None], ...] = ()  # rebind-ok: pending turn callbacks
 
     def log_frames(
         call_logging: LiteLLMLoggingObj,
@@ -3422,6 +3424,7 @@ async def websocket_passthrough_request(
         lane: str | None,
         in_row: Callable[[Mapping[str, object]], bool],
     ) -> None:
+        nonlocal success_logging_tasks
         all_frames: Final = list(websocket_messages)
         frames: Final = [frame for frame in all_frames if in_row(frame)]
         websocket_messages[:] = (
@@ -3444,24 +3447,51 @@ async def websocket_passthrough_request(
             key: value for key, value in call_kwargs.items() if key not in _EXPLICIT_SUCCESS_KWARGS
         }
         custom_llm_provider: Final = call_kwargs.get("custom_llm_provider")
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-            async_coroutine=pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=MockWebSocketResponse(target),
-                response_body=frames,
-                url_route=endpoint or "",
-                result="websocket_connection_successful",
-                start_time=ledger.started,
-                end_time=end_time,
-                logging_obj=call_logging,
-                cache_hit=False,
-                request_body={},
-                passthrough_logging_payload=logged_payload,
-                custom_llm_provider=custom_llm_provider if isinstance(custom_llm_provider, str) else None,
-                finalize_before_dispatch=False,
-                **success_kwargs,
-            )
+        success: Final = pass_through_endpoint_logging.pass_through_async_success_handler(
+            httpx_response=MockWebSocketResponse(target),
+            response_body=frames,
+            url_route=endpoint or "",
+            result="websocket_connection_successful",
+            start_time=ledger.started,
+            end_time=end_time,
+            logging_obj=call_logging,
+            cache_hit=False,
+            request_body={},
+            passthrough_logging_payload=logged_payload,
+            custom_llm_provider=custom_llm_provider if isinstance(custom_llm_provider, str) else None,
+            finalize_before_dispatch=False,
+            **success_kwargs,
         )
+        if call_logging.requires_success_await is True:
+            retained: Final = tuple(
+                task
+                for task in success_logging_tasks
+                if not task.done() or task.cancelled() or task.exception() is not None
+            )
+            success_logging_tasks = (  # rebind-ok: keep only unfinished or failed durable callbacks between turns
+                *retained,
+                asyncio.create_task(success),
+            )
+        else:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
         bind_budget_reservation_to_callbacks(call_logging.litellm_params)
+
+    async def settle_success_logging() -> None:
+        if not success_logging_tasks:
+            return
+        pending: Final = asyncio.gather(*success_logging_tasks, return_exceptions=True)
+        cancelled: asyncio.CancelledError | None = None  # rebind-ok: retain cancellation while callbacks finish
+        with anyio.CancelScope(shield=True):
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError as error:
+                    cancelled = error
+        for outcome in pending.result():
+            if isinstance(outcome, BaseException):
+                raise outcome
+        if cancelled is not None:
+            raise cancelled
 
     def log_turn(lane: str | None, in_row: Callable[[Mapping[str, object]], bool]) -> None:
         end_time: Final = datetime.now()
@@ -3797,9 +3827,12 @@ async def websocket_passthrough_request(
         if _client_socket_is_open(websocket):
             await websocket.close(code=1011, reason="WebSocket passthrough error")
     finally:
-        await proxy_logging_obj.arelease_responses_websocket_slot(user_api_key_dict)
-        if _client_socket_is_open(websocket):
-            await websocket.close()
+        try:
+            await settle_success_logging()
+        finally:
+            await proxy_logging_obj.arelease_responses_websocket_slot(user_api_key_dict)
+            if _client_socket_is_open(websocket):
+                await websocket.close()
 
 
 def _content_type_header(response: httpx.Response) -> str:
@@ -3900,21 +3933,23 @@ async def _relay_passthrough_response_bytes(
                 bytes_relayed,
             )
         await response.aclose()
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-            async_coroutine=pass_through_endpoint_logging.pass_through_async_success_handler(
-                httpx_response=response,
-                response_body=None,
-                url_route=url_route,
-                result="",
-                start_time=start_time,
-                end_time=datetime.now(),
-                logging_obj=logging_obj,
-                cache_hit=False,
-                request_body=request_body,
-                custom_llm_provider=custom_llm_provider,
-                **success_handler_kwargs,
-            )
+        success: Final = pass_through_endpoint_logging.pass_through_async_success_handler(
+            httpx_response=response,
+            response_body=None,
+            url_route=url_route,
+            result="",
+            start_time=start_time,
+            end_time=datetime.now(),
+            logging_obj=logging_obj,
+            cache_hit=False,
+            request_body=request_body,
+            custom_llm_provider=custom_llm_provider,
+            **success_handler_kwargs,
         )
+        if logging_obj.requires_success_await is True:
+            await success
+        else:
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
         bind_budget_reservation_to_callbacks(logging_obj.litellm_params)
 
 

@@ -1958,11 +1958,16 @@ def _failure_fields_to_lift(
         return _EMPTY_LIFT if dispatched_call_type is None else MappingProxyType({"call_type": dispatched_call_type})
     _estimate_call_type: Final = dispatched_call_type or route_call_type
     _model_call_details: Final = getattr(_logging_obj, "model_call_details", {})
+    _stored_payload: Final = _as_str_mapping(_model_call_details.get("standard_logging_object"))
+    _completed_response: Final = _stored_payload.get("status") == "success"
     if (
         isinstance(_logging_obj, Logging)
         and original_exception is not None
-        and _model_call_details.get("combined_usage_object") is not None
-        and _model_call_details.get("standard_logging_object") is None
+        and (
+            _completed_response
+            or _model_call_details.get("combined_usage_object") is not None
+            and _model_call_details.get("standard_logging_object") is None
+        )
     ):
         _logging_obj._failure_handler_helper_fn(  # pyright: ignore[reportPrivateUsage]  # prepare the same payload used by deferred archive callbacks
             original_exception, traceback_str or ""
@@ -1972,15 +1977,19 @@ def _failure_fields_to_lift(
     _base_model: Final = get_base_model_from_metadata(model_call_details=_model_call_details)
     _deployment_id: Final = _logging_obj.get_router_model_id() if isinstance(_logging_obj, Logging) else None
     _success_already_logged: Final = isinstance(_logging_obj, Logging) and _logging_obj.async_success_log_enqueued
-    _billed: Final = provider_billed and not _success_already_logged
-    _usage_to_lift: Final = _failure_usage_to_lift(
-        model_call_details=_model_call_details,
-        request_body=request_data,
-        dispatched=_model_call_details.get("current_attempt_api_call_start_time", _first_handoff) is not None,
-        provider_billed=_billed,
-        deployment_id=_deployment_id,
-        base_model=_base_model,
-        dispatched_call_type=_estimate_call_type,
+    _billed: Final = provider_billed and not (_success_already_logged or _completed_response)
+    _usage_to_lift: Final = (
+        None
+        if _completed_response and _model_call_details.get("combined_usage_object") is None
+        else _failure_usage_to_lift(
+            model_call_details=_model_call_details,
+            request_body=request_data,
+            dispatched=_model_call_details.get("current_attempt_api_call_start_time", _first_handoff) is not None,
+            provider_billed=_billed,
+            deployment_id=_deployment_id,
+            base_model=_base_model,
+            dispatched_call_type=_estimate_call_type,
+        )
     )
     _prompt_estimate: Final = (
         _estimated_prompt_usage(_model_call_details, request_data, _estimate_call_type)
@@ -2007,6 +2016,7 @@ def _failure_fields_to_lift(
         ("combined_usage_object", None if _usage_to_lift is None else _usage_to_lift[0]),
         ("response_cost", None if _usage_to_lift is None else (_usage_to_lift[1] or 0.0)),
         ("standard_logging_object", _model_call_details.get("standard_logging_object")),
+        ("_accounting_request_id", _model_call_details.get("_accounting_request_id")),
         ("billed_failed_attempts", _earlier_attempts or None),
         ("_accounting_pricing_snapshot", _model_call_details.get("_accounting_pricing_snapshot")),
         ("_accounting_finalized_cost", _logging_obj.finalized_cost if isinstance(_logging_obj, Logging) else None),
@@ -4584,11 +4594,14 @@ class ProxyLogging:
             user_api_key_dict=user_api_key_dict
         )
         if litellm_logging_obj is None:
-            from litellm._uuid import uuid
+            from litellm.proxy.common_request_processing import resolve_litellm_call_id
             from litellm.proxy.litellm_pre_call_utils import key_and_team_logging_fields
             from litellm.proxy.proxy_server import proxy_config
 
-            request_data.setdefault("litellm_call_id", str(uuid.uuid4()))
+            caller_call_id: Final = request_fields.get("litellm_call_id")
+            request_data.update(
+                litellm_call_id=resolve_litellm_call_id(caller_call_id if isinstance(caller_call_id, str) else None)
+            )
 
             litellm_logging_obj, data = litellm.utils.function_setup(
                 original_function=route or "IGNORE_THIS",
@@ -5253,9 +5266,9 @@ class ProxyLogging:
                 raise
             except Exception as e:
                 if not ProxyLogging._discard_deferred_stream_logging_for_failure(request_data, e):
-                    ProxyLogging.fire_deferred_stream_logging(request_data)
+                    await ProxyLogging.await_deferred_stream_logging(request_data)
                 raise
-            ProxyLogging.fire_deferred_stream_logging(request_data)
+            await ProxyLogging.await_deferred_stream_logging(request_data)
             return
 
         from litellm.proxy.proxy_server import llm_router
@@ -5350,7 +5363,7 @@ class ProxyLogging:
         except Exception as e:
             await ProxyLogging._record_served_stream_output(request_data, served_chunks)
             if not ProxyLogging._discard_deferred_stream_logging_for_failure(request_data, e):
-                ProxyLogging.fire_deferred_stream_logging(request_data)
+                await ProxyLogging.await_deferred_stream_logging(request_data)
             raise
 
         # Fire deferred logging AFTER all guardrail end-of-stream blocks
@@ -5358,7 +5371,7 @@ class ProxyLogging:
         # its end-of-stream block (inside current_response), so by the time
         # we reach this point the metadata is fully populated.
         await ProxyLogging._record_served_stream_output(request_data, served_chunks)
-        ProxyLogging.fire_deferred_stream_logging(request_data)
+        await ProxyLogging.await_deferred_stream_logging(request_data)
 
     async def async_post_call_event_stream_iterator_hook(
         self,
@@ -5621,7 +5634,7 @@ class ProxyLogging:
         record_served_output_texts(logging_obj.model_call_details, texts)
 
     @staticmethod
-    def fire_deferred_stream_logging(request_data: dict) -> None:
+    def fire_deferred_stream_logging(request_data: dict) -> asyncio.Task[object] | None:
         """
         Fire the deferred streaming logging callback after the full streaming
         pipeline (including guardrail end-of-stream blocks) has completed.
@@ -5640,7 +5653,20 @@ class ProxyLogging:
         if _deferred_cb is not None and _args is not None:
             logging_obj._on_deferred_stream_complete = None
             logging_obj._deferred_stream_complete_args = None
-            asyncio.create_task(_deferred_cb(*_args))
+            task: Final = asyncio.create_task(_deferred_cb(*_args))
+            if getattr(logging_obj, "requires_success_await", False) is True:
+                return task
+        return None
+
+    @staticmethod
+    async def await_deferred_stream_logging(request_data: dict) -> None:
+        task: Final = ProxyLogging.fire_deferred_stream_logging(request_data)
+        if task is not None:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await asyncio.shield(task)
+                raise
 
     _fire_deferred_stream_logging = fire_deferred_stream_logging
 

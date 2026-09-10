@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import hashlib
 import hmac
 import secrets
@@ -242,16 +241,31 @@ class TelemetryRuntime:
         if sink is not None:
             await sink.flush()
 
-    async def stop(self) -> None:
+    async def _drain(self) -> None:
         flush_task: Final = self._flush_task
         if flush_task is not None:
             flush_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await flush_task
+            await asyncio.gather(flush_task, return_exceptions=True)
         flushing: Final = self._flushing
         if flushing is not None:
             await asyncio.gather(flushing, return_exceptions=True)
         await asyncio.gather(*self._pending, return_exceptions=True)
         await self._flush_current()
-        self.sink = None
-        self.store = None
+
+    async def stop(self, *, shutdown_deadline: float | None = None) -> None:
+        timeout: Final = (
+            None if shutdown_deadline is None else max(0.0, shutdown_deadline - asyncio.get_running_loop().time())
+        )
+        try:
+            await asyncio.wait_for(self._drain(), timeout=timeout)
+        finally:
+            tasks: Final = tuple(
+                task for task in (self._flush_task, self._flushing, *self._pending) if task is not None
+            )
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._flush_task = None
+            self._flushing = None
+            self.sink = None
+            self.store = None

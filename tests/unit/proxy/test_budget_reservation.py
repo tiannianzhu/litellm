@@ -1,14 +1,14 @@
 import asyncio
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 
 import litellm
 from litellm.caching.dual_cache import DualCache
@@ -105,6 +105,76 @@ async def _reserve(valid_token, cost, key_cache, proxy_logging_obj):
             user_api_key_cache=key_cache,
             proxy_logging_obj=proxy_logging_obj,
         )
+
+
+@pytest.mark.parametrize(
+    "method,route,path_params,read_only,matched_route",
+    (
+        ("GET", "/v1/batches/batch_fixture", {}, True, None),
+        (None, "/v1/batches/batch_fixture", {}, False, None),
+        (
+            "GET", "/bedrock/v1/batches/job/fixture", {"provider": "bedrock"}, True,
+            "/{provider}/v1/batches/{batch_id:path}",
+        ),
+        ("GET", "/openai/v1/batches/batch_fixture", {"provider": "openai"}, True, None),
+        ("GET", "/v1/files/file_fixture/content", {}, True, None),
+        ("GET", "/v1/videos/video_fixture", {}, True, None),
+        ("GET", "/v1/responses/response_fixture", {}, True, None),
+        ("POST", "/v1/batches", {}, False, None),
+        ("POST", "/v1/files", {}, False, None),
+        ("POST", "/v1/chat/completions", {}, False, None),
+        ("GET", "/v1/realtime", {}, False, None),
+        ("GET", "/v1/responses", {}, False, None),
+        ("GET", "/v1/chat/completions", {}, False, None),
+    ),
+)
+@pytest.mark.asyncio
+async def test_resource_reads_do_not_reserve_a_new_generation_budget(
+    spend_counter_state: tuple[FakeSpendCounters, UserApiKeyCache],
+    monkeypatch: pytest.MonkeyPatch,
+    method: str | None,
+    route: str,
+    path_params: Mapping[str, str],
+    read_only: bool,
+    matched_route: str | None,
+) -> None:
+    from litellm.proxy.auth.user_api_key_auth import _reserve_budget_after_common_checks
+
+    model: Final = "openai/qa-budget-reservation"
+    monkeypatch.setattr(litellm, "model_cost", {
+        **litellm.model_cost,
+        model: {
+            "input_cost_per_token": 0.001, "output_cost_per_token": 0.002,
+            "max_input_tokens": 10000, "max_output_tokens": 1000,
+            "litellm_provider": "openai", "mode": "chat",
+        },
+    })
+    counters, key_cache = spend_counter_state
+    auth: Final = UserAPIKeyAuth(token="budget-resource-fixture", max_budget=1.0, spend=0.0)
+    request: Final = Request({
+        "type": "http", "path": route,
+        **({"method": method} if method is not None else {}),
+        "path_params": dict(path_params), "headers": [],
+        "route": SimpleNamespace(path=matched_route) if matched_route is not None else None,
+    })
+    await _reserve_budget_after_common_checks(
+        user_api_key_auth_obj=auth,
+        request_data={"model": model, "proxy_server_request": {"method": "GET"}},
+        route=route, request=request, llm_router=None, team_object=None, user_object=None,
+        prisma_client=None, user_api_key_cache=key_cache,
+        proxy_logging_obj=ProxyLogging(user_api_key_cache=key_cache),
+        skip_budget_checks=False, general_settings={},
+    )
+    if read_only:
+        assert auth.budget_reservation is None
+        assert request.state.budget_reservation is None
+        assert counters.get_local("spend:key:budget-resource-fixture") is None
+        return
+    assert auth.budget_reservation is not None
+    assert request.state.budget_reservation is auth.budget_reservation
+    assert counters.get_local("spend:key:budget-resource-fixture") == pytest.approx(1.0)
+    await release_budget_reservation(auth.budget_reservation)
+    assert counters.get_local("spend:key:budget-resource-fixture") == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -2420,9 +2490,12 @@ async def test_reserved_counter_deleted_during_spend_write_is_reseeded_instead_o
     redis_cache.redis[counter_key] = 0.6
     redis_cache.set_local(counter_key, 0.6)
 
-    async def _delete_counter_while_persisting(**kwargs: object) -> bool:
+    async def _delete_counter_while_persisting(
+        *, on_accounting_admitted: Callable[[], Awaitable[None]], **kwargs: object
+    ) -> bool:
         redis_cache.redis.pop(counter_key, None)
         redis_cache.delete_local(counter_key)
+        await on_accounting_admitted()
         return True
 
     proxy_logging_obj = MagicMock()

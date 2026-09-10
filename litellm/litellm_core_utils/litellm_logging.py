@@ -387,6 +387,11 @@ else:
     _GENERIC_API_LOGGER_CLS: Final = GenericAPILogger
 _in_memory_loggers: Final[list[CustomLogger]] = []
 
+
+def get_initialized_custom_loggers() -> tuple[CustomLogger, ...]:
+    return tuple(_in_memory_loggers)
+
+
 _STANDARD_LOGGING_METADATA_RESOLVED_KEYS: Final[frozenset[str]] = frozenset(
     ("used_client_oauth_token", "usage_object", KUBERNETES_POD_ROUTING_KEY, "is_silent_experiment")
 )
@@ -791,7 +796,7 @@ def _logging_fields(
     hook: Hook, kwargs: object, args: HookArgs | None, owner: "Logging | None"
 ) -> Mapping[Field, object]:
     return with_sources(
-        KwargsFields(kwargs, LOGGING_KEYS),
+        KwargsFields(kwargs, LOGGING_KEYS) if args is None else KwargsFields(kwargs, LOGGING_KEYS, args.result),
         _HOOK_DERIVED_FIELDS.get(hook, NO_SOURCES),
         args or HookArgs(request=kwargs, logging_obj=owner),
     )
@@ -1160,6 +1165,8 @@ class Logging(LiteLLMLoggingBaseClass):
         self._async_success_scheduled: bool = False
         self._async_success_enqueued: bool = False
         self._sync_success_scheduled: bool = False
+        self.success_accounting_task: asyncio.Task[object] | None = None
+        self.success_accounting_lock = asyncio.Lock()
         self.on_detached_stream_failure: Callable[[Exception], Awaitable[None]] | None = None
         self._stream_failure_claimed: bool = False
         self._stash_owed_on_success: bool = False
@@ -1204,6 +1211,10 @@ class Logging(LiteLLMLoggingBaseClass):
         new_call.cost_allowance_allocation = None
         new_call.cost_finalization_lock = asyncio.Lock()
         new_call.deferred_success_result = None
+        new_call.success_accounting_task = None
+        new_call.success_accounting_lock = asyncio.Lock()
+        new_call._agentic_loop_response = None
+        new_call._async_success_in_progress = False
         new_call.streaming_chunks = []
         new_call.sync_streaming_chunks = []
         return new_call
@@ -1211,6 +1222,27 @@ class Logging(LiteLLMLoggingBaseClass):
     def reset_caching_details(self) -> None:
         """Forget an earlier cache lookup's result, so a call that looks up again reports only its latest."""
         self.caching_details = None
+
+    @property
+    def requires_success_await(self) -> bool:
+        callbacks: Final = (
+            self._get_completed_success_callbacks(asynchronous=True)
+            if not self.stream
+            else (
+                *(self.dynamic_async_success_callbacks or ()),
+                *litellm._async_success_callback,  # pyright: ignore[reportPrivateUsage]  # async registry has no public getter
+            )
+        )
+        return any(isinstance(callback, CustomLogger) and callback.requires_success_await for callback in callbacks)
+
+    async def await_success_accounting(self) -> None:
+        task: Final = self.success_accounting_task
+        if task is not None:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await asyncio.shield(task)
+                raise
 
     def set_response_timing_metrics(self, timing_metrics: Mapping[str, float]) -> None:
         """Keep ``_response_ms`` / ``litellm_overhead_time_ms`` for a result that has no ``_hidden_params``."""
@@ -3265,11 +3297,13 @@ class Logging(LiteLLMLoggingBaseClass):
         self.model_call_details["stream"] = False
 
         def enqueue_logging() -> None:
-            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-                async_coroutine=self.async_success_handler(
-                    result=recorded_response, start_time=self.start_time, end_time=end_time
-                )
+            success: Final = self.async_success_handler(
+                result=recorded_response, start_time=self.start_time, end_time=end_time
             )
+            if self.requires_success_await:
+                self.success_accounting_task = asyncio.create_task(success)
+            else:
+                GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
             self.handle_sync_success_callbacks_for_async_calls(
                 result=recorded_response, start_time=self.start_time, end_time=end_time
             )
@@ -4270,6 +4304,7 @@ class Logging(LiteLLMLoggingBaseClass):
         self, prepared: _LogHookRun, for_async_request: bool, callback: object, _kwargs: object
     ) -> Patch | None:
         before: Final = prepared.details
+        before_result: Final = prepared.result
         if isinstance(callback, CustomGuardrail):
             from litellm.types.guardrails import GuardrailEventHooks
 
@@ -4296,7 +4331,12 @@ class Logging(LiteLLMLoggingBaseClass):
             )
         if not for_async_request:
             self.model_call_details = prepared.details
-        return kwargs_patch(before, prepared.details)
+        patch: Final = kwargs_patch(before, prepared.details)
+        return (
+            patch
+            if prepared.result is before_result
+            else (patch or Patch()).set(Field.deprecated_response_obj, prepared.result)
+        )
 
     def _deliver_sync_success(self, run: _SyncSuccessRun, callback: object, _kwargs: object) -> None:
         call_details: Final = run.call_details
@@ -4649,6 +4689,33 @@ class Logging(LiteLLMLoggingBaseClass):
 
     async def async_success_handler(
         self,
+        result: object = None,
+        start_time: dt_object | None = None,
+        end_time: dt_object | None = None,
+        cache_hit: bool | None = None,
+        **kwargs: object,  # kwargs-ok: forwarded to _locked_async_success and _dispatch_async_success
+    ) -> None:
+        if not self.requires_success_await:
+            await self._dispatch_async_success(result, start_time, end_time, cache_hit, **kwargs)
+            return
+        self.success_accounting_task = asyncio.create_task(
+            self._locked_async_success(result, start_time, end_time, cache_hit, **kwargs)
+        )
+        await self.await_success_accounting()
+
+    async def _locked_async_success(
+        self,
+        result: object,
+        start_time: dt_object | None,
+        end_time: dt_object | None,
+        cache_hit: bool | None,
+        **kwargs: object,  # kwargs-ok: forwarded to _dispatch_async_success
+    ) -> None:
+        async with self.success_accounting_lock:
+            await self._dispatch_async_success(result, start_time, end_time, cache_hit, **kwargs)
+
+    async def _dispatch_async_success(
+        self,
         result: object = None,  # heterogeneous response object; varies by call type (ANN401 ignored, see ruff-strict.toml)
         start_time: datetime.datetime | None = None,
         end_time: datetime.datetime | None = None,
@@ -4782,6 +4849,62 @@ class Logging(LiteLLMLoggingBaseClass):
         ## BUILD COMPLETE STREAMED RESPONSE
         if "async_complete_streaming_response" in self.model_call_details:
             return  # break out of this.
+        delivers_final_stream_log: Final = await self._prepare_async_success_payload(
+            result, start_time, end_time, provider_transcription
+        )
+
+        callbacks: Final[tuple[object, ...]] = tuple(
+            self.get_combined_callback_list(
+                dynamic_success_callbacks=self.dynamic_async_success_callbacks,
+                global_callbacks=litellm._async_success_callback,  # pyright: ignore[reportPrivateUsage]  # shared registry has no public getter
+            )
+        )
+        delivery_callbacks: Final = (
+            self._get_completed_success_callbacks(asynchronous=True) if not self.stream else callbacks
+        )
+        hook_callbacks: Final = tuple(dict.fromkeys((*callbacks, *delivery_callbacks)))
+        durable: Final = tuple(
+            callback
+            for callback in delivery_callbacks
+            if isinstance(callback, CustomLogger) and callback.requires_success_await
+        )
+        await_durable: Final = bool(
+            durable and (not self.stream or "async_complete_streaming_response" in self.model_call_details)
+        )
+        prepared_result: Final = await self._async_success_logging_hooks(
+            hook_callbacks, result, start_time, end_time, delivers_final_stream_log, strict=await_durable
+        )
+        if await_durable:
+            await self._async_success_callbacks(
+                durable, prepared_result, start_time, end_time, delivers_final_stream_log, strict=True
+            )
+            remaining: Final = tuple(callback for callback in delivery_callbacks if callback not in durable)
+            from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
+                async_coroutine=self._background_success_callbacks(
+                    remaining, prepared_result, start_time, end_time, delivers_final_stream_log
+                )
+            )
+        else:
+            await self._async_success_callbacks(
+                delivery_callbacks, prepared_result, start_time, end_time, delivers_final_stream_log
+            )
+        if not self.stream:
+            try:
+                self.handle_sync_success_callbacks_for_async_calls(
+                    result=prepared_result, start_time=start_time, end_time=end_time, cache_hit=cache_hit
+                )
+            except RuntimeError:
+                verbose_logger.exception("Could not schedule synchronous success callbacks")
+
+    async def _prepare_async_success_payload(
+        self,
+        result: object,
+        start_time: dt_object,
+        end_time: dt_object,
+        provider_transcription: TranscriptionResponse | None,
+    ) -> bool:
         complete_streaming_response: Final = self._get_assembled_streaming_response(
             result=result,
             start_time=start_time,
@@ -4868,52 +4991,73 @@ class Logging(LiteLLMLoggingBaseClass):
 
                 # print standard logging payload
                 self._emit_stored_standard_logging_payload()
-        delivers_final_stream_log: Final[bool] = complete_streaming_response is not None or is_pass_through_call
-        callbacks: Final = self.get_combined_callback_list(
-            dynamic_success_callbacks=self.dynamic_async_success_callbacks,
-            global_callbacks=litellm._async_success_callback,
-        )
-        delivery_callbacks: Final = (
-            self._get_completed_success_callbacks(asynchronous=True) if not self.stream else callbacks
-        )
+        return complete_streaming_response is not None or is_pass_through_call
 
-        result = _REDACTED_RESULT.validate_python(
+    async def _background_success_callbacks(
+        self,
+        callbacks: tuple[object, ...],
+        result: object,
+        start_time: dt_object,
+        end_time: dt_object,
+        delivers_final_stream_log: bool,
+    ) -> None:
+        with post_response_phase():
+            await self._async_success_callbacks(callbacks, result, start_time, end_time, delivers_final_stream_log)
+
+    async def _async_success_logging_hooks(
+        self,
+        callbacks: tuple[object, ...],
+        result: object,
+        start_time: dt_object,
+        end_time: dt_object,
+        delivers_final_stream_log: bool,
+        *,
+        strict: bool = False,
+    ) -> object:
+        redacted_result: Final = _REDACTED_RESULT.validate_python(
             redact_message_input_output_from_logging(
                 model_call_details=(self.model_call_details if hasattr(self, "model_call_details") else {}),
                 result=result,
             )
         )
-
-        ## LOGGING HOOK ##
-
-        hook_callbacks: Final = tuple(dict.fromkeys((*callbacks, *delivery_callbacks)))
-        include_v2: Final = self.stream is not True or delivers_final_stream_log
-        prepared: Final = _LogHookRun(details=self.model_call_details, result=result)
+        prepared: Final = _LogHookRun(details=self.model_call_details, result=redacted_result)
         await _run_callbacks(
             Hook.log_prepare,
-            hook_callbacks,
+            callbacks,
             self.model_call_details,
-            functools.partial(self._async_logging_hook_start, prepared),
-            include_v2=include_v2,
+            functools.partial(self._async_logging_hook_start, prepared, strict=strict),
+            include_v2=self.stream is not True or delivers_final_stream_log,
             owner=self,
             args=HookArgs(
                 request=self.model_call_details,
-                result=result,
+                result=redacted_result,
                 start_time=start_time,
                 end_time=end_time,
                 logging_obj=self,
             ),
         )
-        result = prepared.result  # rebind-ok: logging hooks may replace the result
+        return prepared.result
 
-        self.mark_logging_complete(event_type="async_success")
-
+    async def _async_success_callbacks(
+        self,
+        callbacks: tuple[object, ...],
+        result: object,
+        start_time: dt_object,
+        end_time: dt_object,
+        delivers_final_stream_log: bool,
+        *,
+        strict: bool = False,
+    ) -> None:
+        if not strict:
+            self.mark_logging_complete(event_type="async_success")
         await _run_callbacks(
             Hook.attempt_ended,
-            delivery_callbacks,
+            callbacks,
             self.model_call_details,
-            functools.partial(self._deliver_async_success, result, start_time, end_time, delivers_final_stream_log),
-            include_v2=include_v2,
+            functools.partial(
+                self._deliver_async_success, result, start_time, end_time, delivers_final_stream_log, strict=strict
+            ),
+            include_v2=self.stream is not True or delivers_final_stream_log,
             owner=self,
             args=HookArgs(
                 request=self.model_call_details,
@@ -4924,22 +5068,23 @@ class Logging(LiteLLMLoggingBaseClass):
                 logging_obj=self,
             ),
         )
-        if not self.stream:
-            try:
-                self.handle_sync_success_callbacks_for_async_calls(
-                    result=result, start_time=start_time, end_time=end_time, cache_hit=cache_hit
-                )
-            except RuntimeError:
-                verbose_logger.exception("Could not schedule synchronous success callbacks")
-        await flush_post_call_redis_batches()
+        if strict:
+            self.mark_logging_complete(event_type="async_success")
+        else:
+            await flush_post_call_redis_batches()
 
     def _async_logging_hook_start(
-        self, prepared: _LogHookRun, callback: object, _kwargs: object
+        self, prepared: _LogHookRun, callback: object, _kwargs: object, *, strict: bool = False
     ) -> Awaitable[Patch | None] | None:
-        return self._async_logging_hook(prepared, callback) if isinstance(callback, CustomLogger) else None
+        return (
+            self._async_logging_hook(prepared, callback, strict=strict) if isinstance(callback, CustomLogger) else None
+        )
 
-    async def _async_logging_hook(self, prepared: _LogHookRun, callback: CustomLogger) -> Patch | None:
+    async def _async_logging_hook(
+        self, prepared: _LogHookRun, callback: CustomLogger, *, strict: bool = False
+    ) -> Patch | None:
         before: Final = self.model_call_details
+        before_result: Final = prepared.result
         try:
             if isinstance(callback, CustomGuardrail):
                 from litellm.types.guardrails import GuardrailEventHooks
@@ -4974,8 +5119,15 @@ class Logging(LiteLLMLoggingBaseClass):
                 traceback.format_exc(),
             )
             self._handle_callback_failure(callback=callback)
+            if strict and callback.requires_success_await:
+                raise
         prepared.details = self.model_call_details
-        return kwargs_patch(before, self.model_call_details)
+        patch: Final = kwargs_patch(before, self.model_call_details)
+        return (
+            patch
+            if prepared.result is before_result
+            else (patch or Patch()).set(Field.deprecated_response_obj, prepared.result)
+        )
 
     def _deliver_async_success(
         self,
@@ -4985,6 +5137,8 @@ class Logging(LiteLLMLoggingBaseClass):
         delivers_final_stream_log: bool,
         callback: object,
         _kwargs: object,
+        *,
+        strict: bool = False,
     ) -> Awaitable[None] | None:
         litellm_params: Final = self._model_call_details_view.get("litellm_params", {})
         should_run: Final = self.should_run_callback(
@@ -4993,7 +5147,9 @@ class Logging(LiteLLMLoggingBaseClass):
             event_hook="async_success_handler",
         )
         return (
-            self._deliver_async_success_to(callback, result, start_time, end_time, delivers_final_stream_log)
+            self._deliver_async_success_to(
+                callback, result, start_time, end_time, delivers_final_stream_log, strict=strict
+            )
             if should_run
             else None
         )
@@ -5005,6 +5161,8 @@ class Logging(LiteLLMLoggingBaseClass):
         start_time: datetime.datetime,
         end_time: datetime.datetime,
         delivers_final_stream_log: bool,
+        *,
+        strict: bool = False,
     ) -> None:
         try:
             if callback == "openmeter" and openMeterLogger is not None:
@@ -5129,6 +5287,8 @@ class Logging(LiteLLMLoggingBaseClass):
                 traceback.format_exc(),
             )
             self._handle_callback_failure(callback=callback)
+            if strict:
+                raise
 
     def _handle_callback_failure(self, callback: object):
         """

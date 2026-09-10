@@ -12,7 +12,7 @@ from itertools import chain
 from types import MappingProxyType
 from typing import Final, NoReturn, SupportsFloat, SupportsIndex, SupportsInt, TypeAlias, cast
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 from pydantic import ConfigDict, TypeAdapter
 
 import litellm
@@ -36,7 +36,11 @@ from litellm.proxy._types import (
     LiteLLM_UserTable,
     UserAPIKeyAuth,
 )
-from litellm.proxy.auth.auth_utils import get_model_from_request
+from litellm.proxy.auth.auth_utils import (
+    get_model_from_request,
+    get_request_route_template,
+    normalize_request_route,
+)
 from litellm.proxy.auth.budget_throttle import should_throttle_budget_exceeded
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.common_utils.timezone_utils import (
@@ -317,6 +321,48 @@ def _raise_counter_budget_exceeded(
     )
 
 
+_RESOURCE_READ_CALL_TYPES: Final = frozenset(
+    {
+        CallTypes.aretrieve_batch,
+        CallTypes.retrieve_batch,
+        CallTypes.afile_retrieve,
+        CallTypes.file_retrieve,
+        CallTypes.afile_content,
+        CallTypes.file_content,
+        CallTypes.afile_list,
+        CallTypes.file_list,
+        CallTypes.avideo_retrieve,
+        CallTypes.video_retrieve,
+        CallTypes.avideo_content,
+        CallTypes.video_content,
+        CallTypes.avideo_list,
+        CallTypes.video_list,
+        CallTypes.avideo_get_character,
+        CallTypes.video_get_character,
+        CallTypes.alist_input_items,
+    }
+)
+_PATH_PARAMS: Final = TypeAdapter(Mapping[str, object])
+
+
+def _reads_existing_resource(request: Request | None, route: str) -> bool:
+    if request is None or request.scope.get("method") not in ("GET", "HEAD"):
+        return False
+    provider: Final = _PATH_PARAMS.validate_python(request.path_params).get("provider")
+    registered_route: Final = get_request_route_template(request)
+    operation_route: Final = (
+        registered_route.removeprefix("/{provider}")
+        if registered_route is not None
+        else route.removeprefix(f"/{provider}")
+        if isinstance(provider, str)
+        else route
+    )
+    call_types: Final = get_call_types_for_route(operation_route) or ()
+    return any(call_type in _RESOURCE_READ_CALL_TYPES for call_type in call_types) or (
+        CallTypes.aresponses in call_types and normalize_request_route(operation_route).endswith("/{response_id}")
+    )
+
+
 async def reserve_budget_for_request(
     request_body: dict,
     route: str,
@@ -333,7 +379,10 @@ async def reserve_budget_for_request(
     fail_closed_budget_enforcement: bool = False,
     raw_body: bytes | None = None,
     path_params: Mapping[str, object] | None = None,
+    request: Request | None = None,
 ) -> dict | None:
+    if _reads_existing_resource(request, route):
+        return None
     if valid_token is None or not RouteChecks.runs_inference_checks(route=route):
         return None
     if RouteChecks.is_unbilled_route(route):

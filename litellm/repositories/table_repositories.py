@@ -9,7 +9,7 @@ methods; richer repositories live in their own modules.
 
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
-from itertools import groupby
+from itertools import chain, groupby
 from typing import TYPE_CHECKING, Any, Final, Generic, Protocol
 
 from pydantic import TypeAdapter
@@ -23,6 +23,8 @@ from litellm.repositories.prisma_protocols import RowT_co, TableActions
 
 if TYPE_CHECKING:
     from prisma import models as prisma_models  # noqa: F401  # used by quoted base-class subscripts
+
+    from litellm.proxy.db.spend_log_tool_index import ToolUsageTransaction
 
 
 class _PrismaReaderClientView(Protocol):
@@ -160,6 +162,17 @@ def _delivery_id(row: Mapping[str, object]) -> str:
     return str(row["accounting_delivery_id"]) if not _settles_once(row) else str(row["request_id"])
 
 
+def _successful_delivery_id(row: Mapping[str, object]) -> str | None:
+    if _settles_once(row):
+        return None
+    identity, separator, phase = _delivery_id(row).rpartition(":")
+    if not separator or phase not in ("success", "failure") or len(identity) != 64:
+        return None
+    if any(character not in "0123456789abcdef" for character in identity):
+        return None
+    return f"{identity}:success"
+
+
 class SpendLogsRepository(PrismaTableRepository["prisma_models.LiteLLM_SpendLogs"]):
     table_name = "litellm_spendlogs"
 
@@ -191,16 +204,37 @@ class SpendLogsRepository(PrismaTableRepository["prisma_models.LiteLLM_SpendLogs
         payloads: Final = tuple(
             {
                 "delivery_id": _delivery_id(row),
+                "success_delivery_id": _successful_delivery_id(row),
                 "request_id": row["request_id"],
                 "accounting_payload": _accounting_payload(row["accounting_payload"]),
                 "is_batch": _settles_once(row),
             }
             for row in rows
         )
+        admission_keys: Final = tuple(
+            sorted(
+                frozenset(
+                    f"litellm_spend_delivery:{identity}"
+                    for item in payloads
+                    if isinstance(identity := item["success_delivery_id"], str)
+                )
+            )
+        )
+        if admission_keys:
+            await transaction.execute_raw(
+                "SELECT pg_advisory_xact_lock(hashtextextended(admission_key, 0)) "
+                "FROM unnest($1::text[]) AS admissions(admission_key) ORDER BY admission_key",
+                list(admission_keys),
+            )
         inserted_deliveries: Final = await transaction.query_raw(
             'INSERT INTO "LiteLLM_SpendLogDelivery" (delivery_id, request_id, accounting_payload, is_batch) '
             "SELECT delivery_id, request_id, accounting_payload, is_batch FROM jsonb_to_recordset($1::jsonb) "
-            "AS inputs(delivery_id text, request_id text, accounting_payload jsonb, is_batch boolean) "
+            "AS inputs(delivery_id text, request_id text, accounting_payload jsonb, is_batch boolean, "
+            "success_delivery_id text) "
+            "WHERE NOT (success_delivery_id IS NOT NULL "
+            'AND accounting_payload @> \'{"status":"failure","spend":0}\'::jsonb '
+            'AND EXISTS (SELECT 1 FROM "LiteLLM_SpendLogDelivery" succeeded '
+            "WHERE succeeded.delivery_id = inputs.success_delivery_id)) "
             "ON CONFLICT (delivery_id) DO NOTHING RETURNING delivery_id",
             safe_dumps(payloads, non_finite_as_null=True),
         )
@@ -387,8 +421,46 @@ class DailyTagSpendRepository(PrismaTableRepository["prisma_models.LiteLLM_Daily
     table_name = "litellm_dailytagspend"
 
 
+_TOOL_INDEX: Final = """INSERT INTO "LiteLLM_SpendLogToolIndex" (request_id, tool_name, start_time)
+VALUES ($1, $2, ($3::timestamptz AT TIME ZONE 'UTC'))
+ON CONFLICT (request_id, tool_name) DO NOTHING"""
+_TOOL_DAY: Final = """INSERT INTO "LiteLLM_DailyToolSpend"
+    (date, tool_name, spend, total_tokens, request_count, created_at, updated_at)
+VALUES ($1, $2, $3::double precision, $4::bigint, $5::bigint, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT (date, tool_name) DO UPDATE SET
+    spend = "LiteLLM_DailyToolSpend".spend + EXCLUDED.spend,
+    total_tokens = "LiteLLM_DailyToolSpend".total_tokens + EXCLUDED.total_tokens,
+    request_count = "LiteLLM_DailyToolSpend".request_count + EXCLUDED.request_count,
+    updated_at = CURRENT_TIMESTAMP"""
+
+
 class SpendLogToolIndexRepository(PrismaTableRepository["prisma_models.LiteLLM_SpendLogToolIndex"]):
     table_name = "litellm_spendlogtoolindex"
+
+    @staticmethod
+    async def apply_transactions(
+        transaction: LedgerTransaction, transactions: Sequence["ToolUsageTransaction"]
+    ) -> None:
+        from litellm.proxy.db.spend_log_tool_index import indexable_tool_names
+
+        indexed: Final = tuple((item, indexable_tool_names(item)) for item in transactions)
+        index_rows: Final = tuple(
+            chain.from_iterable(
+                ((item.request_id, name, item.start_time.isoformat()) for name in names) for item, names in indexed
+            )
+        )
+        for row in sorted(index_rows):
+            await transaction.execute_raw(_TOOL_INDEX, *row)
+        daily: Final = tuple(
+            chain.from_iterable(
+                ((item.date, name, item.spend, item.total_tokens) for name in names) for item, names in indexed
+            )
+        )
+        for key, grouped in groupby(sorted(daily), key=lambda row: row[:2]):
+            entries = tuple(grouped)
+            await transaction.execute_raw(
+                _TOOL_DAY, *key, sum(row[2] for row in entries), sum(row[3] for row in entries), len(entries)
+            )
 
 
 class DailyToolSpendRepository(PrismaTableRepository["prisma_models.LiteLLM_DailyToolSpend"]):

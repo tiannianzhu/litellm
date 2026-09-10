@@ -90,7 +90,7 @@ def daily_spend_entity_ids(payload: Mapping[str, object], entity: DailySpendEnti
         return tuple(dict.fromkeys(tag for tag in tags if isinstance(tag, str)))
     if value is None:
         return (None,) if entity == "user" else ()
-    if not isinstance(value, str) or (entity == "end_user" and not value):
+    if not isinstance(value, str) or (entity in ("org", "end_user") and not value):
         return ()
     return (value,)
 
@@ -98,7 +98,23 @@ def daily_spend_entity_ids(payload: Mapping[str, object], entity: DailySpendEnti
 # The unique constraint's columns after the entity id, in constraint order. A NULL can
 # never match itself in a unique index, so every one of these is normalized to '': the
 # conflict target has to be NULL-free or the row is re-inserted on every single flush.
-_KEY_COLUMNS: Final = ("date", "api_key", "model", "custom_llm_provider", "mcp_namespaced_tool_name", "endpoint")
+_KEY_COLUMNS: Final = (
+    "date",
+    "api_key",
+    "model",
+    "model_group",
+    "custom_llm_provider",
+    "mcp_namespaced_tool_name",
+    "endpoint",
+)
+_GLOBAL_KEY_COLUMNS: Final = (
+    "date",
+    "model",
+    "model_group",
+    "custom_llm_provider",
+    "mcp_namespaced_tool_name",
+    "endpoint",
+)
 
 _COUNTER_COLUMNS: Final = (
     "prompt_tokens",
@@ -150,7 +166,6 @@ def _identity_columns(table: DailySpendTable) -> tuple[str, ...]:
         table.entity_id_column,
         *table.parent_id_columns,
         *_KEY_COLUMNS,
-        *(("model_group",) if table.hashed_identity else ()),
     )
 
 
@@ -197,11 +212,9 @@ def _row_params(
     transaction: SpendRow,
 ) -> tuple[SqlValue, ...]:
     request_id: Final = transaction.get("request_id")
-    model_group: Final = transaction.get("model_group")
     return (
         hashed_row_id(table, key) if table.hashed_identity else str(uuid.uuid4()),
-        *key[: len(key) - 1 if table.hashed_identity else len(key)],
-        _as_text(model_group) if table.hashed_identity or model_group is not None else None,
+        *key,
         *(_as_int(transaction.get(column)) for column in _COUNTER_COLUMNS),
         *(_as_float(transaction.get(column)) for column in _SPEND_COLUMNS),
         *((None if request_id is None else _as_text(request_id),) if table.carries_request_id else ()),
@@ -214,7 +227,6 @@ def _insert_columns(table: DailySpendTable) -> tuple[str, ...]:
         table.entity_id_column,
         *table.parent_id_columns,
         *_KEY_COLUMNS,
-        "model_group",
         *_COUNTER_COLUMNS,
         *_SPEND_COLUMNS,
         *(("request_id",) if table.carries_request_id else ()),
@@ -227,6 +239,7 @@ def build_bulk_upsert(
 ) -> tuple[str, tuple[SqlValue, ...]]:
     """The single statement writing one merged batch, plus its positional arguments."""
     columns: Final = _insert_columns(table)
+    include_global_rollup: Final = table.name == DAILY_SPEND_TABLES["user"].name
     quoted_table: Final = f'"{table.name}"'
     rows: Final = ", ".join(
         "("
@@ -248,11 +261,44 @@ def build_bulk_upsert(
         if table.carries_request_id
         else ""
     )
+    source: Final = (
+        f"SELECT * FROM daily_user_input ORDER BY {_quoted((table.entity_id_column, *_KEY_COLUMNS))}"
+        if include_global_rollup
+        else f"VALUES {rows}"
+    )
     sql: Final = (
         f'INSERT INTO {quoted_table} ({_quoted(columns)}, "updated_at")\n'
-        f"VALUES {rows}\n"
+        f"{source}\n"
         f"ON CONFLICT ({_quoted(('id',) if table.hashed_identity else _identity_columns(table))}) DO UPDATE SET\n"
         f"  {increments}{request_id_update},\n"
         f"  \"updated_at\" = (NOW() AT TIME ZONE 'UTC')"
     )
-    return sql, tuple(value for key, transaction in batch for value in _row_params(table, key, transaction))
+    return (
+        _with_global_rollup(table, sql, columns, rows) if include_global_rollup else sql,
+        tuple(value for key, transaction in batch for value in _row_params(table, key, transaction)),
+    )
+
+
+def _with_global_rollup(table: DailySpendTable, user_sql: str, columns: Sequence[str], rows: str) -> str:
+    user_keys: Final = (table.entity_id_column, *_KEY_COLUMNS)
+    global_keys: Final = tuple(f"COALESCE(updated_daily_users.\"{column}\", '')" for column in _GLOBAL_KEY_COLUMNS)
+    join: Final = " AND ".join(f'daily_user_input."{column}" = updated_daily_users."{column}"' for column in user_keys)
+    sums: Final = ", ".join(f'SUM(daily_user_input."{column}")' for column in (*_COUNTER_COLUMNS, *_SPEND_COLUMNS))
+    increments: Final = ", ".join(
+        f'"{column}" = "LiteLLM_DailyGlobalSpend"."{column}" + EXCLUDED."{column}"'
+        for column in (*_COUNTER_COLUMNS, *_SPEND_COLUMNS)
+    )
+    return (
+        f'WITH daily_user_input ({_quoted(columns)}, "updated_at") AS (VALUES {rows}),\n'
+        f"updated_daily_users AS (\n{user_sql}\n"
+        f"RETURNING {_quoted(user_keys)}\n)\n"
+        f'INSERT INTO "LiteLLM_DailyGlobalSpend" '
+        f'({_quoted(("id", *_GLOBAL_KEY_COLUMNS, *_COUNTER_COLUMNS, *_SPEND_COLUMNS))}, "updated_at")\n'
+        f'SELECT MIN(daily_user_input."id"), {", ".join(global_keys)}, {sums}, '
+        f"(NOW() AT TIME ZONE 'UTC')\n"
+        f"FROM daily_user_input JOIN updated_daily_users ON {join}\n"
+        f"GROUP BY {', '.join(global_keys)} ORDER BY {', '.join(global_keys)}\n"
+        f"ON CONFLICT ({_quoted(_GLOBAL_KEY_COLUMNS)}) DO UPDATE SET\n"
+        f"  {increments},\n"
+        f"  \"updated_at\" = (NOW() AT TIME ZONE 'UTC')"
+    )

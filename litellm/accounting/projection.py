@@ -180,6 +180,7 @@ def _daily_contributions(row: Mapping[str, object], metadata: Mapping[str, objec
         ("date", date),
         ("api_key", _text(row.get("api_key"))),
         ("model", _text(row.get("model"))),
+        ("model_group", _text(row.get("model_group"))),
         ("custom_llm_provider", _text(row.get("custom_llm_provider"))),
         ("mcp_namespaced_tool_name", _text(row.get("mcp_namespaced_tool_name"))),
         ("endpoint", _text(endpoint)),
@@ -202,29 +203,24 @@ def _daily_rows(
     shared_key: tuple[tuple[str, str], ...],
     counters: tuple[tuple[str, int | float], ...],
 ) -> Iterator[Contribution]:
+    customer_date: Final = _utc_date(row)
+    customer_key: Final = tuple(
+        (column, customer_date if column == "date" and customer_date is not None else value)
+        for column, value in shared_key
+    )
     for entity, table in DAILY_SPEND_TABLES.items():
-        customer_date = _utc_date(row) if entity == "customer_member" else None
         if entity == "customer_member" and customer_date is None:
             continue
-        daily_key = tuple(
-            (column, customer_date if column == "date" and customer_date is not None else value)
-            for column, value in shared_key
-        )
-        model_group = (("model_group", None if row.get("model_group") is None else _text(row.get("model_group"))),)
         for identity in daily_spend_entity_ids(row, entity):
             yield Contribution(
                 table.name,
                 (
                     (table.entity_id_column, _text(identity)),
                     *((column, _text(row.get(column))) for column in table.parent_id_columns),
-                    *daily_key,
-                    *((("model_group", _text(row.get("model_group"))),) if table.hashed_identity else ()),
+                    *(customer_key if entity == "customer_member" else shared_key),
                 ),
                 counters,
-                (
-                    *(() if table.hashed_identity else model_group),
-                    *((("request_id", _text(row.get("request_id"))),) if table.carries_request_id else ()),
-                ),
+                (*((("request_id", _text(row.get("request_id"))),) if table.carries_request_id else ()),),
             )
 
 

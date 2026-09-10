@@ -3017,6 +3017,44 @@ def test_carry_superseded_attempt_usage_without_stashed_usage_preserves_failure_
 
 
 @pytest.mark.asyncio
+async def test_outer_failure_after_a_completed_round_keeps_new_partial_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.litellm_core_utils.hidden_params import set_hidden_param
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+    from litellm.types.integrations.custom_logger import AgenticLoopLimitError
+    from litellm.types.utils import ModelResponse, Usage
+
+    for name in ("success_callback", "_async_success_callback"):
+        monkeypatch.setattr(litellm, name, [])
+    timestamp: Final = real_datetime.datetime(2026, 1, 1, tzinfo=real_datetime.timezone.utc)
+    logging_obj: Final = Logging(
+        model="fixture-model", messages=[], stream=True, call_type="acompletion",
+        start_time=timestamp, litellm_call_id="outer-failure", function_id="fixture",
+    )
+    logging_obj.update_environment_variables(
+        optional_params={}, custom_llm_provider="openai", litellm_params={"metadata": {"model_group": "fixture-model"}},
+    )
+    completed: Final = ModelResponse(
+        id="completed-round", model="fixture-model", usage=Usage(prompt_tokens=10, completion_tokens=5)
+    )
+    set_hidden_param(completed, "response_cost", 0.25)
+    await logging_obj.dispatch_success_handlers(
+        completed, start_time=timestamp, end_time=timestamp, prefer_async_handlers=True
+    )
+    logging_obj.record_partial_usage_for_failure(Usage(prompt_tokens=2, completion_tokens=3), 0.125)
+    failure: Final = AgenticLoopLimitError("fixture loop limit")
+
+    lifted: Final = _failure_fields_to_lift({"litellm_logging_obj": logging_obj}, original_exception=failure)
+    payload: Final = get_logging_payload(
+        kwargs={**lifted, "model": "fixture-model", "litellm_params": {"metadata": {"status": "failure"}}},
+        response_obj=failure, start_time=timestamp, end_time=timestamp,
+    )
+
+    assert payload["request_id"] == "outer-failure"
+    assert (payload["prompt_tokens"], payload["completion_tokens"], lifted["response_cost"]) == (2, 3, 0.125)
+    assert json.loads(payload["metadata"])["error_information"]["error_class"] == "AgenticLoopLimitError"
+
+
+@pytest.mark.asyncio
 async def test_dropped_stream_failure_attribution_reaches_terminal_spend_row() -> None:
     from litellm.exceptions import MidStreamFallbackError
     from litellm.litellm_core_utils.get_litellm_params import get_litellm_params

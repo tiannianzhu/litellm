@@ -1721,28 +1721,28 @@ async def test_add_spend_log_transaction_to_daily_org_transaction_injects_org_id
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_org_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_org_transaction(
         payload=payload,
         prisma_client=mock_prisma,
         org_id=org_id,
     )
+    updates: Final = (
+        await writer.daily_org_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    )
 
-    # Should enqueue one org spend update
-    writer.daily_org_spend_update_queue.add_update.assert_called_once()
-
-    # Validate key and injected fields
-    call_args = writer.daily_org_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-    for key, transaction in update_dict.items():
-        assert key == f"{org_id}_2024-01-01_test-key_gpt-4_openai_"
-        assert transaction["organization_id"] == org_id
-        assert transaction["date"] == "2024-01-01"
-        assert transaction["api_key"] == "test-key"
-        assert transaction["model"] == "gpt-4"
-        assert transaction["custom_llm_provider"] == "openai"
+    assert len(updates) == 1
+    transaction: Final = next(iter(updates.values()))
+    assert transaction["organization_id"] == org_id
+    assert transaction["date"] == "2024-01-01"
+    assert transaction["api_key"] == "test-key"
+    assert transaction["model"] == "gpt-4"
+    assert transaction["model_group"] == "gpt-4-group"
+    assert transaction["custom_llm_provider"] == "openai"
+    assert transaction["endpoint"] is None
+    assert transaction["spend"] == 0.2
+    assert (transaction["prompt_tokens"], transaction["completion_tokens"]) == (10, 5)
+    assert transaction["api_requests"] == transaction["successful_requests"] == 1
+    assert transaction["failed_requests"] == 0
 
 
 @pytest.mark.asyncio
@@ -1801,25 +1801,27 @@ async def test_add_spend_log_transaction_to_daily_end_user_transaction_injects_e
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_end_user_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_end_user_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
+    updates: Final = (
+        await writer.daily_end_user_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    )
 
-    writer.daily_end_user_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_end_user_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-    for key, transaction in update_dict.items():
-        assert key == f"{end_user_id}_2024-01-01_test-key_gpt-4_openai_"
-        assert transaction["end_user_id"] == end_user_id
-        assert transaction["date"] == "2024-01-01"
-        assert transaction["api_key"] == "test-key"
-        assert transaction["model"] == "gpt-4"
-        assert transaction["custom_llm_provider"] == "openai"
+    assert len(updates) == 1
+    transaction: Final = next(iter(updates.values()))
+    assert transaction["end_user_id"] == end_user_id
+    assert transaction["date"] == "2024-01-01"
+    assert transaction["api_key"] == "test-key"
+    assert transaction["model"] == "gpt-4"
+    assert transaction["model_group"] == "gpt-4-group"
+    assert transaction["custom_llm_provider"] == "openai"
+    assert transaction["endpoint"] is None
+    assert transaction["spend"] == 0.2
+    assert (transaction["prompt_tokens"], transaction["completion_tokens"]) == (10, 5)
+    assert transaction["api_requests"] == transaction["successful_requests"] == 1
+    assert transaction["failed_requests"] == 0
 
 
 @pytest.mark.asyncio
@@ -1877,25 +1879,27 @@ async def test_add_spend_log_transaction_to_daily_agent_transaction_injects_agen
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_agent_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_agent_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
+    updates: Final = (
+        await writer.daily_agent_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    )
 
-    writer.daily_agent_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_agent_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-    for key, transaction in update_dict.items():
-        assert key == f"{agent_id}_2024-01-01_test-key_gpt-4_openai_"
-        assert transaction["agent_id"] == agent_id
-        assert transaction["date"] == "2024-01-01"
-        assert transaction["api_key"] == "test-key"
-        assert transaction["model"] == "gpt-4"
-        assert transaction["custom_llm_provider"] == "openai"
+    assert len(updates) == 1
+    transaction: Final = next(iter(updates.values()))
+    assert transaction["agent_id"] == agent_id
+    assert transaction["date"] == "2024-01-01"
+    assert transaction["api_key"] == "test-key"
+    assert transaction["model"] == "gpt-4"
+    assert transaction["model_group"] == "gpt-4-group"
+    assert transaction["custom_llm_provider"] == "openai"
+    assert transaction["endpoint"] is None
+    assert transaction["spend"] == 0.3
+    assert (transaction["prompt_tokens"], transaction["completion_tokens"]) == (20, 10)
+    assert transaction["api_requests"] == transaction["successful_requests"] == 1
+    assert transaction["failed_requests"] == 0
 
 
 @pytest.mark.asyncio
@@ -1966,23 +1970,13 @@ async def test_add_spend_log_transaction_to_daily_agent_transaction_skips_when_a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("call_type", "expected_endpoint"),
-    (("acompletion", "/chat/completions"), ("anthropic_messages", "/messages")),
-)
-async def test_endpoint_field_is_correctly_mapped_from_call_type(call_type: str, expected_endpoint: str):
-    """
-    Test that the endpoint field is correctly mapped from call_type using ROUTE_ENDPOINT_MAPPING.
-    Verifies that when call_type is provided, the endpoint is set in the transaction and included in the key.
-    """
-    writer = DBSpendUpdateWriter()
-    mock_prisma = MagicMock()
-    mock_prisma.get_request_status = MagicMock(return_value="success")
-
-    payload = {
+async def test_endpoint_field_is_correctly_mapped_from_call_type():
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = MagicMock()
+    prisma.get_request_status = MagicMock(return_value="success")
+    payload: Final = {
         "request_id": "req-endpoint-test",
         "user": "test-user",
-        "call_type": call_type,
         "startTime": "2024-01-01T12:00:00",
         "api_key": "test-key",
         "model": "gpt-4",
@@ -1993,32 +1987,23 @@ async def test_endpoint_field_is_correctly_mapped_from_call_type(call_type: str,
         "spend": 0.15,
         "metadata": '{"usage_object": {}}',
     }
+    for call_type in ("acompletion", "anthropic_messages"):
+        await writer.add_spend_log_transaction_to_daily_user_transaction(
+            payload={**payload, "call_type": call_type}, prisma_client=prisma
+        )
+    updates: Final = await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
 
-    writer.daily_spend_update_queue.add_update = AsyncMock()
-
-    await writer.add_spend_log_transaction_to_daily_user_transaction(
-        payload=payload,
-        prisma_client=mock_prisma,
-    )
-
-    writer.daily_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-
-    for key, transaction in update_dict.items():
-        # Verify endpoint is included in the key
-        assert key == f"test-user_2024-01-01_test-key_gpt-4_openai_{expected_endpoint}"
-
-        # Verify endpoint is set in the transaction
-        assert transaction["endpoint"] == expected_endpoint
+    assert sorted(
+        (row["endpoint"], row["spend"], row["prompt_tokens"], row["completion_tokens"], row["api_requests"])
+        for row in updates.values()
+    ) == [("/chat/completions", 0.15, 100, 50, 1), ("/messages", 0.15, 100, 50, 1)]
+    for transaction in updates.values():
         assert transaction["user_id"] == "test-user"
         assert transaction["date"] == "2024-01-01"
         assert transaction["api_key"] == "test-key"
         assert transaction["model"] == "gpt-4"
+        assert transaction["model_group"] == "gpt-4-group"
         assert transaction["custom_llm_provider"] == "openai"
-
 
 @pytest.mark.asyncio
 async def test_endpoint_field_maps_retrieve_batch_spend_row_to_batches_endpoint():
@@ -2041,22 +2026,25 @@ async def test_endpoint_field_maps_retrieve_batch_spend_row_to_batches_endpoint(
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_user_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
+    updates: Final = await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
 
-    writer.daily_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-
-    for key, transaction in update_dict.items():
-        assert key == "test-user_2024-01-01_test-key_gpt-4_openai_/batches"
-        assert transaction["endpoint"] == "/batches"
+    assert len(updates) == 1
+    transaction: Final = next(iter(updates.values()))
+    assert transaction["user_id"] == "test-user"
+    assert transaction["date"] == "2024-01-01"
+    assert transaction["api_key"] == "test-key"
+    assert transaction["model"] == "gpt-4"
+    assert transaction["model_group"] == "gpt-4-group"
+    assert transaction["custom_llm_provider"] == "openai"
+    assert transaction["endpoint"] == "/batches"
+    assert transaction["spend"] == 0.0175
+    assert (transaction["prompt_tokens"], transaction["completion_tokens"]) == (15, 10)
+    assert transaction["api_requests"] == transaction["successful_requests"] == 1
+    assert transaction["failed_requests"] == 0
 
 
 @pytest.mark.asyncio
@@ -4797,6 +4785,60 @@ async def test_client_call_id_without_request_or_provider_identity_does_not_dedu
 
 
 @pytest.mark.asyncio
+async def test_blocked_admission_does_not_block_another_request_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.proxy import proxy_server
+
+    monkeypatch.setattr(proxy_server, "prisma_client", None)
+    monkeypatch.setattr(proxy_server, "disable_spend_logs", True)
+    monkeypatch.setitem(proxy_server.general_settings, "use_spend_logs_ledger", True)
+    writer: Final = DBSpendUpdateWriter()
+    timestamp: Final = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    counters: Final = FakeSpendCounters(redis=None)
+    store: Final = counters.store()
+
+    async def charge(identity: str, blocked: bool) -> bool:
+        async def debit() -> None:
+            if blocked:
+                entered.set()
+                await release.wait()
+            await store.increment("spend:key:fixture", 0.25)
+
+        return await writer.update_database(
+            token=None,
+            user_id=None,
+            end_user_id=None,
+            team_id=None,
+            org_id=None,
+            kwargs={
+                "model": "fixture-model",
+                "call_type": "aembedding",
+                "litellm_call_id": "shared-client-call-id",
+                "_accounting_request_id": identity,
+            },
+            completion_response=None,
+            start_time=timestamp,
+            end_time=timestamp,
+            response_cost=0.25,
+            on_accounting_admitted=debit,
+        )
+
+    first: Final = asyncio.create_task(charge("first-request", True))
+    await entered.wait()
+    second: Final = asyncio.create_task(charge("second-request", False))
+    try:
+        assert await asyncio.wait_for(second, timeout=5) is True
+        assert not first.done()
+        assert counters.memory == {"spend:key:fixture": 0.25}
+    finally:
+        release.set()
+        await asyncio.gather(first, second, return_exceptions=True)
+    assert await first is True
+    assert counters.memory == {"spend:key:fixture": 0.5}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("disable_spend_logs", [False, True])
 async def test_completed_response_usage_is_not_added_again_by_an_unbilled_failure(disable_spend_logs: bool):
     writer: Final = DBSpendUpdateWriter()
@@ -5234,6 +5276,8 @@ def _job_poll(
     polled_video_id: str = "video_abc",
     guardrail_cost: float = 0.0,
     call_type: str = "avideo_status",
+    *,
+    accounting_request_id: str | None = None,
 ) -> tuple[dict[str, object], object]:
     """The logging kwargs a job poll reaches the spend writer with: litellm logs the provider's own cost as
     response_cost and the guardrails' on top of it only in the standard logging payload."""
@@ -5258,6 +5302,7 @@ def _job_poll(
         "model": "sora-2",
         "call_type": call_type,
         "litellm_call_id": litellm_call_id,
+        **({"_accounting_request_id": accounting_request_id} if accounting_request_id is not None else {}),
         "response_cost": response_cost - guardrail_cost,
         "polled_video_status": status,
         "litellm_params": {"metadata": {"user_api_key": "test-key"}, "video_id": polled_video_id},
@@ -5315,8 +5360,18 @@ async def _update_database_for_video_poll(
     polled_video_id: str = "video_abc",
     guardrail_cost: float = 0.0,
     call_type: str = "avideo_status",
+    *,
+    accounting_request_id: str | None = None,
 ) -> bool:
-    kwargs, polled_job = _job_poll(litellm_call_id, response_cost, status, polled_video_id, guardrail_cost, call_type)
+    kwargs, polled_job = _job_poll(
+        litellm_call_id,
+        response_cost,
+        status,
+        polled_video_id,
+        guardrail_cost,
+        call_type,
+        accounting_request_id=accounting_request_id,
+    )
     with _proxy_globals(prisma):
         charged = await _spend_writer_call(db_writer, polled_job)(kwargs=kwargs, response_cost=response_cost)
         await asyncio.sleep(0)
@@ -5352,12 +5407,19 @@ async def test_a_poll_paying_only_its_guardrail_cannot_take_the_jobs_charge_what
 
     charged = [
         await _update_database_for_video_poll(
-            db_writer, prisma, call_id, cost, status=status, guardrail_cost=0.01, call_type=call_type
+            db_writer,
+            prisma,
+            call_id,
+            cost,
+            status=status,
+            guardrail_cost=0.01,
+            call_type=call_type,
+            accounting_request_id=accounting_request_id,
         )
-        for call_id, cost, status in (
-            (charge_row_id, 0.01, "in_progress"),
-            (charge_row_id, 0.01, "in_progress"),
-            ("poll-3", 0.43, "completed"),
+        for call_id, cost, status, accounting_request_id in (
+            (charge_row_id, 0.01, "in_progress", "guardrail-request-first"),
+            (charge_row_id, 0.01, "in_progress", "guardrail-request-second"),
+            ("poll-3", 0.43, "completed", "completed-video-request"),
         )
     ]
     await _flush_queued_spend_logs(prisma)
@@ -5476,8 +5538,12 @@ async def test_update_database_writes_no_row_of_its_own_for_a_video_poll_that_re
         skip_duplicates=True,
     )
 
-    assert await _update_database_for_video_poll(db_writer, prisma, "poll-1", response_cost=0.0) is True
-    assert await _update_database_for_video_poll(db_writer, prisma, "poll-2", response_cost=0.0) is True
+    assert await _update_database_for_video_poll(
+        db_writer, prisma, "poll-1", response_cost=0.0, accounting_request_id="zero-video-request-first"
+    ) is True
+    assert await _update_database_for_video_poll(
+        db_writer, prisma, "poll-2", response_cost=0.0, accounting_request_id="zero-video-request-second"
+    ) is True
     await _flush_queued_spend_logs(prisma)
 
     assert db_writer._batch_database_updates.await_count == 2
@@ -6259,11 +6325,8 @@ async def test_completed_spend_survives_error_log_suppression(
     assert (rows[0]["prompt_tokens"], rows[0]["completion_tokens"]) == (10, 5)
 
 
-@pytest.mark.parametrize("ledger_enabled", [False, True])
 @pytest.mark.asyncio
-async def test_request_error_counts_survive_the_ledger_path_switch(
-    monkeypatch: pytest.MonkeyPatch, ledger_enabled: bool
-):
+async def test_request_error_counts_survive_legacy_spend_admission(monkeypatch: pytest.MonkeyPatch):
     from litellm.proxy import proxy_server
     from litellm.proxy.db import db_spend_update_writer as writer_module
     from litellm.proxy.db.request_error_tracking import RequestErrorAccumulator
@@ -6274,7 +6337,7 @@ async def test_request_error_counts_survive_the_ledger_path_switch(
     prisma.get_request_status.return_value = "failure"
     monkeypatch.setattr(writer_module, "request_error_accumulator", accumulator)
     monkeypatch.setattr(proxy_server, "prisma_client", prisma)
-    monkeypatch.setattr(proxy_server, "general_settings", {"use_spend_logs_ledger": ledger_enabled})
+    monkeypatch.setattr(proxy_server, "general_settings", {"use_spend_logs_ledger": False})
     monkeypatch.setattr(proxy_server, "disable_spend_logs", False)
     now = datetime(2026, 11, 2, tzinfo=timezone.utc)
     await DBSpendUpdateWriter().update_database(

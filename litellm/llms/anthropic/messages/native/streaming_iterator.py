@@ -423,6 +423,31 @@ def anthropic_messages_stream_hidden_params(
     )
 
 
+async def _dispatch_pending_deferred_logging(logging_obj: LiteLLMLoggingObj) -> None:
+    deferred_cb: Final[DeferredStreamRelease | None] = getattr(logging_obj, "_on_deferred_stream_complete", None)
+    deferred_args: Final[tuple[object, ...] | None] = getattr(logging_obj, "_deferred_stream_complete_args", None)
+    if deferred_cb is None or deferred_args is None:
+        return
+    logging_obj._on_deferred_stream_complete = None
+    logging_obj._deferred_stream_complete_args = None
+    logging_coroutine: Final = deferred_cb(*deferred_args)
+    if logging_obj.requires_success_await is True:
+        await logging_coroutine
+    else:
+        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
+
+
+async def record_proxy_disconnect(logger: LiteLLMLoggingObj) -> None:
+    proxy_request: Final = logger.litellm_params.get("proxy_server_request")
+    if not isinstance(proxy_request, Mapping) or not isinstance(proxy_request.get("url"), str):
+        return
+    from litellm.proxy.common_request_processing import record_streaming_client_disconnect_if_needed
+
+    await record_streaming_client_disconnect_if_needed(
+        None, {"litellm_logging_obj": logger, "litellm_call_id": logger.litellm_call_id}, True
+    )
+
+
 class AnthropicMessagesStreamingResponse:
     """
     Wraps the /v1/messages SSE byte stream so upstream provider response
@@ -436,9 +461,12 @@ class AnthropicMessagesStreamingResponse:
         self,
         completion_stream: AsyncIterator[bytes],
         hidden_params: AnthropicMessagesStreamHiddenParams,
+        accounting_logger: LiteLLMLoggingObj | None = None,
     ) -> None:
         self.completion_stream = completion_stream
         self._hidden_params = hidden_params
+        self._accounting_logger: Final = accounting_logger
+        self._stream_completed = False
 
     @property
     def hidden_params(self) -> AnthropicMessagesStreamHiddenParams:
@@ -456,10 +484,48 @@ class AnthropicMessagesStreamingResponse:
         return self
 
     async def __anext__(self) -> bytes:
-        return await self.completion_stream.__anext__()
+        if self._accounting_logger is None:
+            return await self.completion_stream.__anext__()
+        try:
+            return await self.completion_stream.__anext__()
+        except StopAsyncIteration:
+            self._stream_completed = True
+            await self._await_accounting()
+            raise
+        except (asyncio.CancelledError, GeneratorExit):
+            await self.aclose()
+            raise
+        except BaseException:
+            await self._await_accounting()
+            raise
 
     async def aclose(self) -> None:
-        await aclose_if_supported(self.completion_stream)
+        if self._accounting_logger is None:
+            await aclose_if_supported(self.completion_stream)
+            return
+        with anyio.CancelScope(shield=True):
+            if not self._stream_completed:
+                await record_proxy_disconnect(self._accounting_logger)
+            try:
+                await aclose_if_supported(self.completion_stream)
+            finally:
+                if not self._stream_completed:
+                    await _dispatch_pending_deferred_logging(self._accounting_logger)
+                await self._await_accounting()
+
+    async def _await_accounting(self) -> None:
+        if self._accounting_logger is None:
+            return
+        task: Final = self._accounting_logger.success_accounting_task
+        if task is None:
+            return
+        with anyio.CancelScope(shield=True):
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await record_proxy_disconnect(self._accounting_logger)
+                await asyncio.shield(task)
+                raise
 
 
 _SSE_FRAME_END: Final = re.compile(rb"(?<=\n\n)|(?<=\r\n\r\n)")
@@ -545,6 +611,7 @@ class BaseAnthropicMessagesStreamingIterator:
         self.request_body = request_body
         self.start_time = litellm_logging_obj.start_time
         self.completion_start_time: datetime | None = None
+        self._success_logging_task: asyncio.Task[None] | None = None
 
     async def _handle_streaming_logging(self, collected_chunks: list[bytes], *, stream_teardown: bool = False):
         """Handle the logging after all chunks have been collected."""
@@ -573,6 +640,10 @@ class BaseAnthropicMessagesStreamingIterator:
         )
         if deferred_dispatch_armed and not stream_teardown:
             self.litellm_logging_obj._deferred_stream_complete_args = (logging_coroutine,)
+            return
+        if self.litellm_logging_obj.requires_success_await is True:
+            self._success_logging_task = asyncio.create_task(logging_coroutine)
+            await asyncio.shield(self._success_logging_task)
             return
         # Enqueue on the rooted logging worker rather than asyncio.create_task:
         # this also runs during generator teardown after a client disconnect,
@@ -685,13 +756,25 @@ class BaseAnthropicMessagesStreamingIterator:
                     raise item
                 relayed_terminal_event = relayed_terminal_event or _is_terminal_stream_chunk(item)
                 yield item
+        except (asyncio.CancelledError, GeneratorExit):
+            if self.litellm_logging_obj.requires_success_await is True:
+                with anyio.CancelScope(shield=True):
+                    await record_proxy_disconnect(self.litellm_logging_obj)
+            raise
         finally:
             client_detached.set()
             _start_detached_drain_deadline(drain_deadline)
             if not reached_end:
-                self._dispatch_pending_deferred_logging()
+                if self.litellm_logging_obj.requires_success_await is True:
+                    with anyio.CancelScope(shield=True):
+                        await self._dispatch_pending_deferred_logging()
+                        await asyncio.shield(pump_task)
+                        if self._success_logging_task is not None:
+                            await asyncio.shield(self._success_logging_task)
+                else:
+                    await self._dispatch_pending_deferred_logging()
 
-    def _dispatch_pending_deferred_logging(self) -> None:
+    async def _dispatch_pending_deferred_logging(self) -> None:
         """Fire deferred billing that a torn-down response would otherwise drop.
 
         When the pump finishes draining while the client is still connected it
@@ -700,17 +783,7 @@ class BaseAnthropicMessagesStreamingIterator:
         disconnect (GeneratorExit / CancelledError) re-raises past it. Without
         this dispatch that window loses the spend row entirely.
         """
-        deferred_cb: Final[DeferredStreamRelease | None] = getattr(
-            self.litellm_logging_obj, "_on_deferred_stream_complete", None
-        )
-        deferred_args: Final[tuple[object, ...] | None] = getattr(
-            self.litellm_logging_obj, "_deferred_stream_complete_args", None
-        )
-        if deferred_cb is None or deferred_args is None:
-            return
-        self.litellm_logging_obj._on_deferred_stream_complete = None
-        self.litellm_logging_obj._deferred_stream_complete_args = None
-        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=deferred_cb(*deferred_args))
+        await _dispatch_pending_deferred_logging(self.litellm_logging_obj)
 
     async def _bill_collected_chunks(
         self,
@@ -722,7 +795,9 @@ class BaseAnthropicMessagesStreamingIterator:
 
         try:
             await self._handle_streaming_logging(collected_chunks, stream_teardown=stream_teardown)
-        except Exception as exc:  # noqa: BLE001  # billing is best-effort; never crash the pump
+        except Exception as exc:  # noqa: BLE001  # legacy billing remains best-effort
+            if self.litellm_logging_obj.requires_success_await is True:
+                raise
             verbose_proxy_logger.warning(
                 "async_sse_wrapper billing failed after %d chunks: %s(%s)",
                 len(collected_chunks),
@@ -827,30 +902,36 @@ class BaseAnthropicMessagesStreamingIterator:
             await self._handle_pump_upstream_error(queue, client_detached, collected_chunks, exc)
             return
 
-        if over_drain_cap or drain_deadline.cancelled_caught:
-            verbose_proxy_logger.warning(
-                "async_sse_wrapper: %s; billing %d partial chunks and aborting the upstream stream to stop "
-                "provider billing",
-                f"detached-drain cap ({ANTHROPIC_MESSAGES_MAX_DETACHED_STREAM_DRAINS}) reached"
-                if over_drain_cap
-                else f"detached drain still running {ANTHROPIC_MESSAGES_DETACHED_STREAM_DRAIN_TIMEOUT_SECONDS}s "
-                "after the client left",
-                len(collected_chunks),
-            )
-            await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
-            await self._abort_upstream(completion_stream)
-            return
-        if client_detached.is_set():
-            await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
-            return
-        if not saw_terminal_event and not await self._enqueue_for_client(
-            queue, client_detached, _incomplete_stream_error_sse_event()
-        ):
-            await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
-            return
-        await self._bill_collected_chunks(collected_chunks, stream_teardown=False)
-        if not await self._enqueue_for_client(queue, client_detached, None):
-            self._dispatch_pending_deferred_logging()
+        try:
+            if over_drain_cap or drain_deadline.cancelled_caught:
+                verbose_proxy_logger.warning(
+                    "async_sse_wrapper: %s; billing %d partial chunks and aborting the upstream stream to stop "
+                    "provider billing",
+                    f"detached-drain cap ({ANTHROPIC_MESSAGES_MAX_DETACHED_STREAM_DRAINS}) reached"
+                    if over_drain_cap
+                    else f"detached drain still running {ANTHROPIC_MESSAGES_DETACHED_STREAM_DRAIN_TIMEOUT_SECONDS}s "
+                    "after the client left",
+                    len(collected_chunks),
+                )
+                try:
+                    await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                finally:
+                    await self._abort_upstream(completion_stream)
+                return
+            if client_detached.is_set():
+                await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                return
+            if not saw_terminal_event and not await self._enqueue_for_client(
+                queue, client_detached, _incomplete_stream_error_sse_event()
+            ):
+                await self._bill_collected_chunks(collected_chunks, stream_teardown=True)
+                return
+            await self._bill_collected_chunks(collected_chunks, stream_teardown=False)
+            if not await self._enqueue_for_client(queue, client_detached, None):
+                await self._dispatch_pending_deferred_logging()
+        except Exception as exc:  # noqa: BLE001  # admission errors reach the relay without provider failure logging
+            if not await self._enqueue_for_client(queue, client_detached, exc):
+                raise
 
     async def _handle_pump_upstream_error(
         self,

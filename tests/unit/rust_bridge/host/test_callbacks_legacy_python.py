@@ -128,6 +128,81 @@ def test_a_deferred_success_waits_for_the_proxy_release() -> None:
     assert released == ["released"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable", [False, True], ids=["worker-queue", "durable-task"])
+async def test_native_enqueue_preserves_the_callback_delivery_contract(
+    monkeypatch: pytest.MonkeyPatch, durable: bool
+) -> None:
+    from litellm.litellm_core_utils import logging_worker
+    from litellm.responses.streaming_iterator import drain_logging_tasks
+
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    drain_started: Final = asyncio.Event()
+    accepted: Final[asyncio.Queue[object]] = asyncio.Queue()
+
+    class Admission(CustomLogger):
+        @property
+        def requires_success_await(self) -> bool:
+            return durable
+
+        async def async_log_success_event(
+            self,
+            kwargs: dict[str, object],
+            response_obj: object,
+            start_time: datetime.datetime,
+            end_time: datetime.datetime,
+        ) -> None:
+            entered.set()
+            await release.wait()
+            accepted.put_nowait(response_obj)
+
+    logger: Final = Logging(
+        model="hosted_vllm/fixture",
+        messages=[],
+        stream=False,
+        call_type="anthropic_messages",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="native-admission",
+        function_id="native-admission",
+        dynamic_async_success_callbacks=[Admission()],
+    )
+    logger.update_environment_variables(litellm_params={"metadata": {}}, optional_params={})
+    worker: Final = logging_worker.LoggingWorker()
+    monkeypatch.setattr(logging_worker, "GLOBAL_LOGGING_WORKER", worker)
+    response: Final = ModelResponse(id="native-admission", model="hosted_vllm/fixture")
+
+    async def drain() -> None:
+        drain_started.set()
+        if durable:
+            await drain_logging_tasks()
+        else:
+            await worker.flush()
+
+    legacy.enqueue_logging(legacy.async_success_handler(logger, response, logger.start_time, logger.start_time), logger)
+    draining: Final = asyncio.create_task(drain())
+    try:
+        if durable:
+            assert logger.success_accounting_task is not None
+        else:
+            assert logger.success_accounting_task is None
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.wait_for(drain_started.wait(), timeout=5)
+        assert not draining.done()
+        release.set()
+        await asyncio.wait_for(asyncio.shield(draining), timeout=5)
+        logged: Final = accepted.get_nowait()
+        assert isinstance(logged, ModelResponse)
+        assert logged.id == response.id
+        assert accepted.empty()
+    finally:
+        release.set()
+        await asyncio.gather(draining, return_exceptions=True)
+        await logger.await_success_accounting()
+        await drain_logging_tasks()
+        await worker.stop()
+
+
 def test_setup_claims_the_budget_reservation_for_an_async_call() -> None:
     reservation: Final = _budget_reservation()
 
@@ -495,6 +570,31 @@ async def test_a_native_stream_failure_logs_like_the_python_chunk_processor(monk
 
 
 @pytest.mark.asyncio
+async def test_native_error_frame_dispatches_failure_instead_of_success() -> None:
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    hooks: Final = _Hooks()
+    logger: Final = _logger_with_hooks(hooks)
+    now: Final = datetime.datetime(2026, 1, 1)
+
+    legacy.stream_success(
+        logger,
+        "/v1/messages",
+        "anthropic",
+        {},
+        [b'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n'],
+        now,
+        now,
+        None,
+        False,
+    )
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    assert hooks.hooks.count("async_failure") == 1
+    assert "async_success" not in hooks.hooks
+
+
+@pytest.mark.asyncio
 async def test_a_proxy_stream_abandoned_mid_cancel_bills_after_the_disconnect_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -510,7 +610,9 @@ async def test_a_proxy_stream_abandoned_mid_cancel_bills_after_the_disconnect_cl
 
     events: Final[list[str]] = []
     monkeypatch.setattr(PassThroughStreamingHandler, "_route_streaming_logging_to_handler", lambda **_: billing())
-    monkeypatch.setattr(legacy, "enqueue_logging", lambda coroutine: (events.append("billed"), coroutine.close()))
+    monkeypatch.setattr(
+        legacy, "enqueue_logging", lambda coroutine, logger: (events.append("billed"), coroutine.close())
+    )
     started: Final = asyncio.Event()
     now: Final = datetime.datetime.now()
 

@@ -4,8 +4,8 @@ Tests for BudgetReservationReleaseMiddleware.
 Auth reserves budget before the handler runs and hands the reservation to the
 request or socket state. A litellm call made through the async client wrapper
 claims it for the cost callback that runs after the call; anything still unclaimed
-when the response is done or the socket has closed would keep the spend counter
-pinned until its TTL, so the middleware releases it.
+must be released before the final HTTP body or after the socket closes, so a
+completed request cannot leave the next request blocked by its reservation.
 """
 
 import asyncio
@@ -109,7 +109,7 @@ def _app(
     return app
 
 
-async def _post(app: ASGIApp) -> None:
+async def _post(app: ASGIApp, send: Send | None = None) -> None:
     scope: Final = {
         "type": "http",
         "method": "POST",
@@ -131,10 +131,10 @@ async def _post(app: ASGIApp) -> None:
         body_delivered.set()
         return {"type": "http.request", "body": b"", "more_body": False}
 
-    async def send(message: Message) -> None:
+    async def discard(message: Message) -> None:
         return None
 
-    await app(scope, receive, send)
+    await app(scope, receive, send if send is not None else discard)
 
 
 def _counter(spend_counter_store: SpendCounterStore) -> float | None:
@@ -157,14 +157,130 @@ async def test_unbound_reservation_is_released_after_the_response(spend_counter_
 
 
 @pytest.mark.asyncio
-async def test_unbound_reservation_is_released_when_the_handler_raises(spend_counter_store: SpendCounterStore):
+@pytest.mark.parametrize("cancel_during_release", (False, True))
+async def test_terminal_http_body_waits_for_reservation_release(
+    spend_counter_store: SpendCounterStore, cancel_during_release: bool
+) -> None:
+    reservation: Final = await _reserve()
+    release_started: Final = asyncio.Event()
+    allow_release: Final = asyncio.Event()
+    terminal_body_sent: Final = asyncio.Event()
+
+    async def handler(request: Request) -> Response:
+        request.state.budget_reservation = reservation
+        return JSONResponse({"status": "completed"})
+
+    async def release(budget_reservation: Mapping[str, object]) -> None:
+        assert not release_started.is_set()
+        release_started.set()
+        await allow_release.wait()
+        await release_unbound_budget_reservation(budget_reservation)
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            terminal_body_sent.set()
+            assert _counter(spend_counter_store) == pytest.approx(0.0)
+
+    request_task: Final = asyncio.create_task(_post(_app(handler, release=release), send=send))
+    try:
+        await release_started.wait()
+        assert not terminal_body_sent.is_set()
+        assert _counter(spend_counter_store) == pytest.approx(reservation["reserved_cost"])
+        if cancel_during_release:
+            request_task.cancel()
+        allow_release.set()
+        if cancel_during_release:
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+            assert not terminal_body_sent.is_set()
+        else:
+            await request_task
+            assert terminal_body_sent.is_set()
+    finally:
+        allow_release.set()
+        await asyncio.gather(request_task, return_exceptions=True)
+
+    assert _counter(spend_counter_store) == pytest.approx(0.0)
+    assert reservation["finalized"] is True
+
+
+@pytest.mark.asyncio
+async def test_unbound_stream_keeps_its_reservation_until_the_terminal_body(
+    spend_counter_store: SpendCounterStore,
+) -> None:
+    reservation: Final = await _reserve()
+    intermediate_body_sent: Final = asyncio.Event()
+    terminal_body_sent: Final = asyncio.Event()
+
+    async def handler(request: Request) -> Response:
+        request.state.budget_reservation = reservation
+
+        async def chunks() -> AsyncIterator[bytes]:
+            yield b"first"
+            await intermediate_body_sent.wait()
+            yield b"second"
+
+        return StreamingResponse(chunks())
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            assert intermediate_body_sent.is_set()
+            assert _counter(spend_counter_store) == pytest.approx(0.0)
+            terminal_body_sent.set()
+            return
+        assert _counter(spend_counter_store) == pytest.approx(reservation["reserved_cost"])
+        assert reservation["finalized"] is False
+        if message["type"] == "http.response.body":
+            intermediate_body_sent.set()
+
+    await _post(_app(handler), send=send)
+
+    assert terminal_body_sent.is_set()
+    assert reservation["finalized"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("send_error", (RuntimeError, asyncio.CancelledError))
+async def test_failed_terminal_send_does_not_release_the_reservation_twice(
+    spend_counter_store: SpendCounterStore, send_error: type[BaseException]
+) -> None:
+    reservation: Final = await _reserve()
+    release_started: Final = asyncio.Event()
+
+    async def handler(request: Request) -> Response:
+        request.state.budget_reservation = reservation
+        return JSONResponse({})
+
+    async def release(budget_reservation: Mapping[str, object]) -> None:
+        assert not release_started.is_set()
+        release_started.set()
+        await release_unbound_budget_reservation(budget_reservation)
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            assert _counter(spend_counter_store) == pytest.approx(0.0)
+            raise send_error("client disconnected")
+
+    with pytest.raises(send_error, match="client disconnected"):
+        await _post(_app(handler, release=release), send=send)
+
+    assert release_started.is_set()
+    assert _counter(spend_counter_store) == pytest.approx(0.0)
+    assert reservation["finalized"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler_error", (RuntimeError, asyncio.CancelledError))
+async def test_unbound_reservation_is_released_when_the_handler_raises(
+    spend_counter_store: SpendCounterStore, handler_error: type[BaseException]
+):
     reservation: Final = await _reserve()
 
     async def handler(request: Request) -> Response:
         request.state.budget_reservation = reservation
-        raise RuntimeError("upstream refused the cancel")
+        raise handler_error("upstream refused the cancel")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(handler_error):
         await _post(_app(handler))
 
     assert _counter(spend_counter_store) == pytest.approx(0.0)
@@ -226,7 +342,11 @@ async def test_reservation_claimed_by_a_completed_call_is_left_for_the_callback(
         response: Final = await _chat(reservation, mock_response="ok")
         return JSONResponse(response.model_dump())
 
-    await _post(_app(handler))
+    async def send(message: Message) -> None:
+        assert _counter(spend_counter_store) == pytest.approx(reserved_cost)
+        assert reservation["finalized"] is False
+
+    await _post(_app(handler), send=send)
 
     assert _counter(spend_counter_store) == pytest.approx(reserved_cost)
     assert reservation["finalized"] is False
@@ -251,7 +371,11 @@ async def test_reservation_claimed_by_a_streaming_call_is_left_for_the_callback_
 
         return StreamingResponse(sse(), media_type="text/event-stream")
 
-    await _post(_app(handler))
+    async def send(message: Message) -> None:
+        assert _counter(spend_counter_store) == pytest.approx(reserved_cost)
+        assert reservation["finalized"] is False
+
+    await _post(_app(handler), send=send)
 
     assert _counter(spend_counter_store) == pytest.approx(reserved_cost)
     assert reservation["finalized"] is False
@@ -264,10 +388,15 @@ async def test_reservation_claimed_by_a_streaming_call_is_left_for_the_callback_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("callback_bound", (False, True))
 async def test_unbound_reservation_of_a_websocket_session_is_released_when_the_socket_closes(
     spend_counter_store: SpendCounterStore,
+    no_callbacks: None,
+    callback_bound: bool,
 ):
     reservation: Final = await _reserve()
+    if callback_bound:
+        await _chat(reservation, mock_response="ok")
 
     async def listen_without_a_provider_key(scope: Scope, receive: Receive, send: Send) -> None:
         websocket: Final = WebSocket(scope, receive, send)
@@ -278,15 +407,16 @@ async def test_unbound_reservation_of_a_websocket_session_is_released_when_the_s
         return {"type": "websocket.connect"}
 
     async def send(message: Message) -> None:
-        return None
+        assert _counter(spend_counter_store) == pytest.approx(reservation["reserved_cost"])
+        assert reservation["finalized"] is False
 
     middleware: Final = BudgetReservationReleaseMiddleware(
         listen_without_a_provider_key, release=release_unbound_budget_reservation
     )
     await middleware({"type": "websocket", "path": "/deepgram/v1/listen", "headers": []}, receive, send)
 
-    assert _counter(spend_counter_store) == pytest.approx(0.0)
-    assert reservation["finalized"] is True
+    assert _counter(spend_counter_store) == pytest.approx(reservation["reserved_cost"] if callback_bound else 0.0)
+    assert reservation["finalized"] is (not callback_bound)
 
 
 @pytest.mark.asyncio

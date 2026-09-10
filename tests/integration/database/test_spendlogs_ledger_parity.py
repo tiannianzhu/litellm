@@ -6,23 +6,26 @@ import uuid
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 import psycopg
 from psycopg import sql
+from prisma.errors import RawQueryError
 import pytest
+from pydantic import TypeAdapter
 import litellm
 
 from litellm.accounting.application import apply_deliveries
+from litellm.accounting.snapshot import build_accounting_payload
 from litellm.caching.dual_cache import DualCache
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.constants import BILLED_RETRY_ATTEMPT_METADATA_KEY, INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.proxy.spend_tracking.spend_tracking_utils import spend_log_row_with_retained_metadata
 from litellm.proxy import proxy_server
-from litellm.proxy._types import SpendLogsMetadataFields
+from litellm.proxy._types import SpendLogsMetadataFields, SpendLogsPayload
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
 from litellm.proxy.db.model_usage_rollup import flush_model_usage_transactions
 from litellm.proxy.guardrails.usage_tracking import PendingRollups, process_spend_logs_guardrail_usage
@@ -37,6 +40,9 @@ from tests.integration._support.database import scratch_database
 
 _ROOT: Final = Path(__file__).resolve().parents[3]
 _NOW: Final = datetime(2026, 11, 2, tzinfo=timezone.utc)
+_TOKEN: Final = "2c70e12b7a0646f92279f427c7b38e7334d8e5389cff167a1dc30e73f826b683"
+_FIELDS: Final = TypeAdapter(dict[str, object])
+_DB_ROWS: Final = TypeAdapter(tuple[dict[str, object], ...])
 _ENTITY_TABLES: Final = (
     "LiteLLM_VerificationToken",
     "LiteLLM_UserTable",
@@ -52,6 +58,7 @@ _ENTITY_TABLES: Final = (
 )
 _DAILY_TABLES: Final = (
     "LiteLLM_DailyUserSpend",
+    "LiteLLM_DailyGlobalSpend",
     "LiteLLM_DailyTeamSpend",
     "LiteLLM_DailyOrganizationSpend",
     "LiteLLM_DailyEndUserSpend",
@@ -61,6 +68,98 @@ _DAILY_TABLES: Final = (
     "LiteLLM_DailyGuardrailUsageUnits",
     "LiteLLM_BudgetWindowSpend",
 )
+
+
+@pytest.mark.asyncio
+async def test_customer_counter_failure_without_reservation_reloads_committed_spend(
+    parity_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.accounting.worker import flush_accounting_deliveries
+    from litellm.models.budget import BudgetLimit
+    from litellm.proxy.auth.customer_spend import customer_spend_counter
+    from litellm.proxy.db.spend_counter_reseed import SpendCounterReseed
+    from litellm.proxy.hooks.proxy_track_cost_callback import _update_database_and_spend_counters_in_batch
+    from litellm.proxy.spend_tracking.budget_reservation import customer_window_counters
+    from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth, CustomerScopeAuth
+    from tests.unit.redis.stores.spend_counters_double import FakeSpendCounters
+
+    _seed_customer_hierarchy(parity_database)
+    member: Final = "member:one/@"
+    with psycopg.connect(parity_database) as connection:
+        connection.execute('UPDATE "LiteLLM_CustomerMemberTable" SET customer_member_id=%s', (member,))
+    hierarchy: Final = CustomerHierarchyAuth(
+        customer_org_id="customer-org",
+        customer_member_id=member,
+        scopes=(CustomerScopeAuth(key="customer_member", entity_id=member, budget_reset_at=_NOW),),
+    )
+    scalar_key: Final = customer_spend_counter(hierarchy.scopes[0])
+    windows: Final = customer_window_counters(
+        "customer_member", member, (BudgetLimit(budget_duration="1mo", max_budget=10),), now=_NOW
+    )
+    keys: Final = frozenset((scalar_key, windows[0].counter_key))
+    backend: Final = FakeSpendCounters(
+        redis=dict.fromkeys(keys, 0.0), memory=dict.fromkeys(keys, 0.0), fail_pipelines=True
+    )
+    monkeypatch.setattr(proxy_server, "spend_counter_store", backend.store())
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        writer: Final = DBSpendUpdateWriter()
+        request: Final = {
+            "model": "ledger-test",
+            "call_type": "acompletion",
+            "litellm_call_id": "customer-counter-failure",
+            "litellm_params": {
+                "metadata": {
+                    "status": "success",
+                    "user_api_key_customer_member_id": member,
+                    "user_api_key_customer_org_id": "customer-org",
+                    "user_api_key_customer_hierarchy": hierarchy.model_dump(mode="json"),
+                }
+            },
+        }
+        response: Final = ModelResponse(id="customer-counter-failure", model="ledger-test")
+
+        async def record() -> bool:
+            return await _update_database_and_spend_counters_in_batch(
+                proxy_logging_obj=proxy_server.proxy_logging_obj,
+                spend_writer=writer,
+                increment_spend_counters=proxy_server.increment_spend_counters,
+                user_api_key=None,
+                user_id=None,
+                end_user_id=None,
+                team_id=None,
+                org_id=None,
+                kwargs=request,
+                completion_response=response,
+                start_time=_NOW,
+                end_time=_NOW,
+                response_cost=0.25,
+                budget_reservation=None,
+                request_tags=None,
+                model_access_groups=None,
+                project_id=None,
+                customer_counters=windows,
+            )
+
+        assert await record() is True
+        assert await record() is False
+        assert keys <= backend.deleted()
+        for key in keys:
+            assert (await proxy_server.spend_counter_store.read(key))[0] is None
+        await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
+        assert await SpendCounterReseed.coalesced(client, proxy_server.spend_counter_store, scalar_key) == 0.25
+        window: Final = windows[0]
+        assert (
+            await SpendCounterReseed.coalesced_window(
+                client,
+                proxy_server.spend_counter_store,
+                window.counter_key,
+                window.entity_type,
+                window.entity_id,
+                window.window_duration,
+                window.window_start,
+            )
+            == 0.25
+        )
 
 
 @pytest.mark.parametrize("batch_size,row_count,transactions,distinct_models", [(None, 251, 1, False), (None, 1001, 3, False), ("200", 251, 2, False), ("3001", 3001, 1, True)])
@@ -245,6 +344,87 @@ async def test_registered_proxy_callbacks_charge_model_windows_before_persisting
         await client.db.disconnect()
 
 
+@pytest.mark.asyncio
+async def test_outer_stream_failure_keeps_one_terminal_record_without_rebilling_a_completed_round(
+    parity_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.litellm_core_utils.hidden_params import set_hidden_param
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.db import db_spend_update_writer as writer_module
+    from litellm.proxy.db.request_error_tracking import RequestErrorAccumulator
+    from litellm.proxy.utils import ProxyLogging
+    from litellm.types.integrations.custom_logger import AgenticLoopLimitError
+    from litellm.utils import Rules, function_setup
+
+    for name in (
+        "callbacks", "input_callback", "success_callback", "failure_callback",
+        "_async_success_callback", "_async_failure_callback",
+    ):
+        monkeypatch.setattr(litellm, name, [])
+    monkeypatch.setenv("LITELLM_COLLECTOR_ENABLED", "false")
+    errors: Final = RequestErrorAccumulator()
+    monkeypatch.setattr(writer_module, "request_error_accumulator", errors)
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        proxy_logging: Final = ProxyLogging(UserApiKeyCache())
+        monkeypatch.setattr(proxy_server, "proxy_logging_obj", proxy_logging)
+        proxy_server.cost_tracking()
+        logging, _ = function_setup(
+            "acompletion", Rules(), _NOW, model="ledger-test", messages=[], stream=True,
+            litellm_call_id="outer-stream-failure",
+        )
+        logging.update_environment_variables(
+            optional_params={}, custom_llm_provider="openai",
+            litellm_params={"metadata": {
+                "user_api_key": _TOKEN, "user_api_key_hash": _TOKEN,
+                "user_api_key_user_id": "user", "user_api_key_team_id": "team", "model_group": "ledger-test",
+                "user_api_key_end_user_id": "end-user",
+            }},
+        )
+        response: Final = ModelResponse(
+            id="completed-stream-round", model="ledger-test",
+            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+        set_hidden_param(response, "response_cost", 0.25)
+        await logging.dispatch_success_handlers(
+            response, start_time=_NOW, end_time=_NOW, prefer_async_handlers=True
+        )
+        await drain_logging_tasks()
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute('SELECT spend, status FROM "LiteLLM_SpendLogs"').fetchall() == [(0.25, "success")]
+
+        failure: Final = AgenticLoopLimitError("Exceeded max_agentic_loops=3 for model=ledger-test")
+        for _ in range(2):
+            await proxy_logging.post_call_failure_hook(
+                request_data={
+                    "model": "ledger-test", "litellm_call_id": "outer-stream-failure", "litellm_logging_obj": logging,
+                },
+                original_exception=failure,
+                user_api_key_dict=UserAPIKeyAuth(
+                    api_key=_TOKEN, user_id="user", team_id="team", end_user_id="end-user",
+                    request_route="/v1/responses",
+                ),
+                dispatched_call_type="aresponses",
+            )
+        await _flush(proxy_logging.db_spend_update_writer, client)
+        with psycopg.connect(parity_database) as connection:
+            failures: Final = connection.execute(
+                'SELECT request_id, metadata->\'error_information\'->>\'error_class\', "user", end_user, team_id '
+                'FROM "LiteLLM_SpendLogs" WHERE status=\'failure\''
+            ).fetchall()
+            assert failures == [("outer-stream-failure", "AgenticLoopLimitError", "user", "end-user", "team")]
+            assert connection.execute(
+                'SELECT status, spend, prompt_tokens, completion_tokens FROM "LiteLLM_SpendLogs" ORDER BY status'
+            ).fetchall() == [("failure", 0.0, 0, 0), ("success", 0.25, 10, 5)]
+            assert connection.execute(
+                'SELECT SUM(failed_requests) FROM "LiteLLM_DailyUserSpend"'
+            ).fetchone() == (len(failures),)
+            assert connection.execute(
+                'SELECT SUM(failed_requests) FROM "LiteLLM_DailyGlobalSpend"'
+            ).fetchone() == (len(failures),)
+        assert {key.status_code: count for key, count in errors.drain().items()} == {0: 1}
+        assert _key_spend(parity_database) == (0.25,)
+
+
 @pytest.fixture(scope="module")
 def ledger_schema() -> str:
     return subprocess.run(
@@ -343,6 +523,8 @@ async def _assert_legacy_database_parity(
     export_url: str | None = None,
     export_failure: bool = False,
 ):
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+
     monkeypatch.setitem(
         litellm.model_cost,
         "ledger-test",
@@ -373,14 +555,26 @@ async def _assert_legacy_database_parity(
     monkeypatch.setattr(proxy_server, "prisma_client", client)
     monkeypatch.setattr(proxy_server, "disable_spend_logs", False)
     await client.db.connect()
+    exporter: Final = AsyncHTTPHandler(timeout=10) if export_url is not None else None
     results = []
     try:
         for path in ("legacy", "ledger"):
             _reset(parity_database)
             if reset_kind is not None:
                 _prime_reset(parity_database, reset_kind)
-            monkeypatch.setattr(proxy_server, "general_settings", {"use_spend_logs_ledger": path == "ledger"})
+            monkeypatch.setattr(proxy_server, "general_settings", {
+                "use_spend_logs_ledger": path == "ledger",
+                **(
+                    {"spend_logs_metadata_fields": {"include": []}}
+                    if path == "ledger" and retention == "stripped" else {}
+                ),
+            })
             monkeypatch.setattr(proxy_server, "disable_spend_logs", path == "ledger" and retention == "lean")
+            monkeypatch.setattr(proxy_server, "db_writer_client", exporter if path == "ledger" else None)
+            if path == "ledger" and export_url is not None:
+                monkeypatch.setenv("SPEND_LOGS_URL", export_url)
+            else:
+                monkeypatch.delenv("SPEND_LOGS_URL", raising=False)
             writer = DBSpendUpdateWriter()
             monkeypatch.setattr(proxy_server.proxy_logging_obj, "db_spend_update_writer", writer)
             monkeypatch.setattr(proxy_server, "user_api_key_cache", UserApiKeyCache())
@@ -484,7 +678,10 @@ async def _assert_legacy_database_parity(
                 **({"windows_from_ledger": True} if path == "ledger" else {}),
             )
             await drain_logging_tasks()
-            rows = tuple(client.spend_log_transactions)
+            rows = (
+                tuple(client.spend_log_transactions) or await _persisted_spend_rows(client)
+                if path == "ledger" else tuple(client.spend_log_transactions)
+            )
             client.spend_log_transactions = []
             assert len(rows) == 1
             if path == "ledger" and retention == "lean":
@@ -505,23 +702,22 @@ async def _assert_legacy_database_parity(
                     await SpendLogsRepository(client).insert_with_deliveries(stored_rows)
             elif path == "ledger" and export_url is not None:
                 import httpx
-                from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
                 from litellm.proxy.utils import ProxyUpdateSpend
 
-                monkeypatch.setenv("SPEND_LOGS_URL", export_url)
-                handler = AsyncHTTPHandler(timeout=10)
+                assert exporter is not None
                 wire_rows = [
                     {key: value.isoformat() if isinstance(value, datetime) else value for key, value in row.items()}
                     for row in stored_rows
                 ]
-                try:
-                    if export_failure:
-                        with pytest.raises(httpx.HTTPStatusError):
-                            await ProxyUpdateSpend.update_spend_logs(0, client, handler, proxy_server.proxy_logging_obj, wire_rows)
-                    else:
-                        await ProxyUpdateSpend.update_spend_logs(0, client, handler, proxy_server.proxy_logging_obj, wire_rows)
-                finally:
-                    await handler.close()
+                if export_failure:
+                    with pytest.raises(httpx.HTTPStatusError):
+                        await ProxyUpdateSpend.update_spend_logs(
+                            0, client, exporter, proxy_server.proxy_logging_obj, wire_rows
+                        )
+                else:
+                    await ProxyUpdateSpend.update_spend_logs(
+                        0, client, exporter, proxy_server.proxy_logging_obj, wire_rows
+                    )
             else:
                 await SpendLogsRepository(client).insert_with_deliveries(stored_rows)
             if path == "ledger" and (retention == "lean" or export_url is not None):
@@ -597,6 +793,8 @@ async def _assert_legacy_database_parity(
         if reset_kind == "team_member":
             assert results[-1]["LiteLLM_TeamMembership"][0]["spend"] == cost
     finally:
+        if exporter is not None:
+            await exporter.close()
         await client.db.disconnect()
 
 
@@ -839,49 +1037,61 @@ async def test_window_seed_excludes_pending_and_parked_but_preserves_legacy_cuto
 
 
 @pytest.mark.parametrize("disable_logs", [False, True])
+@pytest.mark.parametrize("job", ["batch", "video"])
 @pytest.mark.asyncio
-async def test_batch_claim_failure_queues_an_atomic_retry_and_repeated_retrieve_does_not_charge(
-    parity_database: str, monkeypatch: pytest.MonkeyPatch, disable_logs: bool
-):
+async def test_job_claim_failure_requires_durable_admission_before_charging(
+    parity_database: str, monkeypatch: pytest.MonkeyPatch, disable_logs: bool, job: Literal["batch", "video"]
+) -> None:
     from litellm.accounting.worker import flush_accounting_deliveries
 
-    monkeypatch.setenv("DATABASE_URL", parity_database)
-    client = PrismaClient(database_url=parity_database, proxy_logging_obj=proxy_server.proxy_logging_obj)
-    client.spend_log_transactions = []
-    writer = DBSpendUpdateWriter()
-    monkeypatch.setattr(proxy_server, "prisma_client", client)
-    monkeypatch.setattr(proxy_server, "general_settings", {"use_spend_logs_ledger": True})
-    monkeypatch.setattr(proxy_server, "disable_spend_logs", disable_logs)
-    monkeypatch.setattr(proxy_server, "user_api_key_cache", UserApiKeyCache())
-    await client.db.connect()
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        monkeypatch.setattr(proxy_server, "disable_spend_logs", disable_logs)
+        writer: Final = DBSpendUpdateWriter()
+        job_id: Final = f"{job}-claim"
+        call_type: Final = "aretrieve_batch" if job == "batch" else "avideo_status"
+        committed_at_counter: Final[asyncio.Queue[tuple[object, ...] | None]] = asyncio.Queue()
 
+        async def counter() -> None:
+            with psycopg.connect(parity_database) as connection:
+                committed_at_counter.put_nowait(connection.execute(
+                    'SELECT (SELECT COUNT(*) FROM "LiteLLM_SpendLogDelivery"), '
+                    '(SELECT COUNT(*) FROM "LiteLLM_SpendLogs")'
+                ).fetchone())
 
-    try:
-        with psycopg.connect(parity_database, autocommit=True) as connection:
-            connection.execute(
-                'ALTER TABLE "LiteLLM_SpendLogDelivery" ADD CONSTRAINT reject_batch '
-                "CHECK (request_id <> 'batch_batch_cost')"
+        async def retrieve(current_writer: DBSpendUpdateWriter) -> bool:
+            return await current_writer.update_database(
+                token=_TOKEN, user_id="user", end_user_id=None, team_id="team", org_id=None,
+                kwargs={
+                    "model": "ledger-test", "call_type": call_type, "litellm_call_id": job_id,
+                    "response_cost": 0.25, "polled_video_status": "completed",
+                    "litellm_params": {"metadata": {"status": "success", "user_api_key": _TOKEN}},
+                },
+                completion_response={"id": job_id, "status": "completed"},
+                start_time=_NOW, end_time=_NOW, response_cost=0.25,
+                on_accounting_admitted=counter,
             )
-        assert await _retrieve_batch(writer, 0.25)
-        with psycopg.connect(parity_database) as connection:
+
+        with psycopg.connect(parity_database, autocommit=True) as connection:
+            connection.execute('ALTER TABLE "LiteLLM_SpendLogDelivery" ADD CONSTRAINT reject_job CHECK (false)')
+        with pytest.raises(RawQueryError, match="reject_job"):
+            await retrieve(writer)
+        assert committed_at_counter.empty()
+        assert client.spend_log_transactions == []
+        with psycopg.connect(parity_database, autocommit=True) as connection:
             assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogs"').fetchone() == (0,)
             assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogDelivery"').fetchone() == (0,)
-        assert len(client.spend_log_transactions) == 1
-        queued = tuple(client.spend_log_transactions)
-        assert "accounting_payload" in queued[0]
-        with psycopg.connect(parity_database, autocommit=True) as connection:
-            connection.execute('ALTER TABLE "LiteLLM_SpendLogDelivery" DROP CONSTRAINT reject_batch')
-        assert await SpendLogsRepository(client).insert_with_deliveries(queued) == 1
-        assert await _retrieve_batch(writer, 0.25) is False
+            connection.execute('ALTER TABLE "LiteLLM_SpendLogDelivery" DROP CONSTRAINT reject_job')
+        assert await retrieve(DBSpendUpdateWriter()) is True
+        assert committed_at_counter.get_nowait() == (1, int(not disable_logs))
+        assert await retrieve(writer) is False
+        assert committed_at_counter.empty()
         await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
         await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
+        assert _key_spend(parity_database) == (0.25,)
         with psycopg.connect(parity_database) as connection:
-            assert connection.execute('SELECT spend FROM "LiteLLM_VerificationToken" WHERE token=\'2c70e12b7a0646f92279f427c7b38e7334d8e5389cff167a1dc30e73f826b683\'').fetchone() == (0.25,)
             assert connection.execute('SELECT spend FROM "LiteLLM_UserTable" WHERE user_id=\'user\'').fetchone() == (0.25,)
             assert connection.execute('SELECT state::text FROM "LiteLLM_SpendLogDelivery"').fetchall() == [("applied",)]
             assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogs"').fetchone() == (int(not disable_logs),)
-    finally:
-        await client.db.disconnect()
 
 
 @pytest.mark.asyncio
@@ -911,12 +1121,12 @@ async def test_failed_claim_over_a_legacy_zero_batch_row_still_charges_it_once(
                 'SELECT spend FROM "LiteLLM_SpendLogs" WHERE request_id=\'batch_batch_cost\''
             ).fetchall() == [(0.0,)]
             connection.execute('ALTER TABLE "LiteLLM_SpendLogDelivery" RENAME TO "LiteLLM_SpendLogDelivery_unavailable"')
-        assert await _retrieve_batch(writer, 0.25)
-        queued = tuple(client.spend_log_transactions)
-        assert ["accounting_payload" in row for row in queued] == [True]
+        with pytest.raises(RawQueryError, match="does not exist"):
+            await _retrieve_batch(writer, 0.25)
+        assert client.spend_log_transactions == []
         with psycopg.connect(parity_database, autocommit=True) as connection:
             connection.execute('ALTER TABLE "LiteLLM_SpendLogDelivery_unavailable" RENAME TO "LiteLLM_SpendLogDelivery"')
-        assert await SpendLogsRepository(client).insert_with_deliveries(queued) == 1
+        assert await _retrieve_batch(DBSpendUpdateWriter(), 0.25) is True
         await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
         assert await _retrieve_batch(writer, 0.25) is False
         await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
@@ -1224,6 +1434,7 @@ async def test_spend_logs_url_without_an_export_client_keeps_local_logs_and_char
     from litellm.proxy.utils import ProxyUpdateSpend
 
     monkeypatch.setenv("DATABASE_URL", parity_database)
+    monkeypatch.setattr(proxy_server, "db_writer_client", None)
     monkeypatch.setenv("SPEND_LOGS_URL", "http://127.0.0.1:1")
     client = PrismaClient(database_url=parity_database, proxy_logging_obj=proxy_server.proxy_logging_obj)
     client.spend_log_transactions = []
@@ -1247,10 +1458,7 @@ async def test_spend_logs_url_without_an_export_client_keeps_local_logs_and_char
             start_time=_NOW, end_time=_NOW, response_cost=0.25,
         )
         await drain_logging_tasks()
-        rows = [
-            {key: value.isoformat() if isinstance(value, datetime) else value for key, value in row.items()}
-            for row in client.spend_log_transactions
-        ]
+        rows = _wire(await _persisted_spend_rows(client))
         client.spend_log_transactions = []
         await ProxyUpdateSpend.update_spend_logs(0, client, None, proxy_server.proxy_logging_obj, rows)
         await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
@@ -1267,6 +1475,8 @@ async def test_spend_logs_url_without_an_export_client_keeps_local_logs_and_char
 @contextlib.asynccontextmanager
 async def _ledger_client(parity_database: str, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("DATABASE_URL", parity_database)
+    monkeypatch.setattr(proxy_server, "db_writer_client", None)
+    monkeypatch.setattr(litellm, "max_budget", 0.0)
     client = PrismaClient(database_url=parity_database, proxy_logging_obj=proxy_server.proxy_logging_obj)
     client.spend_log_transactions = []
     client.model_usage_transactions = []
@@ -1294,6 +1504,62 @@ async def _record_call(
         completion_response=None, start_time=_NOW, end_time=_NOW, response_cost=0.25,
     )
     await drain_logging_tasks()
+
+
+async def _persisted_spend_rows(client: PrismaClient) -> tuple[dict[str, object], ...]:
+    stored: Final = _DB_ROWS.validate_python(
+        await client.writer_db.query_raw(
+            "SELECT delivery.delivery_id, delivery.request_id, delivery.accounting_payload, delivery.is_batch, "
+            'to_jsonb(log) AS spend_log FROM "LiteLLM_SpendLogDelivery" delivery '
+            'LEFT JOIN "LiteLLM_SpendLogs" log ON log.request_id = delivery.request_id '
+            "ORDER BY delivery.created_at, delivery.delivery_id"
+        )
+    )
+
+    def restored(row: Mapping[str, object]) -> dict[str, object]:
+        payload: Final = _FIELDS.validate_python(row["accounting_payload"])
+        log: Final = row["spend_log"]
+        return {
+            **(_FIELDS.validate_python(log) if isinstance(log, Mapping) else {}),
+            "request_id": row["request_id"],
+            "call_type": payload["call_type"],
+            "accounting_payload": payload,
+            "accounting_log_disabled": log is None,
+            **({"accounting_delivery_id": row["delivery_id"]} if row["is_batch"] is False else {}),
+        }
+
+    return tuple(restored(row) for row in stored)
+
+
+def _queued_callback_row(call_id: str) -> Mapping[str, object]:
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+
+    payload: Final[SpendLogsPayload] = {
+        **get_logging_payload(
+            kwargs={
+                "model": "ledger-test",
+                "call_type": "aembedding",
+                "litellm_call_id": call_id,
+                "litellm_params": {"metadata": {"status": "success", "user_api_key": _TOKEN}},
+            },
+            response_obj=None,
+            start_time=_NOW,
+            end_time=_NOW,
+        ),
+        "spend": 0.25,
+    }
+    return {
+        **payload,
+        "accounting_delivery_id": "queued-" + call_id,
+        "accounting_log_disabled": False,
+        "accounting_payload": build_accounting_payload(
+            payload,
+            entities={"api_key": _TOKEN, "user": "user", "team_id": "team"},
+            model_access_groups=(),
+            windows=(),
+            router=lambda: None,
+        ),
+    }
 
 
 def _wire(rows) -> list[dict[str, object]]:
@@ -1328,7 +1594,7 @@ async def test_requests_sharing_a_client_call_id_are_each_charged_but_a_replay_i
         writer = DBSpendUpdateWriter()
         await _record_call(writer, "shared-call-id")
         await _record_call(writer, "shared-call-id")
-        buffered = _wire(client.spend_log_transactions)
+        buffered = _wire(await _persisted_spend_rows(client))
         await _flush(writer, client)
         assert await SpendLogsRepository(client).insert_with_deliveries(buffered) == 0
         await _flush(writer, client)
@@ -1360,9 +1626,7 @@ async def test_an_evicted_spend_log_still_charges_its_request(parity_database: s
 
     async with _ledger_client(parity_database, monkeypatch) as client:
         writer = DBSpendUpdateWriter()
-        await _record_call(writer, "evicted-call")
-        await _record_call(writer, "kept-call")
-        queued = tuple(client.spend_log_transactions)
+        queued = tuple(_queued_callback_row(call_id) for call_id in ("evicted-call", "kept-call"))
         client.spend_log_transactions = []
         await enqueue_spend_logs(client, queued, max_bytes=1)
         assert [row.get("accounting_log_disabled") for row in client.spend_log_transactions] == [True, False]
@@ -1393,9 +1657,9 @@ async def test_a_spend_log_postgres_rejects_still_charges_its_request_and_the_re
 
     async with _ledger_client(parity_database, monkeypatch) as client:
         writer = DBSpendUpdateWriter()
-        await _record_call(writer, "poison-call")
-        await _record_call(writer, "clean-call")
-        rows = tuple(client.jsonify_object(row) for row in client.spend_log_transactions)
+        rows = tuple(
+            client.jsonify_object(_queued_callback_row(call_id)) for call_id in ("poison-call", "clean-call")
+        )
         client.spend_log_transactions = []
         await _create_spend_logs_with_poison_isolation(RejectsOneLog(SpendLogsRepository(client)), rows, isolation_budget)
         await flush_accounting_deliveries(writer, client, proxy_server.proxy_logging_obj)
@@ -1948,3 +2212,408 @@ async def test_customer_budget_reset_is_not_undone_by_an_organization_alias_load
     finally:
         release.set()
         await client.db.disconnect()
+
+
+async def _admit_callback(
+    writer: DBSpendUpdateWriter,
+    identity: str,
+    *,
+    status: Literal["success", "failure"] = "success",
+    cost: float = 0.25,
+    model_group: str = "ledger-test",
+    metadata: Mapping[str, object] | None = None,
+    standard_logging_object: Mapping[str, object] | None = None,
+    on_admitted: Callable[[], Awaitable[None]] | None = None,
+) -> bool:
+    return await writer.update_database(
+        token=_TOKEN,
+        user_id="user",
+        end_user_id=None,
+        team_id="team",
+        org_id=None,
+        kwargs={
+            "model": "ledger-test",
+            "custom_llm_provider": "openai",
+            "call_type": "acompletion",
+            "litellm_call_id": "shared-client-call-id",
+            "_accounting_request_id": identity,
+            "litellm_params": {
+                "metadata": {
+                    "user_api_key": _TOKEN,
+                    "user_api_key_hash": _TOKEN,
+                    "user_api_key_user_id": "user",
+                    "user_api_key_team_id": "team",
+                    "status": status,
+                    "model_group": model_group,
+                    **({} if metadata is None else metadata),
+                }
+            },
+            **({} if standard_logging_object is None else {"standard_logging_object": standard_logging_object}),
+        },
+        completion_response=ModelResponse(
+            id="callback-" + identity,
+            model="ledger-test",
+            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        ),
+        start_time=_NOW,
+        end_time=_NOW,
+        response_cost=cost,
+        on_accounting_admitted=on_admitted,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ledger_records_request_errors_after_durable_admission(
+    parity_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.proxy.db import db_spend_update_writer as writer_module
+    from litellm.proxy.db.request_error_tracking import RequestErrorAccumulator
+    from litellm.types.proxy.request_errors import RequestErrorKey
+
+    accumulator: Final = RequestErrorAccumulator()
+    monkeypatch.setattr(writer_module, "request_error_accumulator", accumulator)
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        assert await _admit_callback(
+            DBSpendUpdateWriter(), "error-rollup", status="failure", cost=0,
+            metadata={"error_information": {"error_code": "503"}},
+        ) is True
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute('SELECT state::text FROM "LiteLLM_SpendLogDelivery"').fetchall() == [("pending",)]
+            assert connection.execute('SELECT spend, status FROM "LiteLLM_SpendLogs"').fetchall() == [(0.0, "failure")]
+        assert client.spend_log_transactions == []
+        assert accumulator.drain() == {
+            RequestErrorKey(
+                date="2026-11-02", api_key=_TOKEN, team_id="team", user_id="user",
+                model_group="ledger-test", status_code=503,
+            ): 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_ordinary_admission_waits_for_atomic_delivery_and_log_commit(
+    parity_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        writer: Final = DBSpendUpdateWriter()
+        with psycopg.connect(parity_database, autocommit=True) as connection:
+            connection.execute("""CREATE FUNCTION reject_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'admission unavailable' USING ERRCODE = '40001'; END; $$""")
+            connection.execute(
+                'CREATE TRIGGER reject_admission BEFORE INSERT ON "LiteLLM_SpendLogs" '
+                "FOR EACH ROW EXECUTE FUNCTION reject_admission()"
+            )
+        with pytest.raises(RawQueryError, match="admission unavailable"):
+            await _admit_callback(writer, "atomic-admission")
+        with psycopg.connect(parity_database, autocommit=True) as connection:
+            assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogDelivery"').fetchone() == (0,)
+            assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogs"').fetchone() == (0,)
+            connection.execute('DROP TRIGGER reject_admission ON "LiteLLM_SpendLogs"')
+        assert await _admit_callback(writer, "atomic-admission") is True
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute('SELECT request_id, state::text FROM "LiteLLM_SpendLogDelivery"').fetchall() == [
+                ("callback-atomic-admission", "pending")
+            ]
+            assert connection.execute('SELECT request_id, spend FROM "LiteLLM_SpendLogs"').fetchall() == [
+                ("callback-atomic-admission", 0.25)
+            ]
+        assert client.spend_log_transactions == []
+        assert await _admit_callback(DBSpendUpdateWriter(), "atomic-admission") is False
+        await _flush(writer, client)
+        assert _key_spend(parity_database) == (0.25,)
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "counter-failure"])
+@pytest.mark.asyncio
+async def test_committed_admission_survives_cancellation_or_counter_failure_without_replay(
+    parity_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from litellm.proxy.spend_tracking.session_spend_total import SessionSpendTotals
+    from tests.unit.redis.stores.spend_counters_double import FakeSpendCounters
+
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        keys: Final = frozenset(
+            (f"spend:key:{_TOKEN}", "spend:user:user", "spend:team:team", "spend:team_member:user:team")
+        )
+        counters: Final = FakeSpendCounters(redis=None, memory=dict.fromkeys(keys, 10.0))
+        monkeypatch.setattr(proxy_server, "spend_counter_store", counters.store())
+        entered: Final = asyncio.Event()
+        release: Final = asyncio.Event()
+        finished: Final = asyncio.Event()
+        session_totals: Final = AsyncMock(spec=SessionSpendTotals)
+        session_metadata: Final = {"session_id": "admission-session"}
+        writer: Final = DBSpendUpdateWriter(session_spend_totals=session_totals)
+
+        async def counter() -> None:
+            entered.set()
+            await release.wait()
+            finished.set()
+            if outcome == "counter-failure":
+                raise RuntimeError("counter dependency unavailable")
+
+        admission: Final = asyncio.create_task(
+            _admit_callback(writer, "post-commit", metadata=session_metadata, on_admitted=counter)
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            with psycopg.connect(parity_database) as connection:
+                assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogDelivery"').fetchone() == (1,)
+                assert connection.execute('SELECT spend FROM "LiteLLM_SpendLogs"').fetchone() == (0.25,)
+            assert not admission.done()
+            if outcome == "cancel":
+                admission.cancel()
+            release.set()
+            if outcome == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await admission
+            else:
+                assert await admission is True
+                assert counters.deleted() == keys
+                assert counters.memory == {}
+        finally:
+            release.set()
+            await asyncio.gather(admission, return_exceptions=True)
+        assert finished.is_set()
+        assert await _admit_callback(writer, "post-commit", metadata=session_metadata) is False
+        assert await _admit_callback(
+            DBSpendUpdateWriter(session_spend_totals=session_totals), "post-commit", metadata=session_metadata
+        ) is False
+        session_totals.record.assert_awaited_once_with(api_key=_TOKEN, session_id="admission-session", spend=0.25)
+        await _flush(writer, client)
+        assert _key_spend(parity_database) == (0.25,)
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute(
+                'SELECT state::text, COUNT(*) FROM "LiteLLM_SpendLogDelivery" GROUP BY state'
+            ).fetchall() == [("applied", 1)]
+
+
+@pytest.mark.asyncio
+async def test_recreated_writer_suppresses_only_unbilled_failure_after_committed_success(
+    parity_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        writer: Final = DBSpendUpdateWriter()
+        assert await _admit_callback(writer, "same-model-round") is True
+        assert await _admit_callback(DBSpendUpdateWriter(), "same-model-round", status="failure", cost=0.0) is False
+        assert await _admit_callback(DBSpendUpdateWriter(), "same-model-round", status="failure", cost=0.125) is True
+        assert await _admit_callback(DBSpendUpdateWriter(), "same-model-round", status="failure", cost=0.125) is False
+        await _flush(writer, client)
+        assert _key_spend(parity_database) == (0.375,)
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogDelivery"').fetchone() == (2,)
+            assert connection.execute(
+                "SELECT prompt_tokens, completion_tokens, api_requests, successful_requests, failed_requests "
+                'FROM "LiteLLM_DailyUserSpend"'
+            ).fetchall() == [(20, 10, 2, 1, 1)]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_writer_outcomes_wait_for_success_commit_before_admitting_zero_failure(
+    parity_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        async with await psycopg.AsyncConnection.connect(parity_database, autocommit=True) as gate:
+            await gate.execute("""CREATE FUNCTION block_success_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM pg_advisory_xact_lock(7131701); RETURN NEW; END; $$""")
+            await gate.execute(
+                'CREATE TRIGGER block_success_admission BEFORE INSERT ON "LiteLLM_SpendLogs" '
+                "FOR EACH ROW EXECUTE FUNCTION block_success_admission()"
+            )
+            await gate.execute("SELECT pg_advisory_lock(7131701)")
+
+            async def wait_for_blocked_transactions(count: int) -> None:
+                while True:
+                    cursor: Final = await gate.execute(
+                        "SELECT COUNT(*) FROM pg_locks WHERE NOT granted AND pid IN "
+                        "(SELECT pid FROM pg_stat_activity WHERE datname = current_database())"
+                    )
+                    row: Final = await cursor.fetchone()
+                    if row is not None and row[0] >= count:
+                        return
+                    await asyncio.sleep(0)
+
+            ready: Final = asyncio.Event()
+
+            async def fail_after_success_started() -> bool:
+                await ready.wait()
+                return await _admit_callback(
+                    DBSpendUpdateWriter(), "concurrent-outcome", status="failure", cost=0.0
+                )
+
+            success: Final = asyncio.create_task(_admit_callback(DBSpendUpdateWriter(), "concurrent-outcome"))
+            failure: Final = asyncio.create_task(fail_after_success_started())
+            try:
+                await asyncio.wait_for(wait_for_blocked_transactions(1), timeout=10)
+                ready.set()
+                await asyncio.wait_for(wait_for_blocked_transactions(2), timeout=10)
+            finally:
+                ready.set()
+                await gate.execute("SELECT pg_advisory_unlock(7131701)")
+                await asyncio.gather(success, failure, return_exceptions=True)
+            assert await success is True
+            assert await failure is False
+        await _flush(DBSpendUpdateWriter(), client)
+        assert _key_spend(parity_database) == (0.25,)
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute('SELECT COUNT(*) FROM "LiteLLM_SpendLogDelivery"').fetchone() == (1,)
+            assert connection.execute(
+                'SELECT prompt_tokens, completion_tokens, api_requests FROM "LiteLLM_DailyUserSpend"'
+            ).fetchall() == [(10, 5, 1)]
+
+
+@pytest.mark.asyncio
+async def test_delivery_keeps_model_groups_separate_and_user_global_totals_equal(
+    parity_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        writer: Final = DBSpendUpdateWriter()
+        for identity, group in (("alpha-first", "alpha"), ("beta", "beta"), ("alpha-second", "alpha")):
+            assert await _admit_callback(writer, identity, model_group=group)
+        await _flush(writer, client)
+        with psycopg.connect(parity_database) as connection:
+            users: Final = connection.execute(
+                "SELECT model_group, spend, prompt_tokens, completion_tokens, api_requests "
+                'FROM "LiteLLM_DailyUserSpend" ORDER BY model_group'
+            ).fetchall()
+            globally: Final = connection.execute(
+                "SELECT model_group, spend, prompt_tokens, completion_tokens, api_requests "
+                'FROM "LiteLLM_DailyGlobalSpend" ORDER BY model_group'
+            ).fetchall()
+            assert users == [("alpha", 0.5, 20, 10, 2), ("beta", 0.25, 10, 5, 1)]
+            assert globally == users
+            assert connection.execute('SELECT COUNT(DISTINCT model) FROM "LiteLLM_DailyUserSpend"').fetchone() == (1,)
+
+
+@pytest.mark.parametrize("baseline", [False, True])
+@pytest.mark.asyncio
+async def test_auxiliary_effects_roll_back_and_recover_with_their_delivery(
+    parity_database: str,
+    monkeypatch: pytest.MonkeyPatch,
+    baseline: bool,
+) -> None:
+    from litellm.proxy.hooks.autorouter_baseline_cache import CapturedBaselineObservation
+    from litellm.proxy.spend_tracking.baseline_accounting import BaselineObservation
+
+    async with _ledger_client(parity_database, monkeypatch) as client:
+        writer: Final = DBSpendUpdateWriter()
+        observation: Final = CapturedBaselineObservation(
+            scope="autorouter-baseline:v3:" + "a" * 64,
+            api_key=_TOKEN,
+            session_id="session",
+            router_name="router",
+            baseline_model="fixture-baseline",
+            model="fixture-baseline",
+            prices=None,
+            observation=BaselineObservation(
+                request_id="before-provider-response",
+                started_at=_NOW.timestamp(),
+                available_at=_NOW.timestamp(),
+                outcome="uncertain",
+                baseline_equivalent=False,
+                reason="fixture-unavailable",
+            ),
+        )
+        standard: Final[dict[str, object]] = {
+            "model": "ledger-test",
+            "model_group": "ledger-test",
+            "response_cost": 0.25,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "metadata": {
+                "user_api_key_hash": _TOKEN,
+                "mcp_tool_call_metadata": {"namespaced_tool_name": "tool.fixture"},
+                "usage_object": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+            "model_map_information": {},
+            "hidden_params": {},
+            "request_tags": [],
+            "autorouter_baseline_observation": observation.model_dump_json() if baseline else None,
+        }
+        assert await _admit_callback(
+            writer,
+            "auxiliary",
+            metadata={
+                "session_id": "session",
+                "routing_decision": {
+                    "router_model_name": "router",
+                    "router_type": "cost",
+                    "savings_baseline_model": "fixture-baseline",
+                },
+            },
+            standard_logging_object=standard,
+        )
+        standard["response_cost"] = 99.0
+        replay: Final = await _persisted_spend_rows(client)
+        with psycopg.connect(parity_database, autocommit=True) as connection:
+            if not baseline:
+                connection.execute(
+                    'UPDATE "LiteLLM_SpendLogDelivery" SET accounting_payload = '
+                    "jsonb_set(accounting_payload, '{metadata}', to_jsonb((accounting_payload -> 'metadata')::text))"
+                )
+            connection.execute(
+                'ALTER TABLE "LiteLLM_DailyToolSpend" ADD CONSTRAINT reject_tool_spend CHECK (spend = 0)'
+            )
+
+        async def apply(transaction, deliveries) -> None:
+            await apply_deliveries(
+                transaction,
+                deliveries,
+                prisma_client=client,
+                writer=writer,
+                proxy_logging_obj=proxy_server.proxy_logging_obj,
+            )
+
+        failed: Final = await AccountingDeliveryRepository(client.writer_db).apply_pending(apply)
+        assert (failed.applied, failed.failed) == (0, 1)
+        with psycopg.connect(parity_database, autocommit=True) as connection:
+            for table in (
+                "LiteLLM_DailyUserSpend",
+                "LiteLLM_DailyGlobalSpend",
+                "LiteLLM_SpendLogToolIndex",
+                "LiteLLM_DailyToolSpend",
+                "LiteLLM_AutoRouterSession",
+                "LiteLLM_AutoRouterUserSession",
+                "LiteLLM_AutoRouterDailySpend",
+                "LiteLLM_AutoRouterBaselineObservation",
+                "LiteLLM_AutoRouterBaselineComparison",
+            ):
+                assert connection.execute(
+                    sql.SQL("SELECT COUNT(*) FROM {}").format(sql.Identifier(table))
+                ).fetchone() == (0,)
+            assert _key_spend(parity_database) == (0.0,)
+            assert connection.execute('SELECT state::text FROM "LiteLLM_SpendLogDelivery"').fetchall() == [("pending",)]
+            connection.execute('ALTER TABLE "LiteLLM_DailyToolSpend" DROP CONSTRAINT reject_tool_spend')
+            connection.execute('UPDATE "LiteLLM_SpendLogDelivery" SET next_attempt_at=CURRENT_TIMESTAMP')
+        await _flush(writer, client)
+        assert await SpendLogsRepository(client).insert_with_deliveries(replay) == 0
+        await _flush(writer, client)
+        assert _key_spend(parity_database) == (0.25,)
+        with psycopg.connect(parity_database) as connection:
+            assert connection.execute('SELECT request_id, tool_name FROM "LiteLLM_SpendLogToolIndex"').fetchall() == [
+                ("callback-auxiliary", "tool.fixture")
+            ]
+            assert connection.execute(
+                'SELECT spend, total_tokens, request_count FROM "LiteLLM_DailyToolSpend"'
+            ).fetchall() == [(0.25, 15, 1)]
+            for table in ("LiteLLM_AutoRouterSession", "LiteLLM_AutoRouterUserSession", "LiteLLM_AutoRouterDailySpend"):
+                assert connection.execute(
+                    sql.SQL("SELECT spend, total_tokens, turns FROM {}").format(sql.Identifier(table))
+                ).fetchall() == [(0.25, 15, 1)]
+            assert connection.execute('SELECT request_id FROM "LiteLLM_AutoRouterBaselineObservation"').fetchall() == (
+                [("callback-auxiliary",)] if baseline else []
+            )
+            assert connection.execute(
+                'SELECT spend, prompt_tokens, completion_tokens, api_requests FROM "LiteLLM_DailyUserSpend"'
+            ).fetchall() == [(0.25, 10, 5, 1)]
+            assert connection.execute(
+                'SELECT spend, prompt_tokens, completion_tokens, api_requests FROM "LiteLLM_DailyGlobalSpend"'
+            ).fetchall() == [(0.25, 10, 5, 1)]
+            assert connection.execute('SELECT state::text FROM "LiteLLM_SpendLogDelivery"').fetchall() == [("applied",)]

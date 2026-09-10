@@ -1,11 +1,14 @@
 import asyncio
-from datetime import datetime, time, timezone
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from datetime import datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import Request
+from pydantic import TypeAdapter
 
 import litellm
 import litellm.proxy.proxy_server as ps
@@ -53,6 +56,44 @@ LIMITS: Final = (
     BudgetLimit(budget_duration="1mo", max_budget=10),
     BudgetLimit(budget_duration="12mo", max_budget=100),
 )
+_FIELDS: Final = TypeAdapter(dict[str, object])
+_ROWS: Final = TypeAdapter(tuple[dict[str, object], ...])
+
+
+class _AccountingDatabase:
+    def __init__(self) -> None:
+        self.deliveries: tuple[Mapping[str, object], ...] = ()
+
+    @property
+    def committed_accounting_payloads(self) -> tuple[dict[str, object], ...]:
+        return tuple(_FIELDS.validate_python(row["accounting_payload"]) for row in self.deliveries)
+
+    @asynccontextmanager
+    async def tx(self, timeout: timedelta) -> AsyncIterator["_AccountingDatabase"]:
+        previous: Final = self.deliveries
+        try:
+            yield self
+        except BaseException:
+            self.deliveries = previous
+            raise
+
+    async def execute_raw(self, query: str, *args: object) -> int:
+        assert query.startswith("SELECT pg_advisory_xact_lock")
+        return 0
+
+    async def query_raw(self, query: str, payload: str) -> tuple[Mapping[str, object], ...]:
+        rows: Final = _ROWS.validate_json(payload)
+        if query.startswith('INSERT INTO "LiteLLM_SpendLogDelivery"'):
+            existing: Final = frozenset(row["delivery_id"] for row in self.deliveries)
+            accepted: Final = tuple(row for row in rows if row["delivery_id"] not in existing)
+            self.deliveries = (*self.deliveries, *accepted)
+            return tuple({"delivery_id": row["delivery_id"]} for row in accepted)
+        assert query.startswith('INSERT INTO "LiteLLM_SpendLogs"')
+        return tuple({"request_id": row["request_id"]} for row in rows)
+
+
+def _jsonify_object(payload: Mapping[str, object]) -> dict[str, object]:
+    return _FIELDS.validate_python(payload)
 
 
 @pytest.fixture
@@ -60,13 +101,21 @@ def accounting_state(monkeypatch):
     backend: Final = FakeSpendCounters()
     writer: Final = DBSpendUpdateWriter()
     prisma: Final = MagicMock()
+    prisma.jsonify_object = _jsonify_object
+    prisma.writer_db = _AccountingDatabase()
     prisma.spend_log_transactions = []
     prisma._spend_log_transactions_lock = asyncio.Lock()
     prisma.tool_usage_transactions = []
     prisma._tool_usage_transactions_lock = asyncio.Lock()
     prisma.db.litellm_budgetwindowspend.find_unique = AsyncMock(return_value=None)
+    for table in (
+        prisma.db.litellm_customerorganizationtable,
+        prisma.db.litellm_customerteamtable,
+        prisma.db.litellm_customermembertable,
+    ):
+        table.find_unique = AsyncMock(return_value=None)
     monkeypatch.setattr(ps, "spend_counter_store", backend.store())
-    monkeypatch.setattr(ps, "proxy_logging_obj", SimpleNamespace(db_spend_update_writer=writer))
+    monkeypatch.setattr(ps, "proxy_logging_obj", SimpleNamespace(db_spend_update_writer=writer, service_logging_obj=None))
     monkeypatch.setattr(ps, "prisma_client", prisma)
     return backend, writer, prisma
 
@@ -286,8 +335,10 @@ async def test_real_cost_callback_keeps_customer_scalar_and_window_cost_once(
     window_rows: Final = await writer.window_spend_update_queue.flush_and_get_aggregated_window_spend_transactions()
     if ledger:
         assert window_rows == ()
-        assert len(prisma.spend_log_transactions) == 1
-        contributions: Final = project(prisma.spend_log_transactions[0]["accounting_payload"])
+        database: Final = prisma.writer_db
+        assert isinstance(database, _AccountingDatabase)
+        (accounting_payload,) = database.committed_accounting_payloads
+        contributions: Final = project(accounting_payload)
         window_contributions: Final = tuple(row for row in contributions if row.table == "LiteLLM_BudgetWindowSpend")
         assert len(window_contributions) == 2
         assert all(dict(row.increments)["spend"] == 0.75 for row in window_contributions)
@@ -404,10 +455,12 @@ async def test_outer_callback_resolves_cached_hierarchy_into_accounting(accounti
     )
     counters: Final = customer_window_counters("customer_member", "member", LIMITS)
     assert tuple(backend.redis[counter.counter_key] for counter in counters) == (0.75, 0.75)
-    assert len(prisma.spend_log_transactions) == 1
+    database: Final = prisma.writer_db
+    assert isinstance(database, _AccountingDatabase)
+    (accounting_payload,) = database.committed_accounting_payloads
     windows: Final = tuple(
         row
-        for row in project(prisma.spend_log_transactions[0]["accounting_payload"])
+        for row in project(accounting_payload)
         if row.table == "LiteLLM_BudgetWindowSpend"
     )
     assert len(windows) == 2
@@ -563,8 +616,10 @@ async def test_admitted_windows_are_charged_during_policy_outage(accounting_stat
     queued: Final = await writer.window_spend_update_queue.flush_and_get_aggregated_window_spend_transactions()
     if ledger:
         assert queued == ()
-        assert len(prisma.spend_log_transactions) == 1
-        contributions: Final = project(prisma.spend_log_transactions[0]["accounting_payload"])
+        database: Final = prisma.writer_db
+        assert isinstance(database, _AccountingDatabase)
+        (accounting_payload,) = database.committed_accounting_payloads
+        contributions: Final = project(accounting_payload)
         rows: Final = tuple(row for row in contributions if row.table == "LiteLLM_BudgetWindowSpend")
         assert len(rows) == 2 * len(scopes)
         assert {dict(row.key)["entity_id"] for row in rows} == {scope.entity_id for scope in scopes}

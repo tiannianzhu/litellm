@@ -6708,7 +6708,7 @@ class TestStreamingClientDisconnectLogging:
             ProxyBaseLLMRequestProcessing,
         )
 
-        fire_spy = MagicMock()
+        fire_spy = MagicMock(return_value=None)
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
             fire_spy,
@@ -6740,7 +6740,7 @@ class TestStreamingClientDisconnectLogging:
             ProxyBaseLLMRequestProcessing,
         )
 
-        fire_spy = MagicMock()
+        fire_spy = MagicMock(return_value=None)
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
             fire_spy,
@@ -6772,7 +6772,7 @@ class TestStreamingClientDisconnectLogging:
 
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
-            MagicMock(),
+            MagicMock(return_value=None),
         )
 
         async def mock_streaming_iterator(*_args, **_kwargs):
@@ -10869,6 +10869,144 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
 
         assert data["model"] == fallback_model
         assert rig[3] == [primary_model, primary_model, fallback_model]
+
+
+@pytest.mark.asyncio
+async def test_deferred_billed_rounds_wait_for_durable_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.litellm_core_utils.litellm_logging import BilledRoundsDispatch, BilledRoundsSpend
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.types.utils import ModelResponse, Usage
+
+    class AdmissionLogger(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered: Final = asyncio.Event()
+            self.release: Final = asyncio.Event()
+            self.accepted: tuple[object, ...] = ()
+
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object,
+            start_time: datetime.datetime, end_time: datetime.datetime,
+        ) -> None:
+            self.entered.set()
+            await self.release.wait()
+            self.accepted = (*self.accepted, response_obj)
+
+    for registry in ("callbacks", "success_callback", "_async_success_callback"):
+        monkeypatch.setattr(litellm, registry, [])
+    admission: Final = AdmissionLogger()
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="hosted_vllm/fixture", messages=[], stream=True, call_type="aresponses",
+        start_time=datetime.datetime(2026, 1, 1), litellm_call_id="deferred-billed-rounds",
+        function_id="deferred-billed-rounds", dynamic_async_success_callbacks=[admission],
+    )
+    assembled: Final = ModelResponse(
+        model="hosted_vllm/fixture", usage=Usage(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+    )
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield b"data: response\n\n"
+
+    async def dispatch() -> None:
+        await logging_obj.dispatch_success_handlers(assembled, cache_hit=False, prefer_async_handlers=True)
+
+    response: Final = stream()
+    ProxyBaseLLMRequestProcessing(data={})._arm_deferred_stream_dispatch(
+        response=response, route_type="aresponses", user_api_key_dict=ProxyUserAPIKeyAuth(), logging_obj=logging_obj,
+    )
+    logging_obj._deferred_stream_complete_args = (
+        BilledRoundsDispatch(dispatch(), BilledRoundsSpend(assembled.usage, 0.75, None)),
+    )
+    task: Final = asyncio.create_task(ProxyLogging.await_deferred_stream_logging({"litellm_logging_obj": logging_obj}))
+    try:
+        await asyncio.wait_for(admission.entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert not task.done()
+        admission.release.set()
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        assert admission.accepted == (assembled,)
+    finally:
+        admission.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await GLOBAL_LOGGING_WORKER.flush()
+        await response.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail", (False, True))
+async def test_disconnect_cleanup_waits_for_durable_accounting_and_keeps_499(fail: bool) -> None:
+    from pydantic import TypeAdapter
+
+    from litellm.types.utils import ModelResponse, StandardLoggingPayload, Usage
+
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    observed: Final[asyncio.Queue[StandardLoggingPayload]] = asyncio.Queue()
+    failure: Final = RuntimeError("controlled cleanup accounting failure")
+    payload_adapter: Final = TypeAdapter(StandardLoggingPayload)
+
+    class Admission(CustomLogger):
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object,
+            start_time: datetime.datetime, end_time: datetime.datetime,
+        ) -> None:
+            observed.put_nowait(payload_adapter.validate_python(kwargs.get("standard_logging_object")))
+            entered.set()
+            await release.wait()
+            if fail:
+                raise failure
+
+    logger: Final = LiteLLMLoggingObj(
+        model="hosted_vllm/fixture", messages=[], stream=True, call_type="anthropic_messages",
+        start_time=datetime.datetime(2026, 1, 1), litellm_call_id="cleanup-accounting",
+        function_id="cleanup-accounting", dynamic_async_success_callbacks=[Admission()],
+    )
+    assembled: Final = ModelResponse(
+        model="hosted_vllm/fixture", usage=Usage(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+    )
+
+    async def provider_stream() -> AsyncGenerator[bytes, None]:
+        try:
+            yield b"data: partial\n\n"
+        finally:
+            logger.success_accounting_task = asyncio.create_task(
+                logger.dispatch_success_handlers(assembled, cache_hit=False, prefer_async_handlers=True)
+            )
+
+    response: Final = provider_stream()
+    await anext(response)
+    cleanup: Final = asyncio.create_task(
+        ProxyBaseLLMRequestProcessing.finalize_streaming_generator_cleanup(
+            request=None, request_data={"litellm_logging_obj": logger}, response=response, client_disconnected=True,
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not cleanup.done()
+        release.set()
+        if fail:
+            with pytest.raises(RuntimeError) as raised:
+                await asyncio.wait_for(cleanup, timeout=5)
+            assert raised.value is failure
+        else:
+            await asyncio.wait_for(cleanup, timeout=5)
+        payload: Final = observed.get_nowait()
+        assert payload["error_information"] is not None
+        assert payload["error_information"].get("error_code") == "499"
+        assert (payload["prompt_tokens"], payload["completion_tokens"]) == (8, 4)
+        assert observed.empty()
+    finally:
+        release.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
+        await response.aclose()
 
 
 class _RecordingSuccessLogger(CustomLogger):
