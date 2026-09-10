@@ -517,6 +517,65 @@ async def test_async_upload_no_retry_on_4xx():
     mock_failure.assert_called_once_with(callback_name="S3Logger")
 
 
+@pytest.mark.asyncio
+async def test_shutdown_flush_waits_for_blocked_s3_upload(monkeypatch):
+    logger = object.__new__(S3Logger)
+    logger.flush_lock = asyncio.Lock()
+    logger.log_queue = [
+        s3BatchLoggingElement(
+            s3_object_key="2025-09-14/shutdown.json",
+            payload={"test": "shutdown"},
+            s3_object_download_filename="shutdown.json",
+        )
+    ]
+    logger.max_queue_size = 1
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+
+    async def blocked_upload(_element: s3BatchLoggingElement) -> bool:
+        started.set()
+        await release.wait()
+        completed.set()
+        return True
+
+    monkeypatch.setattr(logger, "async_upload_data_to_s3", blocked_upload)
+
+    flush_task = asyncio.ensure_future(logger.flush_queue())
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert not flush_task.done()
+
+    release.set()
+    await flush_task
+
+    assert completed.is_set()
+    assert logger.log_queue == []
+
+
+@pytest.mark.asyncio
+async def test_flush_queue_retains_s3_events_after_upload_failure(monkeypatch):
+    logger = object.__new__(S3Logger)
+    logger.flush_lock = asyncio.Lock()
+    logger.log_queue = [
+        s3BatchLoggingElement(
+            s3_object_key="2025-09-14/retry.json",
+            payload={"test": "retry"},
+            s3_object_download_filename="retry.json",
+        )
+    ]
+    logger.max_queue_size = 1
+
+    async def failed_upload(_element: s3BatchLoggingElement) -> bool:
+        return False
+
+    monkeypatch.setattr(logger, "async_upload_data_to_s3", failed_upload)
+
+    await logger.flush_queue()
+
+    assert len(logger.log_queue) == 1
+
+
 _SIGV4_ACCESS_KEY = re.compile(r"Credential=(AKIA\d+)/")
 
 

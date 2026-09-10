@@ -77,6 +77,7 @@ from litellm.litellm_core_utils.asyncify import asyncify
 from litellm.litellm_core_utils.litellm_logging import (
     _init_custom_logger_compatible_class,
 )
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.token_counter import offload_token_count
@@ -964,6 +965,14 @@ async def _flush_spend_logs_queue_on_shutdown() -> None:
         return
 
     try:
+        await proxy_logging_obj.db_spend_update_writer.flush_spend_updates_on_shutdown(
+            prisma_client=prisma_client,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+    except Exception as e:  # noqa: BLE001  # shutdown must continue even if the drain fails
+        verbose_proxy_logger.exception("Error flushing spend rollups on shutdown: %s", e)
+
+    try:
         from litellm.proxy.utils import drain_spend_logs_queue
 
         await drain_spend_logs_queue(
@@ -973,6 +982,74 @@ async def _flush_spend_logs_queue_on_shutdown() -> None:
         )
     except Exception as e:  # noqa: BLE001  # shutdown must continue even if the drain fails
         verbose_proxy_logger.exception("Error flushing spend logs queue on shutdown: %s", e)
+
+
+async def _flush_s3_loggers_on_shutdown() -> None:
+    from litellm.integrations.s3_v2 import S3Logger
+    from litellm.litellm_core_utils.litellm_logging import get_initialized_custom_loggers
+    from litellm.proxy.management_helpers.audit_logs import get_cached_audit_log_callbacks
+
+    callback_registries: Final = tuple(litellm.logging_callback_manager.get_custom_loggers_for_type(S3Logger)) + tuple(
+        litellm.audit_log_callbacks
+    )
+    s3_logger_candidates: Final = (
+        callback_registries + get_initialized_custom_loggers() + get_cached_audit_log_callbacks()
+    )
+    s3_loggers: Final = tuple(
+        logger
+        for index, logger in enumerate(s3_logger_candidates)
+        if isinstance(logger, S3Logger) and all(logger is not prior for prior in s3_logger_candidates[:index])
+    )
+    for logger in s3_loggers:
+        await logger.flush_queue()
+        if logger.log_queue:
+            verbose_proxy_logger.warning("s3_shutdown_flush_incomplete pending_events=%s", len(logger.log_queue))
+
+
+async def _run_shutdown_drain_step(
+    name: str,
+    operation: Callable[[], Awaitable[None]],
+    shutdown_deadline: float,
+) -> None:
+    remaining_timeout: Final = shutdown_deadline - asyncio.get_running_loop().time()
+    if remaining_timeout <= 0:
+        verbose_proxy_logger.warning("shutdown_drain_timeout step=%s", name)
+        return
+
+    try:
+        await asyncio.wait_for(operation(), timeout=remaining_timeout)
+    except TimeoutError:
+        verbose_proxy_logger.warning("shutdown_drain_timeout step=%s", name)
+    except Exception as e:  # noqa: BLE001  # one failed drain must not skip later shutdown cleanup
+        verbose_proxy_logger.exception("Error draining %s on shutdown: %s", name, e)
+
+
+async def _drain_logging_on_shutdown(shutdown_deadline: float) -> None:
+    await _run_shutdown_drain_step(
+        name="logging_worker",
+        operation=GLOBAL_LOGGING_WORKER.flush,
+        shutdown_deadline=shutdown_deadline,
+    )
+    await _run_shutdown_drain_step(
+        name="spend_event_producer",
+        operation=_drain_spend_event_producer_on_shutdown,
+        shutdown_deadline=shutdown_deadline,
+    )
+    await _run_shutdown_drain_step(
+        name="spend_counters",
+        operation=flush_spend_counters_on_shutdown,
+        shutdown_deadline=shutdown_deadline,
+    )
+    await _run_shutdown_drain_step(
+        name="spend_logs",
+        operation=_flush_spend_logs_queue_on_shutdown,
+        shutdown_deadline=shutdown_deadline,
+    )
+    await _run_shutdown_drain_step(
+        name="s3",
+        operation=_flush_s3_loggers_on_shutdown,
+        shutdown_deadline=shutdown_deadline,
+    )
 
 
 async def proxy_shutdown_event(worker_heartbeat: ProxyWorkerHeartbeat | None = None) -> None:
@@ -1367,6 +1444,8 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
     # so SIGTERM (rolling update, scale-down, liveness kill) doesn't drop them.
     GracefulShutdownManager.start_shutdown()
     await GracefulShutdownManager.wait_for_drain()
+    shutdown_deadline: Final = asyncio.get_running_loop().time() + GracefulShutdownManager.get_timeout()
+    await _drain_logging_on_shutdown(shutdown_deadline)
 
     # Shutdown event - close shared aiohttp session
     if shared_aiohttp_session is not None:
@@ -1393,12 +1472,6 @@ async def proxy_startup_event(app: FastAPI) -> AsyncGenerator[None, None]:
             await prisma_client.stop_db_health_watchdog_task()
         except Exception as e:
             verbose_proxy_logger.error("Error stopping DB health watchdog task: %s", e)
-
-    await _drain_spend_event_producer_on_shutdown()
-
-    await flush_spend_counters_on_shutdown()
-
-    await _flush_spend_logs_queue_on_shutdown()
 
     await proxy_config.stop_config_sync_subscriber()
 

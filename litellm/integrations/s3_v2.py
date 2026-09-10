@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 
 
 class S3Logger(CustomBatchLogger, BaseAWSLLM):
+    preserve_events_added_during_flush = True
+
     def __init__(
         self,
         s3_bucket_name: str | None = None,
@@ -338,7 +340,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
             verbose_logger.exception("s3 Layer Error - %s", e)
             self.handle_callback_failure(callback_name="S3Logger")
 
-    async def async_upload_data_to_s3(self, batch_logging_element: s3BatchLoggingElement):
+    async def async_upload_data_to_s3(self, batch_logging_element: s3BatchLoggingElement) -> bool:
         try:
             import base64
             import hashlib
@@ -409,9 +411,11 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
                     continue
                 response.raise_for_status()
                 break
+            return True
         except Exception as e:
             verbose_logger.exception("Error uploading to s3: %s", e)
             self.handle_callback_failure(callback_name="S3Logger")
+            return False
 
     async def async_send_batch(self):
         """
@@ -420,7 +424,7 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
 
         Returns: None
 
-        Raises: Does not raise an exception, will only verbose_logger.exception()
+        Raises: RuntimeError when any upload fails, so the queue is retained for retry.
         """
         verbose_logger.debug("s3_v2 logger - sending batch of %s", len(self.log_queue))
         if not self.log_queue:
@@ -431,8 +435,11 @@ class S3Logger(CustomBatchLogger, BaseAWSLLM):
         #  the log queue can be bounded by DEFAULT_S3_BATCH_SIZE
         #  see custom_batch_logger.py which triggers the flush
         #########################################################
-        for payload in self.log_queue:
-            asyncio.create_task(self.async_upload_data_to_s3(payload))
+        upload_results: Final = await asyncio.gather(
+            *(self.async_upload_data_to_s3(payload) for payload in tuple(self.log_queue))
+        )
+        if not all(upload_results):
+            raise RuntimeError("S3 batch upload failed")
 
     def create_s3_batch_logging_element(
         self,

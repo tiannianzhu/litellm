@@ -264,6 +264,11 @@ else:
     _PAGERDUTY_ALERTING_FACTORY: Final = PagerDutyAlerting
 _in_memory_loggers: Final[list[CustomLogger]] = []
 
+
+def get_initialized_custom_loggers() -> tuple[CustomLogger, ...]:
+    return tuple(_in_memory_loggers)
+
+
 _STANDARD_LOGGING_METADATA_KEYS: Final[frozenset[str]] = frozenset(StandardLoggingMetadata.__annotations__.keys())
 
 

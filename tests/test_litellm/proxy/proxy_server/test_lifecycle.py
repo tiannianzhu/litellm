@@ -220,7 +220,15 @@ async def test_flush_spend_logs_queue_on_shutdown_drains_before_disconnect(monke
     monkeypatch.setattr(ps, "prisma_client", fake_prisma, raising=False)
     monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
 
+    calls: list[str] = []  # mutable-ok: records shutdown ordering
+    writer = MagicMock()
+    writer.flush_spend_updates_on_shutdown = AsyncMock(side_effect=lambda **_: calls.append("rollups"))
+    proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer = writer
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging, raising=False)
+
     drain = AsyncMock()
+    drain.side_effect = lambda **_: calls.append("spend_logs")
     import litellm.proxy.utils as utils_mod
 
     monkeypatch.setattr(utils_mod, "drain_spend_logs_queue", drain)
@@ -235,12 +243,19 @@ async def test_flush_spend_logs_queue_on_shutdown_drains_before_disconnect(monke
         "drain_calls": 1,
         "drain_prisma": True,
     }
+    assert calls == ["rollups", "spend_logs"]
 
 
 @pytest.mark.asyncio
 async def test_flush_spend_logs_queue_on_shutdown_swallows_drain_errors(monkeypatch):
     monkeypatch.setattr(ps, "prisma_client", MagicMock(), raising=False)
     monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+
+    writer = MagicMock()
+    writer.flush_spend_updates_on_shutdown = AsyncMock()
+    proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer = writer
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging, raising=False)
 
     import litellm.proxy.utils as utils_mod
 
@@ -283,6 +298,58 @@ async def test_flush_spend_counters_on_shutdown_logs_and_swallows_commit_errors(
         await ps.flush_spend_counters_on_shutdown()
 
     assert "Error flushing spend counters on shutdown: db gone" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_blocked_global_logging_callback(monkeypatch):
+    from litellm.litellm_core_utils.logging_worker import LoggingWorker
+
+    worker = LoggingWorker(timeout=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[str] = []
+
+    async def blocked_callback():
+        started.set()
+        await release.wait()
+        calls.append("callback")
+
+    async def drain_producer():
+        assert calls == ["callback"]
+        calls.append("producer")
+
+    async def drain_counters():
+        assert calls == ["callback", "producer"]
+        calls.append("counters")
+
+    async def drain_spend_logs():
+        assert calls == ["callback", "producer", "counters"]
+        calls.append("spend_logs")
+
+    async def drain_s3():
+        assert calls == ["callback", "producer", "counters", "spend_logs"]
+        calls.append("s3")
+
+    monkeypatch.setattr(ps, "GLOBAL_LOGGING_WORKER", worker)
+    monkeypatch.setattr(ps, "_drain_spend_event_producer_on_shutdown", drain_producer)
+    monkeypatch.setattr(ps, "flush_spend_counters_on_shutdown", drain_counters)
+    monkeypatch.setattr(ps, "_flush_spend_logs_queue_on_shutdown", drain_spend_logs)
+    monkeypatch.setattr(ps, "_flush_s3_loggers_on_shutdown", drain_s3)
+    worker.ensure_initialized_and_enqueue(blocked_callback())
+    await started.wait()
+
+    deadline = asyncio.get_running_loop().time() + 1
+    drain_task = asyncio.create_task(ps._drain_logging_on_shutdown(deadline))
+    await asyncio.sleep(0)
+
+    assert not drain_task.done()
+    assert calls == []
+
+    release.set()
+    await drain_task
+    await worker.stop()
+
+    assert calls == ["callback", "producer", "counters", "spend_logs", "s3"]
 
 
 # ---------------------------------------------------------------------------
