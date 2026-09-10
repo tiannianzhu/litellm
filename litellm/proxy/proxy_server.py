@@ -1493,34 +1493,49 @@ async def _flush_spend_around_logging_drain_on_shutdown(
     drain_tasks: Callable[[float], Awaitable[None]] = drain_logging_tasks,
     drain_deferred_rows: Callable[[float], Awaitable[None]] = openai_agents_turn_biller.drain,
 ) -> None:
-    await flush_spend()
-    remaining: Final = GracefulShutdownManager.remaining(clock=clock)
-    callback_timeout: Final = max(0.0, remaining - GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS)
-    verbose_proxy_logger.info(
-        "Draining success callbacks before the final spend flush remaining_s=%.3f callback_timeout_s=%.3f",
-        remaining,
-        callback_timeout,
-    )
+    def remaining_for_logging() -> float:
+        return max(0.0, GracefulShutdownManager.remaining(clock=clock) - GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS)
 
-    async def drain_callbacks() -> None:
-        await drain_deferred_rows(callback_timeout)
-        await drain_tasks(callback_timeout)
+    async def drain_callbacks(timeout: float) -> None:
+        await drain_deferred_rows(timeout)
+        await drain_tasks(timeout)
         await worker.flush()
 
     try:
-        await asyncio.wait_for(drain_callbacks(), timeout=callback_timeout)
-    except asyncio.TimeoutError:
-        verbose_proxy_logger.warning(
-            "Success callback shutdown budget exhausted with %d unfinished callbacks; accounting may be incomplete",
-            worker.pending_count,
+        try:
+            await flush_spend()
+        except Exception:  # noqa: BLE001  # a failed first flush must not skip logging cleanup or the final flush
+            verbose_proxy_logger.exception("Error during the initial shutdown spend flush")
+
+        callback_timeout: Final = remaining_for_logging()
+        verbose_proxy_logger.info(
+            "Draining success callbacks before the final spend flush remaining_s=%.3f callback_timeout_s=%.3f",
+            GracefulShutdownManager.remaining(clock=clock),
+            callback_timeout,
         )
+        try:
+            await asyncio.wait_for(drain_callbacks(callback_timeout), timeout=callback_timeout)
+        except asyncio.TimeoutError:
+            verbose_proxy_logger.warning(
+                "Success callback shutdown budget exhausted with %d unfinished callbacks; accounting may be incomplete",
+                worker.pending_count,
+            )
+        finally:
+            await worker.stop(discard_pending=True, timeout=min(2.0, remaining_for_logging()))
+        deferred_timeout: Final = min(5.0, max(0.0, GracefulShutdownManager.remaining(clock=clock) - 5.0))
+        await drain_deferred_rows(deferred_timeout)
+        await drain_tasks(min(5.0, remaining_for_logging()))
+    except Exception:  # noqa: BLE001  # later shutdown cleanup must continue after a logging failure
+        verbose_proxy_logger.exception("Error draining logging tasks on shutdown")
     finally:
-        await worker.stop(discard_pending=True, timeout=GracefulShutdownManager.remaining(2.0, clock=clock))
-    await drain_deferred_rows(GracefulShutdownManager.remaining(5.0, clock=clock))
-    await drain_tasks(GracefulShutdownManager.remaining(5.0, clock=clock))
-    _ = await asyncio.gather(
-        flush_spend(), _bounded_rust_flush(flush_rust, GracefulShutdownManager.remaining(clock=clock))
-    )
+        results: Final = await asyncio.gather(
+            flush_spend(),
+            _bounded_rust_flush(flush_rust, GracefulShutdownManager.remaining(clock=clock)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                verbose_proxy_logger.error("Error during the final shutdown flush", exc_info=result)
 
 
 async def _drain_audit_tasks_on_shutdown() -> None:

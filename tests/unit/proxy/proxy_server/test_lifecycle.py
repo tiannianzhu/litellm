@@ -35,6 +35,8 @@ from pydantic import BaseModel
 from typing_extensions import TypedDict
 
 import litellm.proxy.proxy_server as ps
+from litellm.constants import GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
+from litellm.litellm_core_utils.logging_worker import LoggingWorker
 from litellm.proxy.management_helpers.audit_logs import track_audit_task
 from litellm.proxy.proxy_server import (
     ProxyStartupEvent,
@@ -1105,6 +1107,42 @@ async def test_proxy_shutdown_commits_spend_before_waiting_on_a_slow_logging_tas
         ("spend counters", True),
         ("spend logs", True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_proxy_shutdown_keeps_time_for_the_final_spend_flush_when_logging_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "30")
+    drain_durations: Final[list[float]] = []  # mutable-ok: records elapsed time in the simulated shutdown
+    flush_budgets: Final[asyncio.Queue[float]] = asyncio.Queue()
+
+    def clock() -> float:
+        return 100.0 + sum(drain_durations)
+
+    async def drain_tasks(timeout: float) -> None:
+        drain_durations.append(timeout)
+        if len(drain_durations) == 2:
+            raise RuntimeError("Logging cleanup failed")
+
+    async def flush_spend() -> None:
+        flush_budgets.put_nowait(ps.GracefulShutdownManager.remaining(clock=clock))
+
+    async def flush_rust() -> None:
+        return None
+
+    ps.GracefulShutdownManager.reset()
+    ps.GracefulShutdownManager.start_shutdown(clock=clock)
+    try:
+        await ps._flush_spend_around_logging_drain_on_shutdown(  # pyright: ignore[reportPrivateUsage]  # lifecycle under test
+            flush_spend, flush_rust=flush_rust, worker=LoggingWorker(), clock=clock, drain_tasks=drain_tasks
+        )
+    finally:
+        ps.GracefulShutdownManager.reset()
+
+    assert flush_budgets.qsize() == 2
+    assert flush_budgets.get_nowait() == 30.0
+    assert flush_budgets.get_nowait() >= GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS
 
 
 def test_otel_global_provider_published_after_callback_init():
