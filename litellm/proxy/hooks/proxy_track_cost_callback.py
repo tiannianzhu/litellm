@@ -367,10 +367,18 @@ class _ProxyDBLogger(CustomLogger):
         self._spend_writer: Final = spend_writer
         self._deployment_lookup: Final = deployment_lookup
 
+    @property
+    def requires_success_await(self) -> bool:
+        from litellm.proxy.proxy_server import prisma_client
+
+        return prisma_client is not None and not ProxyUpdateSpend.disable_spend_updates()
+
     async def async_log_success_event(
         self, kwargs: ObjectMapping, response_obj: object, start_time: datetime, end_time: datetime
     ) -> None:
-        if self.spend_event_producer is None or not is_offloadable_success(response_obj):
+        from litellm.proxy.proxy_server import prisma_client
+
+        if prisma_client is not None or self.spend_event_producer is None or not is_offloadable_success(response_obj):
             await self._PROXY_track_cost_callback(kwargs, response_obj, start_time, end_time)
             return
         event: Final = build_spend_event(
@@ -647,6 +655,7 @@ class _ProxyDBLogger(CustomLogger):
     ):
         from litellm.proxy.proxy_server import (
             increment_spend_counters,
+            prisma_client,
             proxy_logging_obj,
             update_cache,
         )
@@ -784,14 +793,18 @@ class _ProxyDBLogger(CustomLogger):
                         )
                     )
 
-                    await proxy_logging_obj.slack_alerting_instance.customer_spend_alert(
+                    alert: Final = proxy_logging_obj.slack_alerting_instance.customer_spend_alert(
                         token=user_api_key,
                         key_alias=key_alias,
                         end_user_id=end_user_id,
                         response_cost=response_cost,
                         max_budget=end_user_max_budget,
                     )
-                elif budget_reservation is not None:
+                    if prisma_client is not None:
+                        asyncio.create_task(alert)
+                    else:
+                        await alert
+                else:
                     await _release_budget_reservation(budget_reservation=budget_reservation)
             else:
                 if _is_unbilled_interaction_response(completion_response):
@@ -821,13 +834,12 @@ class _ProxyDBLogger(CustomLogger):
                 if kwargs.get("stream") is not True or (
                     kwargs.get("stream") is True and "complete_streaming_response" in kwargs
                 ):
-                    if sl_object is not None:
-                        cost_tracking_failure_debug_info: dict | str = (
-                            sl_object["response_cost_failure_debug_info"]
-                            or "response_cost_failure_debug_info is None in standard_logging_object"
-                        )
-                    else:
-                        cost_tracking_failure_debug_info = "standard_logging_object not found"
+                    cost_tracking_failure_debug_info: Final = (
+                        sl_object["response_cost_failure_debug_info"]
+                        or "response_cost_failure_debug_info is None in standard_logging_object"
+                        if sl_object is not None
+                        else "standard_logging_object not found"
+                    )
                     model = kwargs.get("model")
                     raise Exception(
                         f"Cost tracking failed for model={model}.\nDebug info - {cost_tracking_failure_debug_info}\nAdd custom pricing - https://docs.litellm.ai/docs/proxy/custom_pricing"
@@ -859,6 +871,8 @@ class _ProxyDBLogger(CustomLogger):
             )
 
             spend_log_error("Error in tracking cost callback - %s", str(e), exc=e)
+            if prisma_client is not None:
+                raise
 
     @staticmethod
     async def _enrich_failure_metadata_unless_db_stalled(
@@ -1180,6 +1194,39 @@ async def _update_database_and_spend_counters_in_batch(
     project_id: str | None,
     spend_writer: DBSpendUpdateWriter | None = None,
 ) -> bool:
+    from litellm.proxy.db.db_spend_update_writer import accounting_windows_persisted
+    from litellm.proxy.proxy_server import prisma_client
+
+    async def update_counters() -> None:
+        window_context: Final = accounting_windows_persisted.set(prisma_client is not None)
+        try:
+            await increment_spend_counters(
+                token=user_api_key,
+                team_id=team_id,
+                user_id=user_id,
+                response_cost=response_cost,
+                org_id=org_id,
+                budget_reservation=budget_reservation,
+                end_user_id=end_user_id,
+                tags=request_tags,
+                request_started_at=start_time,
+                model_access_groups=model_access_groups,
+                project_id=project_id,
+            )
+        except Exception:
+            if budget_reservation is not None:
+                try:
+                    await _invalidate_budget_reservation_counters(budget_reservation=budget_reservation)
+                except Exception:
+                    verbose_proxy_logger.exception(
+                        "Failed to invalidate budget reservation counters after spend counter update failed"
+                    )
+                finally:
+                    budget_reservation["finalized"] = True
+            raise
+        finally:
+            accounting_windows_persisted.reset(window_context)
+
     try:
         writer: Final = spend_writer if spend_writer is not None else proxy_logging_obj.db_spend_update_writer
         accounting: Final = (
@@ -1201,6 +1248,7 @@ async def _update_database_and_spend_counters_in_batch(
             end_time=end_time,
             org_id=org_id,
             project_id=project_id,
+            on_accounting_admitted=update_counters if prisma_client is not None else None,
         )
     except Exception:
         if budget_reservation is not None:
@@ -1219,31 +1267,8 @@ async def _update_database_and_spend_counters_in_batch(
         await _release_budget_reservation(budget_reservation=budget_reservation)
         return False
 
-    try:
-        await increment_spend_counters(
-            token=user_api_key,
-            team_id=team_id,
-            user_id=user_id,
-            response_cost=response_cost,
-            org_id=org_id,
-            budget_reservation=budget_reservation,
-            end_user_id=end_user_id,
-            tags=request_tags,
-            request_started_at=start_time,
-            model_access_groups=model_access_groups,
-            project_id=project_id,
-        )
-    except Exception:
-        if budget_reservation is not None:
-            try:
-                await _invalidate_budget_reservation_counters(budget_reservation=budget_reservation)
-            except Exception:
-                verbose_proxy_logger.exception(
-                    "Failed to invalidate budget reservation counters after spend counter update failed"
-                )
-            finally:
-                budget_reservation["finalized"] = True
-        raise
+    if prisma_client is None:
+        await update_counters()
     return True
 
 

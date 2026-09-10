@@ -211,6 +211,60 @@ async def test_cancelled_commit_restores_only_the_unwritten_chunks_and_propagate
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("cancellations", [1, 2])
+async def test_cancelled_redis_admission_finishes_before_the_final_flush(
+    admitted: bool, cancellations: int
+) -> None:
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    stored: Final[asyncio.Queue[str]] = asyncio.Queue(maxsize=2)
+    redis_cache: Final = MagicMock()
+
+    async def rpush(key: str, values: tuple[str, ...]) -> int:
+        entered.set()
+        await release.wait()
+        if not admitted and redis_cache.async_rpush.await_count == 1:
+            raise RuntimeError("redis refused admission")
+        for entry in values:
+            stored.put_nowait(entry)
+        return stored.qsize()
+
+    async def lpop(key: str, count: int) -> list[str]:
+        return [stored.get_nowait() for _ in range(min(count, stored.qsize()))]
+
+    redis_cache.async_rpush = AsyncMock(side_effect=rpush)
+    redis_cache.async_lpop = AsyncMock(side_effect=lpop)
+    pod_lock_manager: Final = MagicMock()
+    pod_lock_manager.acquire_lock = AsyncMock(return_value=True)
+    prisma_client: Final = MagicMock()
+    prisma_client.db.execute_raw = AsyncMock()
+    buffer: Final = RequestErrorRedisBuffer(redis_cache=redis_cache, pod_lock_manager=pod_lock_manager)
+    accumulator: Final = RequestErrorAccumulator()
+    accumulator.restore({_key(): 1})
+    flush: Final = asyncio.create_task(flush_request_errors(prisma_client, accumulator, buffer))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        for _ in range(cancellations):
+            flush.cancel()
+            await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await flush
+        pod_lock_manager.acquire_lock.assert_not_awaited()
+        await flush_request_errors(prisma_client, accumulator, buffer)
+        prisma_client.db.execute_raw.assert_awaited_once()
+        assert prisma_client.db.execute_raw.await_args.args[1:] == (
+            "2026-10-08", "hash-1", "team-a", "user-a", "gpt-4o", 429, 1,
+        )
+        assert accumulator.drain() == {}
+        assert stored.empty()
+    finally:
+        release.set()
+        await asyncio.gather(flush, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_leader_commit_requeues_the_unwritten_chunks_to_redis() -> None:
     redis_cache: Final = MagicMock()
     stored: Final[list[str]] = []  # mutable-ok: stands in for the Redis list

@@ -23,7 +23,7 @@ import pytest_asyncio
 from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
 from openai import AsyncOpenAI
 from openai._legacy_response import HttpxBinaryResponseContent
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 import litellm
 from litellm._internal_context import in_post_response_phase
@@ -4643,75 +4643,33 @@ async def test_async_success_handler_sets_standard_logging_object_for_pass_throu
     )
 
 
+@pytest.mark.usefixtures("isolate_litellm_state", "drain_logging_worker")
 @pytest.mark.asyncio
-async def test_async_success_handler_prevents_reprocessing_for_pass_through_endpoints():
-    """
-    Test that async_success_handler prevents re-processing for pass-through endpoints
-    by setting async_complete_streaming_response, consistent with the existing code pattern.
-
-    This ensures that if async_success_handler is called multiple times (e.g., during
-    streaming), it won't re-process the response after the first complete call.
-    """
-    from datetime import datetime
-    from unittest.mock import patch
-
-    from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+async def test_async_success_handler_prevents_reprocessing_for_pass_through_endpoints() -> None:
     from litellm.types.utils import StandardPassThroughResponseObject
 
-    # Create a logging object for a pass-through endpoint
-    logging_obj = LiteLLMLoggingObj(
+    recorder: Final = _SuccessCapturingLogger()
+    now: Final = dt_object(2026, 1, 1)
+    logging_obj: Final = LitellmLogging(
         model="unknown",
         messages=[{"role": "user", "content": "test"}],
         stream=False,
         call_type="pass_through_endpoint",
-        start_time=datetime.now(),
+        start_time=now,
         litellm_call_id="test-call-id-reprocess",
         function_id="test-function-id-reprocess",
+        dynamic_async_success_callbacks=[recorder],
     )
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="openai")
+    result: Final = StandardPassThroughResponseObject(response='{"status": "success"}')
+    await logging_obj.async_success_handler(result=result, start_time=now, end_time=now)
+    first_payload: Final = recorder.success_payload
 
-    # Set up model_call_details with required fields
-    logging_obj.model_call_details = {
-        "litellm_params": {
-            "metadata": {},
-            "proxy_server_request": {},
-        },
-        "litellm_call_id": "test-call-id-reprocess",
-    }
+    await logging_obj.async_success_handler(result=result, start_time=now, end_time=now)
 
-    result = StandardPassThroughResponseObject(response='{"status": "success"}')
-    start_time = datetime.now()
-    end_time = datetime.now()
-
-    # Mock the callbacks to avoid actual logging
-    with patch.object(logging_obj, "get_combined_callback_list", return_value=[]):
-        # First call - should process and set standard_logging_object
-        await logging_obj.async_success_handler(
-            result=result,
-            start_time=start_time,
-            end_time=end_time,
-            cache_hit=False,
-        )
-
-    # Verify first call set the values
-    assert "standard_logging_object" in logging_obj.model_call_details
-    assert "async_complete_streaming_response" in logging_obj.model_call_details
-    first_standard_logging_object = logging_obj.model_call_details["standard_logging_object"]
-
-    # Second call - should return early due to async_complete_streaming_response guard
-    with patch.object(logging_obj, "get_combined_callback_list", return_value=[]) as mock_callbacks:
-        await logging_obj.async_success_handler(
-            result=result,
-            start_time=start_time,
-            end_time=end_time,
-            cache_hit=False,
-        )
-        # The guard should cause early return, so get_combined_callback_list should not be called
-        mock_callbacks.assert_not_called()
-
-    # Verify standard_logging_object wasn't modified by second call
-    assert logging_obj.model_call_details["standard_logging_object"] is first_standard_logging_object, (
-        "standard_logging_object should not be modified on re-processing"
-    )
+    assert recorder.success_calls == 1
+    assert recorder.stream_event_calls == 0
+    assert first_payload is not None and logging_obj.model_call_details["standard_logging_object"] is first_payload
 
 
 class _StreamSuccessRecorder(CustomLogger):
@@ -14750,6 +14708,104 @@ class _BlockedSuccessLogger(CustomLogger):
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
         self.responses.append(response_obj.id)
+
+
+@pytest.mark.usefixtures("isolate_litellm_state", "drain_logging_worker")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stream", "sync_registry"), ((False, False), (True, False), (False, True)))
+@pytest.mark.parametrize("logging_only", (False, True))
+async def test_durable_success_includes_logging_hook_audit_before_background_sends(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, sync_registry: bool, logging_only: bool
+) -> None:
+    from litellm.integrations.custom_guardrail import CustomGuardrail
+    from litellm.types.guardrails import GuardrailEventHooks
+
+    class AuditGuardrail(CustomGuardrail):
+        hook_calls: int = 0
+
+        async def async_logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            self.hook_calls += 1
+            payload: Final = TypeAdapter(dict[str, object]).validate_python(kwargs["standard_logging_object"])
+            return {
+                **kwargs,
+                "standard_logging_object": {
+                    **payload,
+                    "guardrail_information": [{"guardrail_name": self.guardrail_name, "guardrail_status": "success"}],
+                },
+            }, result
+
+    class CapturingLogger(CustomLogger):
+        def __init__(self, durable: bool) -> None:
+            super().__init__()
+            self.durable = durable
+            self.hook_calls = 0
+            self.audit_json: str | None = None
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        @property
+        def requires_success_await(self) -> bool:
+            return self.durable
+
+        async def async_logging_hook(
+            self, kwargs: dict[str, object], result: object, call_type: str
+        ) -> tuple[dict[str, object], object]:
+            self.hook_calls += 1
+            return kwargs, result
+
+        async def async_log_success_event(
+            self, kwargs: Mapping[str, object], response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            self.audit_json = json.dumps(kwargs["standard_logging_object"], default=str)
+            self.entered.set()
+            if not self.durable:
+                await self.release.wait()
+            self.finished.set()
+
+    durable: Final = CapturingLogger(durable=True)
+    external: Final = CapturingLogger(durable=False)
+    if sync_registry:
+        monkeypatch.setattr(litellm, "success_callback", [durable])
+    guardrail: Final = AuditGuardrail(
+        guardrail_name="audit-fixture",
+        default_on=True,
+        event_hook=GuardrailEventHooks.logging_only if logging_only else GuardrailEventHooks.pre_call,
+    )
+    logging_obj: Final = LitellmLogging(
+        model="hosted_vllm/logging-fixture",
+        messages=[],
+        stream=stream,
+        call_type=CallTypes.acompletion.value,
+        start_time=datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc),
+        litellm_call_id="durable-hook-order",
+        function_id="durable-hook-order",
+        dynamic_async_success_callbacks=[guardrail, external] if sync_registry else [durable, guardrail, external],
+    )
+    assert logging_obj.requires_success_await
+    logging_obj.update_environment_variables(litellm_params={}, optional_params={}, custom_llm_provider="hosted_vllm")
+    response: Final = ModelResponse(
+        model="hosted_vllm/logging-fixture",
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    )
+    response._hidden_params["response_cost"] = 0.01
+    try:
+        await asyncio.wait_for(logging_obj.async_success_handler(result=response), timeout=5)
+        await asyncio.wait_for(external.entered.wait(), timeout=5)
+        assert durable.finished.is_set()
+        assert not external.finished.is_set()
+        assert durable.audit_json is not None
+        payload: Final = TypeAdapter(dict[str, object]).validate_json(durable.audit_json)
+        assert payload.get("guardrail_information") == (
+            [{"guardrail_name": "audit-fixture", "guardrail_status": "success"}] if logging_only else None
+        )
+    finally:
+        external.release.set()
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+    assert (durable.hook_calls, guardrail.hook_calls, external.hook_calls) == (1, int(logging_only), 1)
+    assert external.finished.is_set()
 
 
 @pytest.mark.asyncio

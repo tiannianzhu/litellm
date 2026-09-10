@@ -10,6 +10,7 @@ from litellm.proxy.db.daily_spend_bulk_upsert import (
     DAILY_SPEND_TABLES,
     build_bulk_upsert,
     conflict_key,
+    daily_spend_entity_ids,
     merge_by_conflict_key,
 )
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
@@ -21,6 +22,14 @@ USER_TABLE = DAILY_SPEND_TABLES["user"]
 # Every nullable member of the unique constraint, so a test that only varied the provider
 # cannot pass while a sibling column still leaks a NULL into the conflict target.
 NULLABLE_KEY_COLUMNS = ("model", "custom_llm_provider", "mcp_namespaced_tool_name", "endpoint")
+
+
+@pytest.mark.parametrize("identity, expected", ((None, ()), ("", ()), ("org-id", ("org-id",))))
+def test_daily_organization_requires_id_but_anonymous_user_still_counts(
+    identity: str | None, expected: tuple[str, ...]
+) -> None:
+    assert daily_spend_entity_ids({"organization_id": identity}, "org") == expected
+    assert daily_spend_entity_ids({"user": identity}, "user") == (identity,)
 
 
 def tag_txn(**overrides):

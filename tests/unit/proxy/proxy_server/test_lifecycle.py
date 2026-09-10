@@ -347,7 +347,15 @@ async def test_flush_spend_logs_queue_on_shutdown_drains_before_disconnect(monke
     monkeypatch.setattr(ps, "prisma_client", fake_prisma, raising=False)
     monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
 
+    calls: list[str] = []  # mutable-ok: records shutdown ordering
+    writer = MagicMock()
+    writer.flush_spend_updates_on_shutdown = AsyncMock(side_effect=lambda **_: calls.append("rollups"))
+    proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer = writer
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging, raising=False)
+
     drain = AsyncMock()
+    drain.side_effect = lambda **_: calls.append("spend_logs")
     import litellm.proxy.utils as utils_mod
 
     monkeypatch.setattr(utils_mod, "drain_spend_logs_queue", drain)
@@ -362,12 +370,19 @@ async def test_flush_spend_logs_queue_on_shutdown_drains_before_disconnect(monke
         "drain_calls": 1,
         "drain_prisma": True,
     }
+    assert calls == ["rollups", "spend_logs"]
 
 
 @pytest.mark.asyncio
 async def test_flush_spend_logs_queue_on_shutdown_swallows_drain_errors(monkeypatch):
     monkeypatch.setattr(ps, "prisma_client", MagicMock(), raising=False)
     monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+
+    writer = MagicMock()
+    writer.flush_spend_updates_on_shutdown = AsyncMock()
+    proxy_logging = MagicMock()
+    proxy_logging.db_spend_update_writer = writer
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging, raising=False)
 
     import litellm.proxy.utils as utils_mod
 
@@ -706,13 +721,26 @@ async def test_cost_tracking_adds_db_and_shadow_eval_callbacks_when_prisma_set(
 
     import litellm
     from litellm.integrations.shadow_eval_logger import ShadowEvalLogger
-    from litellm.proxy.spend_tracking.spend_event import SpendEventDecodeError, decode_spend_event
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
     from litellm.proxy.spend_tracking.spend_event_producer import SpendEventProducer
     from litellm.types.utils import ModelResponse, Usage
     from litellm.utils import Rules, function_setup
 
     producer: Final = AsyncMock(spec=SpendEventProducer)
+    async def admitted_database_update(
+        *, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **kwargs: object
+    ) -> bool:
+        if on_accounting_admitted is not None:
+            await on_accounting_admitted()
+        return True
+
+    proxy_logging: Final = MagicMock()
+    proxy_logging.db_spend_update_writer.update_database = AsyncMock(side_effect=admitted_database_update)
+    proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
+    counters: Final = AsyncMock()
     monkeypatch.setattr(ps, "prisma_client", MagicMock())
+    monkeypatch.setattr(ps, "proxy_logging_obj", proxy_logging)
+    monkeypatch.setattr(ps, "increment_spend_counters", counters)
     monkeypatch.setattr(ps, "spend_event_producer", None)
     monkeypatch.setattr(ps, "build_spend_event_producer", lambda settings, fallback: producer)
     for name in (
@@ -740,18 +768,31 @@ async def test_cost_tracking_adds_db_and_shadow_eval_callbacks_when_prisma_set(
         messages=[{"role": "user", "content": "hello"}],
         litellm_call_id="single-accounting-event",
     )
-    logging_obj.update_environment_variables(litellm_params={"acompletion": True, "metadata": {}}, optional_params={})
+    logging_obj.update_environment_variables(
+        litellm_params={
+            "acompletion": True,
+            "metadata": {"user_api_key": "hashed-fixture-key", "user_api_key_user_id": "fixture-user"},
+        },
+        optional_params={},
+    )
     response: Final = ModelResponse(
         id="chatcmpl-single-accounting-event",
         model="gpt-4o-mini",
         usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
     )
     await logging_obj.async_success_handler(response, now, now)
-    producer.publish.assert_awaited_once()
-    event: Final = decode_spend_event(producer.publish.call_args.args[0])
-    assert not isinstance(event, SpendEventDecodeError)
-    assert event.response_cost == logging_obj.model_call_details["response_cost"]
-    assert event.response_cost > 0
+    proxy_logging.db_spend_update_writer.update_database.assert_awaited_once()
+    counters.assert_awaited_once()
+    producer.publish.assert_not_awaited()
+    written: Final = proxy_logging.db_spend_update_writer.update_database.call_args.kwargs
+    payload: Final = get_logging_payload(
+        kwargs=written["kwargs"], response_obj=written["completion_response"],
+        start_time=written["start_time"], end_time=written["end_time"],
+    )
+    assert payload["request_id"] == response.id
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (10, 5, 15)
+    assert payload["spend"] == logging_obj.model_call_details["response_cost"]
+    assert payload["spend"] > 0
 
 
 def test_cost_tracking_no_op_when_prisma_missing(monkeypatch):

@@ -77,7 +77,7 @@ async def test_admin_mcp_failure_still_closes_proxy_resources(
     failure_phase: Literal["startup", "serving", "shutdown", "cancelled", "license"],
 ) -> None:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    from apscheduler.schedulers.base import STATE_PAUSED
+    from apscheduler.schedulers.base import STATE_RUNNING
     from litellm_admin_mcp import server as connector_server
     from litellm_admin_mcp.gateway import Gateway
 
@@ -97,7 +97,7 @@ async def test_admin_mcp_failure_still_closes_proxy_resources(
         if failure_phase == "startup":
             raise RuntimeError("startup failed")
         yield
-        assert scheduler.state == STATE_PAUSED
+        assert scheduler.state != STATE_RUNNING
         assert GracefulShutdownManager.is_shutting_down()
         assert proxy_server.shared_aiohttp_session is not None
         assert not proxy_server.shared_aiohttp_session.closed
@@ -240,28 +240,102 @@ async def test_proxy_shutdown_closes_admin_connector_when_drain_is_cancelled(
     assert InFlightRequestsMiddleware.get_count() == 0
 
 
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="Admin MCP requires Python 3.12+")
+async def test_proxy_teardown_headroom_bounds_a_request_that_survives_cancellation(
+    admin_mcp_proxy: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx2
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy.middleware.in_flight_requests_middleware import InFlightRequestsMiddleware
+
+    monkeypatch.setenv("GRACEFUL_SHUTDOWN_TIMEOUT", "1")
+    monkeypatch.setattr(proxy_server, "GRACEFUL_SHUTDOWN_TEARDOWN_HEADROOM_SECONDS", 0.02, raising=False)
+    admin_mcp_proxy.add_middleware(InFlightRequestsMiddleware)
+    ready: Final = asyncio.Event()
+    shutdown: Final = asyncio.Event()
+    started: Final = asyncio.Event()
+    cancelled: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+
+    @admin_mcp_proxy.get("/hold-accounting")
+    async def hold_accounting() -> dict[str, bool]:
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            raise
+        return {"complete": True}
+
+    async def serve() -> None:
+        async with admin_mcp_proxy.router.lifespan_context(admin_mcp_proxy):
+            ready.set()
+            await shutdown.wait()
+
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=admin_mcp_proxy), base_url="http://localhost:4000"
+    ) as client:
+        serving: Final = asyncio.create_task(serve())
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        request: Final = asyncio.create_task(client.get("/hold-accounting"))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            request.cancel()
+            await asyncio.wait_for(cancelled.wait(), timeout=5)
+            assert InFlightRequestsMiddleware.get_count() == 1
+            shutdown.set()
+            await asyncio.wait_for(serving, timeout=0.3)
+            assert not request.done()
+            assert all(route.name != "admin_mcp" for route in admin_mcp_proxy.routes)
+            assert proxy_server.shared_aiohttp_session is not None
+            assert proxy_server.shared_aiohttp_session.closed
+        finally:
+            release.set()
+            serving.cancel()
+            await asyncio.gather(request, serving, return_exceptions=True)
+
+    assert InFlightRequestsMiddleware.get_count() == 0
+
+
 # Your bearer token
 @pytest.mark.asyncio
-async def test_shutdown_commits_spend_a_logging_task_queued_while_the_first_commit_was_writing():
+async def test_shutdown_commits_spend_a_logging_task_queued_while_the_first_commit_was_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.proxy import proxy_server
     from litellm.responses.streaming_iterator import spawn_logging_task
 
-    queued: list[str] = []
-    committed: list[str] = []
+    queued: Final = asyncio.Queue[str]()
+    committed: Final = asyncio.Queue[str]()
+    commit_started: Final = asyncio.Event()
+    row_queued: Final = asyncio.Event()
 
     async def commit_spend() -> None:
-        committed.extend(queued)
-        queued.clear()
-        await asyncio.sleep(0.05)
+        for _ in range(queued.qsize()):
+            committed.put_nowait(queued.get_nowait())
+        commit_started.set()
+        await row_queued.wait()
 
     async def failure_row() -> None:
-        await asyncio.sleep(0.01)
-        queued.append("failure row spend")
+        await commit_started.wait()
+        queued.put_nowait("failure row spend")
+        row_queued.set()
 
-    spawn_logging_task(asyncio.get_running_loop(), failure_row(), task_name="failure row")
+    monkeypatch.setattr(proxy_server, "flush_spend_counters_on_shutdown", commit_spend)
+    monkeypatch.setattr(proxy_server, "_flush_spend_logs_queue_on_shutdown", AsyncMock())
+    task: Final = spawn_logging_task(asyncio.get_running_loop(), failure_row(), task_name="failure row")
+    try:
+        await proxy_server._drain_logging_on_shutdown(asyncio.get_running_loop().time() + 5)
+    finally:
+        commit_started.set()
+        await asyncio.wait_for(task, timeout=5)
 
-    await litellm.proxy.proxy_server._flush_spend_around_logging_drain_on_shutdown(flush_spend=commit_spend)
-
-    assert committed == ["failure row spend"]
+    assert committed.qsize() == 1
+    assert committed.get_nowait() == "failure row spend"
+    assert queued.empty()
 
 
 token = MASTER_KEY

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -346,6 +347,7 @@ async def test_vertex_ai_anthropic_streaming_cost_injection_enabled():
 
         # Setup logging object with model info
         litellm_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
+        litellm_logging_obj.requires_success_await = False
         litellm_logging_obj.litellm_params = {}
         litellm_logging_obj.model_call_details = {"model": "claude-sonnet-4@20250514"}
         litellm_logging_obj.completion_start_time = None
@@ -423,6 +425,7 @@ async def test_vertex_ai_anthropic_streaming_cost_injection_disabled():
         response.aiter_bytes = mock_aiter_bytes
 
         litellm_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
+        litellm_logging_obj.requires_success_await = False
         litellm_logging_obj.litellm_params = {}
         litellm_logging_obj.model_call_details = {"model": "claude-sonnet-4@20250514"}
         litellm_logging_obj.completion_start_time = None
@@ -487,6 +490,7 @@ async def test_vertex_ai_anthropic_streaming_cost_injection_no_usage_chunk():
         response.aiter_bytes = mock_aiter_bytes
 
         litellm_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
+        litellm_logging_obj.requires_success_await = False
         litellm_logging_obj.litellm_params = {}
         litellm_logging_obj.model_call_details = {"model": "claude-sonnet-4@20250514"}
         litellm_logging_obj.completion_start_time = None
@@ -544,6 +548,7 @@ async def test_vertex_ai_anthropic_streaming_model_extraction():
         response.aiter_bytes = mock_aiter_bytes
 
         litellm_logging_obj = MagicMock(spec=LiteLLMLoggingObj)
+        litellm_logging_obj.requires_success_await = False
         litellm_logging_obj.litellm_params = {}
         litellm_logging_obj.model_call_details = {}
         litellm_logging_obj.completion_start_time = None
@@ -699,6 +704,7 @@ async def test_completed_passthrough_cancellation_preserves_accounting(
     )
     monkeypatch.setattr(litellm, "apply_search_free_tier", True)
     monkeypatch.setattr(proxy_server, "general_settings", {})
+    monkeypatch.setattr(proxy_server, "prisma_client", MagicMock())
     counters: Final = DualCache()
     for key in ("spend:key:pass-through-key", "spend:team:pass-through-team"):
         counters.set_cache(key=key, value=1.9)
@@ -712,6 +718,15 @@ async def test_completed_passthrough_cancellation_preserves_accounting(
         ],
     }
     writer: Final = create_autospec(DBSpendUpdateWriter, instance=True)
+
+    async def admitted_database_update(
+        *, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **kwargs: object
+    ) -> bool:
+        if on_accounting_admitted is not None:
+            await on_accounting_admitted()
+        return True
+
+    writer.update_database.side_effect = admitted_database_update
     proxy_logging: Final = ProxyLogging(user_api_key_cache=DualCache())
     proxy_logging.db_spend_update_writer = writer
     allowance: Final = AllowanceCounter()
@@ -788,6 +803,9 @@ async def test_completed_passthrough_cancellation_preserves_accounting(
     else:
         await pending
         assert scope.cancelled_caught is (cancel_mode == "scope")
+    assert writer.update_database.await_count == 1
+    assert logging_obj.finalized_cost is not None
+    assert logging_obj.finalized_cost.amount == pytest.approx(0.48)
     assert reservation["callback_bound"] is True
     await release_unbound_budget_reservation(reservation)
     await GLOBAL_LOGGING_WORKER.flush()

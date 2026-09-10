@@ -148,23 +148,25 @@ class PassThroughEndpointLogging:
             from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
             from litellm.proxy.spend_tracking.cost_finalization import finalize_proxy_response_cost
 
-            async def finalize_and_enqueue() -> None:
+            async def finalize_and_dispatch() -> None:
                 await finalize_proxy_response_cost(logging_obj, standard_logging_response_object)
-                GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-                    async_coroutine=self.handle_logging(
-                        logging_obj=logging_obj,
-                        standard_logging_response_object=standard_logging_response_object,
-                        result=result,
-                        start_time=start_time,
-                        end_time=end_time,
-                        cache_hit=cache_hit,
-                        finalize_before_dispatch=False,
-                        **kwargs,
-                    )
+                success: Final = self.handle_logging(
+                    logging_obj=logging_obj,
+                    standard_logging_response_object=standard_logging_response_object,
+                    result=result,
+                    start_time=start_time,
+                    end_time=end_time,
+                    cache_hit=cache_hit,
+                    finalize_before_dispatch=False,
+                    **kwargs,
                 )
+                if logging_obj.requires_success_await:
+                    await success
+                else:
+                    GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
                 bind_budget_reservation_to_callbacks(logging_obj.litellm_params)
 
-            pending: Final = asyncio.create_task(finalize_and_enqueue())
+            pending: Final = asyncio.create_task(finalize_and_dispatch())
             try:
                 await asyncio.shield(pending)
             except asyncio.CancelledError:
