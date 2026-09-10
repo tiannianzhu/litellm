@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
@@ -13,7 +13,7 @@ import pytest
 
 import litellm
 import litellm.proxy.proxy_server as ps
-from litellm.caching.redis_cache import RedisCache
+from litellm.caching.redis_batch import request_redis_batch_scope
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.db.spend_counter_reseed import SpendCounterReseed
 from litellm.proxy.spend_tracking.spend_counter_batch import (
@@ -26,7 +26,6 @@ from litellm.proxy.spend_tracking.spend_counter_batch import (
     spend_counter_batch_scope,
 )
 from litellm.rust_bridge._native import NativeRedisStoreError
-from litellm.caching.redis_batch import request_redis_batch_scope
 from tests.unit.caching.redis_batch_double import FakeNativePending, FakeNatives, fake_send
 from tests.unit.redis.stores.spend_counters_double import FakeSpendCounters
 from tests.unit.proxy.spend_tracking.native_budgets_replica import (
@@ -658,7 +657,12 @@ async def test_post_call_lifecycle_reads_the_counters_after_the_db_update_and_wr
     monkeypatch.setattr(ps, "spend_counter_store", spend)
     monkeypatch.setattr(ps, "prisma_client", None)
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(return_value=True)
+
+    async def _update_database(*, on_accounting_admitted: Callable[[], Awaitable[None]], **kwargs: object) -> bool:
+        await on_accounting_admitted()
+        return True
+
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_update_database)
     reservation = await _held(spend, reserved_cost=0.4, counter_keys=RESERVED_KEYS)
 
     charged = await _update_database_and_spend_counters(

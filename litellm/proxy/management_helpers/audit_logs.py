@@ -27,6 +27,12 @@ if TYPE_CHECKING:
     from litellm.integrations.s3_v2 import S3Logger
 
 _audit_log_callback_cache: Final[dict[str, "CustomLogger | S3Logger"]] = {}
+
+
+def get_cached_audit_log_callbacks() -> tuple["CustomLogger | S3Logger", ...]:
+    return tuple(_audit_log_callback_cache.values())
+
+
 ALLOW_LITELLM_CHANGED_BY_HEADER_METADATA_KEY: Final = "allow_litellm_changed_by_header"
 _AUDIT_JSON: Final = TypeAdapter(JsonValue)
 

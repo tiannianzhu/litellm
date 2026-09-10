@@ -1,10 +1,13 @@
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import Request
 
+import litellm
 from litellm.proxy._types import (
     LiteLLM_BudgetTable,
     LiteLLM_EndUserTable,
@@ -21,6 +24,7 @@ from litellm.proxy.spend_tracking.budget_reservation import (
     _get_model_access_group_budget_counters,
     estimate_request_max_cost,
     get_budget_window_start,
+    release_budget_reservation,
     release_budget_reservation_on_cancel,
     reserve_budget_for_request,
 )
@@ -61,6 +65,81 @@ def _request_body() -> dict:
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 10,
     }
+
+
+@pytest.mark.parametrize(
+    "method,route,path_params,read_only,matched_route",
+    (
+        ("GET", "/v1/batches/batch_fixture", {}, True, None),
+        (None, "/v1/batches/batch_fixture", {}, False, None),
+        (
+            "GET", "/bedrock/v1/batches/job/fixture", {"provider": "bedrock"}, True,
+            "/{provider}/v1/batches/{batch_id:path}",
+        ),
+        ("GET", "/openai/v1/batches/batch_fixture", {"provider": "openai"}, True, None),
+        ("GET", "/v1/files/file_fixture/content", {}, True, None),
+        ("GET", "/v1/videos/video_fixture", {}, True, None),
+        ("GET", "/v1/responses/response_fixture", {}, True, None),
+        ("POST", "/v1/batches", {}, False, None),
+        ("POST", "/v1/files", {}, False, None),
+        ("POST", "/v1/chat/completions", {}, False, None),
+        ("GET", "/v1/realtime", {}, False, None),
+        ("GET", "/v1/responses", {}, False, None),
+        ("GET", "/v1/chat/completions", {}, False, None),
+    ),
+)
+@pytest.mark.asyncio
+async def test_resource_reads_do_not_reserve_a_new_generation_budget(
+    spend_counter_state: tuple[FakeSpendCounters, UserApiKeyCache],
+    monkeypatch: pytest.MonkeyPatch,
+    native_budgets_on: None,
+    method: str | None,
+    route: str,
+    path_params: Mapping[str, str],
+    read_only: bool,
+    matched_route: str | None,
+) -> None:
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy.auth.user_api_key_auth import _reserve_budget_after_common_checks
+
+    model: Final = "openai/qa-budget-reservation"
+    monkeypatch.setattr(litellm, "model_cost", {
+        **litellm.model_cost,
+        model: {
+            "input_cost_per_token": 0.001, "output_cost_per_token": 0.002,
+            "max_input_tokens": 10000, "max_output_tokens": 1000,
+            "litellm_provider": "openai", "mode": "chat",
+        },
+    })
+    _, key_cache = spend_counter_state
+    counters: Final = SpendCounterStore(connect(None).spend_counters())
+    monkeypatch.setattr(ps, "spend_counter_store", counters)
+    install_native_owner(counters)
+    auth: Final = UserAPIKeyAuth(token="budget-resource-fixture", max_budget=1.0, spend=0.0)
+    request: Final = Request({
+        "type": "http", "path": route,
+        **({"method": method} if method is not None else {}),
+        "path_params": dict(path_params), "headers": [],
+        "route": SimpleNamespace(path=matched_route) if matched_route is not None else None,
+    })
+    await _reserve_budget_after_common_checks(
+        user_api_key_auth_obj=auth,
+        request_data={"model": model, "proxy_server_request": {"method": "GET"}},
+        route=route, request=request, llm_router=None, team_object=None, user_object=None,
+        prisma_client=None, user_api_key_cache=key_cache,
+        proxy_logging_obj=ProxyLogging(user_api_key_cache=key_cache),
+        skip_budget_checks=False, general_settings={},
+    )
+    if read_only:
+        assert auth.budget_reservation is None
+        assert request.state.budget_reservation is None
+        assert counters.get_local("spend:key:budget-resource-fixture") is None
+        return
+    assert auth.budget_reservation is not None
+    assert request.state.budget_reservation is auth.budget_reservation
+    assert counters.get_local("spend:key:budget-resource-fixture") == pytest.approx(1.0)
+    await release_budget_reservation(auth.budget_reservation)
+    assert counters.get_local("spend:key:budget-resource-fixture") == pytest.approx(0.0)
 
 
 def test_should_not_serialize_budget_reservation_on_user_api_key_auth():

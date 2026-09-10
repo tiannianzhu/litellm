@@ -1,6 +1,6 @@
 import asyncio
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -1967,9 +1967,12 @@ async def test_reserved_counter_deleted_during_spend_write_is_reseeded_instead_o
     with _install(redis_cache) as store:
         store.set_local(counter_key, 0.6)
 
-        async def _delete_counter_while_persisting(**kwargs: object) -> bool:
+        async def _delete_counter_while_persisting(
+            *, on_accounting_admitted: Callable[[], Awaitable[None]], **kwargs: object
+        ) -> bool:
             redis_cache.values.pop(counter_key, None)
             store.delete_local(counter_key)
+            await on_accounting_admitted()
             return True
 
         proxy_logging_obj = MagicMock()

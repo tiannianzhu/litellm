@@ -2868,17 +2868,19 @@ class CustomStreamWrapper:
                 # prefer_async_handlers routes CustomLogger to async_success_handler
                 # when consumers use ``async for`` on sync-SDK streams. Legacy string
                 # callbacks still run via executor.submit inside dispatch_success_handlers.
-                spawn_logging_task(
-                    asyncio.get_running_loop(),
-                    self.logging_obj.dispatch_success_handlers(
-                        complete_streaming_response,
-                        cache_hit=cache_hit,
-                        start_time=None,
-                        end_time=None,
-                        prefer_async_handlers=True,
-                    ),
-                    task_name="Chat completions stream success log",
+                success: Final = self.logging_obj.dispatch_success_handlers(
+                    complete_streaming_response,
+                    cache_hit=cache_hit,
+                    start_time=None,
+                    end_time=None,
+                    prefer_async_handlers=True,
                 )
+                if self.logging_obj.requires_success_await is True:
+                    await success
+                else:
+                    spawn_logging_task(
+                        asyncio.get_running_loop(), success, task_name="Chat completions stream success log"
+                    )
 
             await self.aclose()
             raise StopAsyncIteration  # Re-raise StopIteration

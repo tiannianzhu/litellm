@@ -5,16 +5,20 @@ from typing import Final
 import pytest
 
 from litellm.integrations.custom_logger_v2 import Field, Hook, InvalidDeclarationError, InvalidPatchError, Patch
-from litellm.integrations.custom_logger_v2.hooks import Subscription
+from litellm.integrations.custom_logger_v2.derivations import cost, usage
 from litellm.integrations.custom_logger_v2.field_sources import (
-    HookArgs,
     FieldSource,
+    HookArgs,
     SourcedFields,
     derived,
     mapped,
     source_table_problem,
     with_sources,
 )
+from litellm.integrations.custom_logger_v2.hook_point_fields import ResultFields
+from litellm.integrations.custom_logger_v2.hooks import Subscription
+from litellm.integrations.custom_logger_v2.legacy import KwargsFields
+from litellm.types.integrations.custom_logger_v2 import Cost, Usage, UsageRecord
 
 INNER: Final = MappingProxyType({Field.model: "gpt"})
 ARGS: Final = HookArgs(request={"model": "gpt"})
@@ -55,6 +59,62 @@ def test_the_derived_cache_survives_a_patch_to_another_field() -> None:
 
     assert patched[Field.model] == "claude"
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("replacement_field", "source_field", "replacement", "expected"),
+    [
+        (
+            Field.deprecated_kwargs,
+            Field.cost,
+            {"standard_logging_object": {"response_cost": 2.5}},
+            Cost(response_cost=2.5),
+        ),
+        (
+            Field.deprecated_response_obj,
+            Field.usage,
+            {"usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}},
+            Usage(
+                response=UsageRecord(prompt_tokens=20, completion_tokens=10, total_tokens=30),
+                logged=UsageRecord(prompt_tokens=3, completion_tokens=4, total_tokens=7),
+            ),
+        ),
+    ],
+)
+def test_legacy_replacements_update_unread_sources_and_preserve_already_derived_values(
+    replacement_field: Field,
+    source_field: Field,
+    replacement: Mapping[str, object],
+    expected: Cost | Usage,
+) -> None:
+    request: Final = {
+        "standard_logging_object": {
+            "response_cost": 1.25,
+            "prompt_tokens": 3,
+            "completion_tokens": 4,
+            "total_tokens": 7,
+        }
+    }
+    response: Final = {"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+    calls, read = _counting({"key_hash": "h"})
+    carrier: Final = (
+        ResultFields(request, {}, Field.response, response)
+        if replacement_field is Field.deprecated_response_obj
+        else KwargsFields(request, {Field.standard_logging_payload: "standard_logging_object"}, response)
+    )
+    fields: Final = SourcedFields(
+        carrier,
+        {Field.key_identity: derived(read), Field.cost: derived(cost), Field.usage: derived(usage)},
+        HookArgs(request=request, result=response),
+    )
+    cached: Final = fields[Field.key_identity]
+
+    patched: Final = fields.apply(Patch().set(replacement_field, replacement))
+
+    assert patched[replacement_field] is replacement
+    assert patched[Field.key_identity] is cached
+    assert len(calls) == 1
+    assert patched[source_field] == expected
 
 
 def test_a_derived_source_that_finds_nothing_leaves_the_field_absent() -> None:

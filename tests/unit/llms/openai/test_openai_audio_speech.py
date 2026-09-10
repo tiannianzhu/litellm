@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Final
@@ -12,8 +13,10 @@ import pytest
 from openai import AsyncAzureOpenAI, AsyncOpenAI, OpenAI
 
 import litellm
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.llms.azure.azure import AzureChatCompletion
 from litellm.llms.openai.openai import OpenAIChatCompletion
+from litellm.responses.streaming_iterator import drain_logging_tasks
 
 
 class _RecordingAudioStream(httpx.AsyncByteStream):
@@ -75,6 +78,44 @@ async def test_openai_audio_speech_buffers_without_stream():
 
     assert produced == [b"one", b"two", b"three"]
     assert response.content == b"onetwothree"
+
+
+@pytest.mark.asyncio
+async def test_streamed_speech_waits_for_required_accounting_before_audio_eof(monkeypatch: pytest.MonkeyPatch) -> None:
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    produced: Final[list[bytes]] = []
+
+    class RequiredAccountingLogger(CustomLogger):
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: object, response_obj: object, start_time: object, end_time: object
+        ) -> None:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(litellm, "callbacks", [RequiredAccountingLogger()])
+    async with AsyncOpenAI(api_key="fake-key", http_client=_audio_client(produced)) as client:
+        response: Final = await litellm.aspeech(
+            model="openai/tts-1", input="hello", voice="alloy", api_key="fake-key", client=client, stream=True
+        )
+        read: Final = asyncio.create_task(response.aread())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert produced == [b"one", b"two", b"three"]
+            assert not read.done()
+            release.set()
+            assert await asyncio.wait_for(read, timeout=5) == b"onetwothree"
+        finally:
+            release.set()
+            if not read.done():
+                read.cancel()
+            await asyncio.gather(read, return_exceptions=True)
+            await response.aclose()
+            await drain_logging_tasks()
 
 
 @pytest.mark.asyncio

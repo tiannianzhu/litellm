@@ -6,13 +6,14 @@ from typing import Final
 import pytest
 from pydantic import TypeAdapter
 
-from litellm.accounting.delivery_projection import project_deliveries
 from litellm.accounting.application import _window
+from litellm.accounting.delivery_projection import project_deliveries
 from litellm.accounting.projection import project
 from litellm.accounting.snapshot import build_accounting_payload
 from litellm.constants import BILLED_RETRY_ATTEMPT_METADATA_KEY, INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.proxy._types import SpendLogsPayload
 from litellm.proxy.common_utils.customer_usage import CUSTOMER_USAGE_METADATA_KEY, CustomerUsageAttribution
+from litellm.proxy.db.daily_spend_bulk_upsert import DAILY_SPEND_TABLES, conflict_key
 from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
 from litellm.proxy.proxy_server import proxy_logging_obj
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
@@ -84,6 +85,7 @@ def test_customer_usage_survives_logging_and_accounting_with_correct_request_cou
         "customer_org_id": attribution.customer_org_id,
         "customer_team_id": attribution.customer_team_id,
         "customer_member_id": attribution.customer_member_id,
+        "app_id": "",
         "model": payload["model"],
         "custom_llm_provider": payload["custom_llm_provider"],
         "api_key": payload["api_key"],
@@ -561,7 +563,7 @@ def test_daily_organization_uses_frozen_charged_identity(organization_id: str | 
         "metadata": {"accounting_entities": {"organization_id": organization_id}},
     }
     daily: Final = tuple(item for item in project(row) if item.table == "LiteLLM_DailyOrganizationSpend")
-    if organization_id is None:
+    if not organization_id:
         assert daily == ()
     else:
         assert len(daily) == 1
@@ -752,13 +754,18 @@ def test_caller_supplied_savings_beyond_json_range_are_clamped_and_never_drop_th
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,cost", [("success", 0.25), ("failure", 0.0), ("failure", 0.25)])
-async def test_customer_daily_usage_matches_ledger_and_legacy_with_utc_date(status: str, cost: float) -> None:
+async def test_customer_daily_usage_matches_ledger_and_legacy_with_utc_date(
+    monkeypatch: pytest.MonkeyPatch, status: str, cost: float
+) -> None:
+    import litellm
+
+    monkeypatch.setattr(litellm, "timezone", "Asia/Shanghai", raising=False)
     identities: Final = {
         "customer_member_id": "member",
         "customer_team_id": "customer-team",
         "customer_org_id": "customer-org",
     }
-    start: Final = datetime.fromisoformat("2026-11-02T23:30:00-05:00")
+    start: Final = datetime.fromisoformat("2026-11-02T23:30:00+00:00")
     payload: Final[SpendLogsPayload] = {
         **get_logging_payload(
             kwargs={
@@ -801,7 +808,9 @@ async def test_customer_daily_usage_matches_ledger_and_legacy_with_utc_date(stat
     contributions: Final = project(_FIELDS.validate_json(json.dumps(accounting, default=str)))
     daily: Final = next(item for item in contributions if item.table == "LiteLLM_DailyCustomerMemberSpend")
     assert {key: dict(daily.key)[key] for key in identities} == identities
-    assert dict(daily.key)["date"] == "2026-11-03"
+    assert dict(daily.key)["date"] == "2026-11-02"
+    user_daily: Final = next(item for item in contributions if item.table == "LiteLLM_DailyUserSpend")
+    assert dict(user_daily.key)["date"] == "2026-11-03"
     writer: Final = DBSpendUpdateWriter()
     client: Final = PrismaClient(database_url="postgresql://unused", proxy_logging_obj=proxy_logging_obj)
     from litellm.types.proxy.auth.customer_hierarchy import customer_hierarchy_ids_from_request
@@ -814,6 +823,7 @@ async def test_customer_daily_usage_matches_ledger_and_legacy_with_utc_date(stat
         await writer.daily_customer_member_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
     )
     (legacy,) = rows.values()
+    assert tuple(value for _, value in daily.key) == conflict_key(DAILY_SPEND_TABLES["customer_member"], legacy)
     assert {key: legacy[key] or "" for key, _ in daily.key} == dict(daily.key)
     assert {key: legacy[key] for key, _ in daily.increments} == dict(daily.increments)
     assert legacy["api_requests"] == 1

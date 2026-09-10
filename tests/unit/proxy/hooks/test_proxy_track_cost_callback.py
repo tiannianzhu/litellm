@@ -7,6 +7,7 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Final, ParamSpec, cast
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -1272,7 +1273,7 @@ def test_get_budget_reservation_from_metadata_handles_dict_auth_object():
 )
 async def test_charge_moves_only_the_committed_counters_auth_named_as_budgeted(metadata, expected_scope):
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
     increment_spend_counters = AsyncMock()
 
     await _update_database_and_spend_counters(
@@ -1306,7 +1307,7 @@ async def test_charge_with_no_auth_on_its_row_moves_the_committed_counters_that_
     from litellm.proxy.proxy_server import increment_spend_counters
 
     proxy_logging_obj = MagicMock()
-    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock()
+    proxy_logging_obj.db_spend_update_writer.update_database = AsyncMock(side_effect=_admit_accounting_update)
     spend_counter_store: Final = SpendCounterStore(connect(None).spend_counters())
     spend_counter_store.set_local("spend:committed:key:test_api_key", 1.0)
     spend_counter_store.set_local("spend:committed:org:test_org_id", 2.0)
@@ -3110,6 +3111,7 @@ def live_spend_counters(monkeypatch: pytest.MonkeyPatch) -> SpendCounterStore:
     monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", DualCache())
     monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", None)
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", ProxyLogging(UserApiKeyCache()))
     return counters
 
 
@@ -3141,12 +3143,14 @@ _LIVE_COUNTERS: Final = {
 async def _fail_request(
     logger: ProxyDBLogger, failure: Mapping[str, object], committed: CommittedBudgetSpend | None = None
 ) -> None:
+    request_id: Final = uuid4().hex
     await logger.async_post_call_failure_hook(
         request_data={
             "model": "gpt-4.1",
             "messages": [{"role": "user", "content": "Hello"}],
             "metadata": {"tags": ["batch-jobs"], MODEL_ACCESS_GROUP_METADATA_KEY: ["premium"]},
-            "proxy_server_request": {"request_id": "rid"},
+            "litellm_call_id": request_id,
+            "proxy_server_request": {"request_id": request_id},
             **failure,
         },
         original_exception=Exception("stream broke mid-flight"),
@@ -3354,6 +3358,7 @@ async def test_failure_spend_rows_leave_the_live_spend_counters_alone_while_spen
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
+@pytest.mark.usefixtures("live_spend_counters")
 async def test_a_failing_spend_counter_store_is_still_sent_every_failure_spend_row():
     counters: Final = AsyncMock(side_effect=RuntimeError("redis unavailable"))
 
@@ -3364,6 +3369,7 @@ async def test_a_failing_spend_counter_store_is_still_sent_every_failure_spend_r
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
+@pytest.mark.usefixtures("live_spend_counters")
 async def test_a_slow_spend_counter_store_lets_the_failure_out_and_raises_the_counters_once_it_answers():
     store_answers: Final = asyncio.Event()
     raised_cost: Final[asyncio.Future[object]] = asyncio.get_running_loop().create_future()
@@ -3903,7 +3909,10 @@ async def _no_fallback(line: bytes) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_log_success_event_hands_the_sidecar_a_compact_event_and_skips_the_pipeline(socket_path: Path):
+@pytest.mark.parametrize("has_postgres", [False, True])
+async def test_async_log_success_event_uses_postgres_pipeline_or_compact_sidecar_event(
+    socket_path: Path, has_postgres: bool
+) -> None:
     handler = _RecordingHandler()
     consumer = SpendEventConsumer(handler)
     address = UnixAddress(path=str(socket_path))
@@ -3914,6 +3923,7 @@ async def test_async_log_success_event_hands_the_sidecar_a_compact_event_and_ski
     logger = ProxyDBLogger(producer)
 
     with (
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock() if has_postgres else None),
         patch(  # test-quality-ok: the callback imports this from proxy_server inside its body, so there is no injection seam
             "litellm.proxy.proxy_server.proxy_logging_obj"
         ) as mock_proxy_logging,
@@ -3921,12 +3931,27 @@ async def test_async_log_success_event_hands_the_sidecar_a_compact_event_and_ski
             "litellm.proxy.proxy_server.increment_spend_counters", new_callable=AsyncMock
         ) as counters,
     ):
-        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+
+        async def admitted_database_update(
+            *, on_accounting_admitted: Callable[[], Awaitable[None]] | None = None, **kwargs: object
+        ) -> bool:
+            if on_accounting_admitted is not None:
+                await on_accounting_admitted()
+            return True
+
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock(side_effect=admitted_database_update)
+        mock_proxy_logging.slack_alerting_instance.customer_spend_alert = AsyncMock()
         await logger.async_log_success_event(_offload_kwargs(), _offload_response(), datetime.now(), datetime.now())
         await producer.close(drain_timeout=5.0)
         server.close()
         assert await consumer.drain(timeout=5.0) == 0
 
+    if has_postgres:
+        mock_proxy_logging.db_spend_update_writer.update_database.assert_awaited_once()
+        counters.assert_awaited_once()
+        assert producer.stats().sent == 0
+        assert handler.lines == []
+        return
     mock_proxy_logging.db_spend_update_writer.update_database.assert_not_awaited()
     counters.assert_not_awaited()
     assert producer.stats().sent == 1

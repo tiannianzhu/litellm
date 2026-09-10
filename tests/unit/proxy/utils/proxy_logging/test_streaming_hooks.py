@@ -465,7 +465,142 @@ async def test_async_post_call_streaming_iterator_hook_with_override_chains_call
 
 
 @pytest.mark.asyncio
-async def test_async_post_call_streaming_iterator_hook_upstream_error_raises(proxy_logging, make_user_api_key_auth, mock_callbacks_disabled):
+@pytest.mark.parametrize("fail", [False, True])
+async def test_guarded_stream_waits_for_required_accounting_and_propagates_failure(
+    proxy_logging: ProxyLogging, monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    from litellm.responses.streaming_iterator import drain_logging_tasks
+
+    class IteratorHook(CustomLogger):
+        async def async_post_call_streaming_iterator_hook(
+            self, user_api_key_dict: UserAPIKeyAuth, response: AsyncIterator[object], request_data: dict[str, object]
+        ) -> AsyncGenerator[object, None]:
+            async for chunk in response:
+                yield chunk
+
+    class RequiredAccounting(CustomLogger):
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+    monkeypatch.setattr(litellm, "callbacks", [IteratorHook()])
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    accepted: Final[asyncio.Queue[str]] = asyncio.Queue()
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="openai/test-model",
+        messages=[],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="required-stream",
+        function_id="required-stream",
+        dynamic_async_success_callbacks=[RequiredAccounting()],
+    )
+
+    async def admit() -> None:
+        entered.set()
+        await release.wait()
+        if fail:
+            raise RuntimeError("admission failed")
+        accepted.put_nowait("required-stream")
+
+    logging_obj._on_deferred_stream_complete = admit
+    logging_obj._deferred_stream_complete_args = ()
+
+    async def consume() -> tuple[object, ...]:
+        return tuple(
+            [
+                chunk
+                async for chunk in proxy_logging.async_post_call_streaming_iterator_hook(
+                    response=_one_chunk(),
+                    user_api_key_dict=UserAPIKeyAuth(api_key="test-key"),
+                    request_data={"litellm_logging_obj": logging_obj},
+                )
+            ]
+        )
+
+    pending: Final = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        assert not pending.done()
+        assert accepted.empty()
+        release.set()
+        if fail:
+            with pytest.raises(RuntimeError, match="admission failed"):
+                await pending
+            assert accepted.empty()
+        else:
+            assert await pending == ("chunk",)
+            assert accepted.get_nowait() == "required-stream"
+            assert accepted.empty()
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        await drain_logging_tasks(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drain_waits_for_background_served_stream_logging(
+    proxy_logging: ProxyLogging, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.responses.streaming_iterator import drain_logging_tasks
+
+    class IteratorHook(CustomLogger):
+        async def async_post_call_streaming_iterator_hook(
+            self, user_api_key_dict: UserAPIKeyAuth, response: AsyncIterator[object], request_data: dict[str, object]
+        ) -> AsyncGenerator[object, None]:
+            async for chunk in response:
+                yield chunk
+
+    monkeypatch.setattr(litellm, "callbacks", [IteratorHook()])
+    entered: Final = asyncio.Event()
+    release: Final = asyncio.Event()
+    logged: Final = asyncio.Event()
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="openai/test-model",
+        messages=[],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime(2026, 1, 1),
+        litellm_call_id="background-stream",
+        function_id="background-stream",
+    )
+
+    async def log() -> None:
+        entered.set()
+        await release.wait()
+        logged.set()
+
+    logging_obj._on_deferred_stream_complete = log
+    logging_obj._deferred_stream_complete_args = ()
+    served: Final = [
+        chunk
+        async for chunk in proxy_logging.async_post_call_streaming_iterator_hook(
+            response=_one_chunk(),
+            user_api_key_dict=UserAPIKeyAuth(api_key="test-key"),
+            request_data={"litellm_logging_obj": logging_obj},
+        )
+    ]
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    drain: Final = asyncio.create_task(drain_logging_tasks(timeout=5))
+    try:
+        await asyncio.sleep(0)
+        assert served == ["chunk"]
+        assert not drain.done()
+        assert not logged.is_set()
+        release.set()
+        await drain
+        assert logged.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(drain, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_async_post_call_streaming_iterator_hook_upstream_error_raises(
+    proxy_logging, make_user_api_key_auth, mock_callbacks_disabled
+):
     async def gen():
         if False:
             yield  # pragma: no cover

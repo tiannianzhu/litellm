@@ -3,15 +3,18 @@ completion_start_time on the first chunk so downstream TTFT consumers
 (Prometheus, OTEL, SpendLogs completionStartTime) do not fall back to
 completion_start_time = end_time."""
 
-import asyncio, importlib
+import asyncio
 import functools
 import gc
+import importlib
 import json
 import threading
 import time
 import weakref
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from contextlib import suppress
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Final, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -28,6 +31,7 @@ from litellm.litellm_core_utils.core_helpers import UPSTREAM_USAGE_COST, billed_
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.responses.transformation import BaseResponsesAPIConfig
 from litellm.llms.openai.responses.transformation import OpenAIResponsesAPIConfig
+from litellm.responses import streaming_iterator as streaming_module
 from litellm.responses.streaming_iterator import (
     CachedResponsesAPIStreamingIterator,
     MockResponsesAPIStreamingIterator,
@@ -42,12 +46,9 @@ from litellm.types.llms.openai import (
     ResponsesAPIStreamEvents,
     ResponsesAPIStreamingResponse,
 )
-from contextlib import suppress
-from litellm.responses import streaming_iterator as streaming_module
 from litellm.responses.utils import ResponsesAPIRequestUtils
-from litellm.types.utils import CallTypes
+from litellm.types.utils import CallTypes, Usage
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
-from types import SimpleNamespace
 
 
 def _sse_event(payload: dict) -> bytes:
@@ -1841,6 +1842,7 @@ def setup_and_teardown():
 
 
 class _FakeLoggingObj:
+    requires_success_await: Final = False
     def __init__(self):
         self.success_calls = 0
         self.async_success_calls = 0
@@ -3317,3 +3319,137 @@ def test_synthetic_stream_serializes_every_event_position_from_zero(output: list
 
     payloads: Final = tuple(json.loads(event.model_dump_json()) for event in events)
     assert [payload.get("sequence_number") for payload in payloads] == list(range(len(payloads)))
+
+
+class _DurableResponsesRecorder(CustomLogger):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+        self.fail = fail
+        self.calls = 0
+        self.usage: Usage | None = None
+
+    @property
+    def requires_success_await(self) -> bool:
+        return True
+
+    async def async_log_success_event(
+        self, kwargs: Mapping[str, object], response_obj: object, start_time: datetime, end_time: datetime
+    ) -> None:
+        self.calls += 1
+        self.usage = TypeAdapter(Usage).validate_python(kwargs.get("standard_logging_object"))
+        self.started.set()
+        await self.release.wait()
+        if self.fail:
+            raise RuntimeError("controlled accounting failure")
+        self.finished.set()
+
+
+def _durable_responses_iterator(
+    recorder: _DurableResponsesRecorder, surface: str
+) -> ResponsesAPIStreamingIterator | MockResponsesAPIStreamingIterator | CachedResponsesAPIStreamingIterator:
+    model: Final = "controlled-accounting-model"
+    response: Final = ResponsesAPIResponse(
+        id="resp_accounting",
+        created_at=0,
+        status="completed",
+        model=model,
+        object="response",
+        output=[],
+        usage=ResponseAPIUsage(input_tokens=7, output_tokens=11, total_tokens=18),
+    )
+    logging_obj: Final = LiteLLMLoggingObj(
+        model=model,
+        messages=[],
+        stream=True,
+        call_type="aresponses",
+        start_time=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        litellm_call_id="responses-accounting",
+        function_id="responses-accounting",
+        dynamic_async_success_callbacks=[recorder],
+    )
+    config: Final = OpenAIResponsesAPIConfig()
+    if surface == "cached":
+        return CachedResponsesAPIStreamingIterator(response=response, logging_obj=logging_obj)
+    if surface == "synthetic":
+        return MockResponsesAPIStreamingIterator(
+            response=httpx.Response(200, json=response.model_dump()),
+            model=model,
+            responses_api_provider_config=config,
+            logging_obj=logging_obj,
+        )
+    return ResponsesAPIStreamingIterator(
+        response=httpx.Response(
+            200,
+            content=_sse_event({"type": "response.completed", "response": response.model_dump()}),
+        ),
+        model=model,
+        responses_api_provider_config=config,
+        logging_obj=logging_obj,
+        custom_llm_provider="openai",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("native", "synthetic", "cached"))
+@pytest.mark.parametrize("fail", (False, True))
+async def test_responses_terminal_event_waits_for_durable_accounting(surface: str, fail: bool) -> None:
+    recorder: Final = _DurableResponsesRecorder(fail=fail)
+    iterator: Final = _durable_responses_iterator(recorder, surface)
+
+    async def terminal_event() -> object:
+        async for event in iterator:
+            if isinstance(event, ResponseCompletedEvent):
+                return event
+        raise AssertionError("terminal event was dropped")
+
+    pending: Final = asyncio.create_task(terminal_event())
+    try:
+        await asyncio.wait_for(recorder.started.wait(), timeout=5)
+        assert not pending.done()
+        recorder.release.set()
+        if fail:
+            with pytest.raises(RuntimeError, match="controlled accounting failure"):
+                await asyncio.wait_for(pending, timeout=5)
+        else:
+            await asyncio.wait_for(pending, timeout=5)
+            assert recorder.finished.is_set()
+        assert recorder.calls == 1
+        assert recorder.usage is not None
+        assert (recorder.usage.prompt_tokens, recorder.usage.completion_tokens) == (7, 11)
+    finally:
+        recorder.release.set()
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError):
+                await pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ("native", "synthetic", "cached"))
+async def test_responses_cancellation_waits_for_obtained_usage_accounting(surface: str) -> None:
+    recorder: Final = _DurableResponsesRecorder()
+    iterator: Final = _durable_responses_iterator(recorder, surface)
+
+    async def consume() -> None:
+        async for _ in iterator:
+            pass
+
+    pending: Final = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(recorder.started.wait(), timeout=5)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+        recorder.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, timeout=5)
+        assert recorder.finished.is_set()
+        assert recorder.calls == 1
+    finally:
+        recorder.release.set()
+        if not pending.done():
+            with suppress(asyncio.CancelledError):
+                await pending

@@ -109,7 +109,8 @@
     "end"
   ],
   "enqueue_logging": [
-    "coroutine"
+    "coroutine",
+    "logger"
   ],
   "restore_context": [
     "logger"

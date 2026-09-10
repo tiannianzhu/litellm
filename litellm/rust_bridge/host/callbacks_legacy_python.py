@@ -80,6 +80,10 @@ _ASYNC_CALLS: Final[weakref.WeakSet[Logging]] = weakref.WeakSet()
 def _begin_call(call_setup: CallSetup, asynchronous: bool) -> CallSetup:
     if asynchronous:
         _ASYNC_CALLS.add(call_setup.logger)
+        if call_setup.logger.call_type == "anthropic_messages":
+            from litellm.rust_bridge.messages.entrypoints import register_messages_logging
+
+            register_messages_logging(call_setup.logger)
     else:
         _ASYNC_CALLS.discard(call_setup.logger)
     return _claim_budget_reservation(call_setup, asynchronous)
@@ -129,6 +133,10 @@ def finalize(
 class LoggingSurface(Protocol):
     deferred_success_result: tuple[object, datetime.datetime, datetime.datetime] | None
     enqueue_deferred_logging: Callable[[], None] | None
+    success_accounting_task: asyncio.Task[object] | None
+
+    @property
+    def requires_success_await(self) -> bool: ...
 
     @property
     def model_call_details(self) -> Mapping[str, object]: ...
@@ -486,7 +494,14 @@ def cache_hit_success(logger: Logging, response: object, start: datetime.datetim
         )
 
 
-def enqueue_logging(coroutine: Coroutine[object, object, None]) -> None:
+def enqueue_logging(coroutine: Coroutine[object, object, None], logger: LoggingSurface) -> None:
+    if logger.requires_success_await:
+        from litellm.responses.streaming_iterator import spawn_logging_task
+
+        logger.success_accounting_task = spawn_logging_task(
+            asyncio.get_running_loop(), coroutine, task_name="native success accounting"
+        )
+        return
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
     worker: Final = cast(  # cast-ok: bounded adapter for the untyped logging worker
@@ -618,6 +633,13 @@ def _proxy_request(logger: LoggingSurface) -> object:
     return logger.litellm_params.get("proxy_server_request")
 
 
+async def _disconnected_proxy_stream_logging(coroutine: Coroutine[object, object, None], logger: Logging) -> None:
+    from litellm.llms.anthropic.messages.native.streaming_iterator import record_proxy_disconnect
+
+    await record_proxy_disconnect(logger)
+    await coroutine
+
+
 def stream_success(
     logger: Logging,
     url_route: str,
@@ -668,12 +690,15 @@ def stream_success(
 
         executor.submit(contextvars.copy_context().run, asyncio.run, coroutine)
         return
+    if stream_teardown and logger.requires_success_await and _proxy_request(logger):
+        enqueue_logging(_disconnected_proxy_stream_logging(coroutine, logger), logger)
+        return
     cancelled: Final = asyncio.current_task()
     if stream_teardown and cancelled is not None and _cancelling(cancelled) and _proxy_request(logger):
         # the proxy's disconnect cleanup runs later in this task and stamps the 499 error_information this row carries
-        cancelled.add_done_callback(lambda _: enqueue_logging(coroutine))
+        cancelled.add_done_callback(lambda _: enqueue_logging(coroutine, logger))
         return
-    enqueue_logging(coroutine)
+    enqueue_logging(coroutine, logger)
 
 
 def _log_superseded_stream_failure(
@@ -701,7 +726,8 @@ def _log_superseded_stream_failure(
             logger.dispatch_attempt_failure_handlers(  # pyright: ignore[reportArgumentType]  # the dispatch snapshots now, its coroutine never receives a sent value
                 anthropic_error_frame_exception(error_type, message, status_code, str(logger.model)),
                 traceback.format_exc(),
-            )
+            ),
+            logger,
         )
     except Exception as e:  # noqa: BLE001  # the stream's failure scheduling logs and drops its own failure
         verbose_proxy_logger.error("Error scheduling stream failure logging: %s", e)

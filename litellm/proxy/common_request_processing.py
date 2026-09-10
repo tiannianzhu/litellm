@@ -457,7 +457,7 @@ def _apply_client_disconnect_metadata(target_metadata: dict[str, object] | None)
     target_metadata["error_information"] = dict(_CLIENT_DISCONNECTED_ERROR_INFORMATION)
 
 
-async def _record_streaming_client_disconnect_if_needed(
+async def record_streaming_client_disconnect_if_needed(
     request: Request | None,
     request_data: dict,
     client_disconnected: bool = False,
@@ -4137,7 +4137,9 @@ class ProxyBaseLLMRequestProcessing:
                 if requested_model_from_client:
                     self.data["_litellm_client_requested_model"] = requested_model_from_client
 
-                if _post_call_guardrails_active:
+                if _post_call_guardrails_active or (
+                    route_type == "anthropic_messages" and logging_obj.requires_success_await is True
+                ):
                     self._arm_deferred_stream_dispatch(
                         response=response,
                         route_type=route_type,
@@ -4351,6 +4353,10 @@ class ProxyBaseLLMRequestProcessing:
                 logging_obj=logging_obj,
                 exception_raised=_exception_raised,
             )
+            if not _exception_raised and logging_obj.requires_success_await is True:
+                if logging_obj.call_type in ("ocr", "aocr"):
+                    await logging_obj.async_success_handler(response)
+                await logging_obj.await_success_accounting()
 
             # Streaming cleanup: if an exception occurred AND the deferred
             # streaming closure is still set, no streaming route will
@@ -5181,9 +5187,15 @@ class ProxyBaseLLMRequestProcessing:
         async def _on_deferred_native_stream_complete(*args: object) -> None:
             match args:
                 case (BilledRoundsDispatch(dispatch=logging_coroutine),):
-                    GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
+                    if _captured_native_logging_obj.requires_success_await is True:
+                        await logging_coroutine
+                    else:
+                        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
                 case (logging_coroutine,) if asyncio.iscoroutine(logging_coroutine):
-                    GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
+                    if _captured_native_logging_obj.requires_success_await is True:
+                        await logging_coroutine
+                    else:
+                        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=logging_coroutine)
                 case _ if (success := parked_success(args)) is not None:
                     await success.dispatch(_captured_native_logging_obj)
                 case _:
@@ -5257,22 +5269,24 @@ class ProxyBaseLLMRequestProcessing:
                 # callbacks fire regardless of the call-type heuristic in
                 # _is_sync_litellm_request (which only recognizes a subset of
                 # async markers stored in litellm_params).
-                spawn_logging_task(
-                    asyncio.get_running_loop(),
-                    _as_success_dispatcher(captured_logging_obj).dispatch_success_handlers(
-                        run.response,
-                        cache_hit=cache_hit,
-                        start_time=None,
-                        end_time=None,
-                        prefer_async_handlers=True,
-                    ),
-                    task_name="Deferred stream success log",
+                success: Final = _as_success_dispatcher(captured_logging_obj).dispatch_success_handlers(
+                    run.response,
+                    cache_hit=cache_hit,
+                    start_time=None,
+                    end_time=None,
+                    prefer_async_handlers=True,
                 )
+                if captured_logging_obj.requires_success_await is True:
+                    await success
+                else:
+                    spawn_logging_task(asyncio.get_running_loop(), success, task_name="Deferred stream success log")
             except Exception as e:
                 verbose_proxy_logger.exception(
                     "Error in deferred streaming success logging: %s",
                     e,
                 )
+                if captured_logging_obj.requires_success_await is True:
+                    raise
 
     @staticmethod
     async def _deferred_stream_guardrail(
@@ -5552,7 +5566,7 @@ class ProxyBaseLLMRequestProcessing:
             should_record_client_disconnect: Final = client_disconnected or (not stream_completed)
             recorded_client_disconnect = False
             if should_record_client_disconnect:
-                recorded_client_disconnect = await _record_streaming_client_disconnect_if_needed(
+                recorded_client_disconnect = await record_streaming_client_disconnect_if_needed(
                     request,
                     request_data,
                     client_disconnected,
@@ -5560,7 +5574,7 @@ class ProxyBaseLLMRequestProcessing:
             if recorded_client_disconnect:
                 await _bill_in_flight_round_on_disconnect(_REQUEST_FIELDS.validate_python(request_data))
                 deferred_stream_logging_armed: Final = _deferred_stream_logging_is_armed(request_data)
-                ProxyLogging.fire_deferred_stream_logging(request_data)
+                await ProxyLogging.await_deferred_stream_logging(request_data)
                 # A disconnect-time success event (the deferred-guardrail flush
                 # above, or the partial-spend billing below) releases the
                 # request's max_parallel_requests slot through the limiter's
@@ -5599,6 +5613,8 @@ class ProxyBaseLLMRequestProcessing:
                 and logging_obj.model_call_details.get("prompt_cache_response_complete") is not True
             ):
                 await logging_obj.invalidate_baseline_cache_estimate("incomplete_response", completed=True)
+            if isinstance(logging_obj, LiteLLMLoggingObj) and logging_obj.requires_success_await is True:
+                await logging_obj.await_success_accounting()
 
     _finalize_streaming_generator_cleanup = finalize_streaming_generator_cleanup
 
@@ -5732,6 +5748,8 @@ class ProxyBaseLLMRequestProcessing:
             # Starlette closes on disconnect, so the nested iterator hook (which
             # only sees GeneratorExit on GC) cannot own the refund.
             client_disconnected = not stream_completed
+            if client_disconnected:
+                await record_streaming_client_disconnect_if_needed(request, request_data, True)
             await close_guarded_stream(guarded_stream)
             if not delivered_chunk and not withheld_provider_output(response):
                 from litellm.proxy.spend_tracking.budget_reservation import (

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Final
+from typing import Final, Literal
 
 import httpx
 import pytest
@@ -213,6 +213,7 @@ class _HeldFlushSink:
     def __init__(self) -> None:
         self.started: Final = asyncio.Event()
         self.release: Final = asyncio.Event()
+        self.finished: Final = asyncio.Event()
         self.flushes: Final[list[bool]] = []  # mutable-ok: records each flush that ran to completion
 
     def set_instance(self, info: InstanceInfo) -> None: ...
@@ -225,8 +226,11 @@ class _HeldFlushSink:
 
     async def flush(self) -> None:
         self.started.set()
-        await self.release.wait()
-        self.flushes.append(True)
+        try:
+            await self.release.wait()
+            self.flushes.append(True)
+        finally:
+            self.finished.set()
 
 
 @pytest.mark.asyncio
@@ -248,6 +252,58 @@ async def test_stop_during_an_export_lets_that_export_finish() -> None:
     held.release.set()
     await stopping
     assert len(held.flushes) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ("cancel", "deadline", "expired"))
+async def test_interrupted_stop_cancels_exports_and_request_finalizers(
+    interruption: Literal["cancel", "deadline", "expired"],
+) -> None:
+    runtime: Final = TelemetryRuntime()
+    await runtime.start(
+        litellm_version="1.0.0",
+        settings=TelemetrySettings(groups="heartbeat", endpoint=_ENDPOINT, destination=TelemetryDestination.HTTP),
+        flush_interval_s=0.001,
+        db=lambda: None,
+        register=lambda _logger: None,
+        http_client=_offline,
+    )
+    held: Final = _HeldFlushSink()
+    runtime.sink = ConsentGatedSink(held, _HEARTBEAT)
+    finalizer_started: Final = asyncio.Event()
+    finalizer_release: Final = asyncio.Event()
+    finalizer_finished: Final = asyncio.Event()
+
+    async def finalize() -> None:
+        finalizer_started.set()
+        try:
+            await finalizer_release.wait()
+        finally:
+            finalizer_finished.set()
+
+    runtime.spawn(finalize())
+    try:
+        await asyncio.wait_for(held.started.wait(), timeout=5)
+        await asyncio.wait_for(finalizer_started.wait(), timeout=5)
+        if interruption == "cancel":
+            stopping: Final = asyncio.create_task(runtime.stop())
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            stopping.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(stopping, timeout=5)
+        else:
+            deadline: Final = asyncio.get_running_loop().time() + (0.01 if interruption == "deadline" else -1)
+            with pytest.raises(asyncio.TimeoutError):
+                await runtime.stop(shutdown_deadline=deadline)
+        assert (runtime.sink, runtime.store, held.finished.is_set(), finalizer_finished.is_set()) == (
+            None, None, True, True
+        )
+    finally:
+        held.release.set()
+        finalizer_release.set()
+        await asyncio.wait_for(runtime.stop(), timeout=5)
 
 
 async def test_settle_timeout_reads_the_configured_value_after_start_and_the_default_before() -> None:

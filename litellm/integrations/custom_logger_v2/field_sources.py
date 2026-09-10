@@ -1,5 +1,5 @@
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Final, TypeAlias
 
@@ -118,7 +118,14 @@ class SourcedFields(LiveFields):
         if not rest.ops:
             return self
         inner: Final = apply_patch(self._inner, rest)
-        return self if inner is self._inner else SourcedFields(inner, self._sources, self._args, self._cache)
+        args: Final = replace(
+            self._args,
+            request=inner.get(Field.deprecated_kwargs, self._args.request),
+            result=inner.get(Field.deprecated_response_obj, self._args.result),
+        )
+        if inner is self._inner and args.request is self._args.request and args.result is self._args.result:
+            return self
+        return SourcedFields(inner, self._sources, args, self._cache)
 
     def _write(self, op: PatchOp) -> None:
         write: Final = self._sources[op.field].write

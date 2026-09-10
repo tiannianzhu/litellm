@@ -48,6 +48,7 @@ def _unarmed_logging_obj(model: str = "unknown"):
     obj = MagicMock()
     obj._on_deferred_stream_complete = None
     obj.model = model
+    obj.requires_success_await = False
     return obj
 
 

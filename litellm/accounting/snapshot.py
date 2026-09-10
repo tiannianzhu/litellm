@@ -1,4 +1,5 @@
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
 
@@ -14,6 +15,9 @@ from litellm.proxy.spend_tracking.customer_cost_margin import customer_margin_sh
 from litellm.proxy.spend_tracking.savings import SavingsSpend, compute_savings_spend, marks_gateway_injection
 
 if TYPE_CHECKING:
+    from litellm.proxy.db.autorouter_session_rollup import AutoRouterTurnTransaction
+    from litellm.proxy.db.baseline_accounting import BaselineAccountingRecord
+    from litellm.proxy.db.spend_log_tool_index import ToolUsageTransaction
     from litellm.router import Router
 
 _FIELDS: Final = TypeAdapter(dict[str, object])
@@ -75,6 +79,9 @@ def build_accounting_payload(
     model_access_groups: Sequence[str],
     windows: Sequence[Mapping[str, object]],
     router: "Callable[[], Router | None]",
+    tools: "ToolUsageTransaction | None" = None,
+    autorouter: "AutoRouterTurnTransaction | None" = None,
+    baseline: "BaselineAccountingRecord | None" = None,
 ) -> Mapping[str, object]:
     metadata: Final = _FIELDS.validate_json(payload["metadata"])
     savings: Final = _savings_or_zero(payload, metadata, router)
@@ -91,6 +98,9 @@ def build_accounting_payload(
         },
         "accounting_model_access_groups": model_access_groups,
         "accounting_windows": windows,
+        "accounting_tools": None if tools is None else asdict(tools),
+        "accounting_autorouter": None if autorouter is None else asdict(autorouter),
+        "accounting_baseline": None if baseline is None else baseline.model_dump(mode="json"),
     }
     return _FIELDS.validate_python(
         safe_json_structure(
