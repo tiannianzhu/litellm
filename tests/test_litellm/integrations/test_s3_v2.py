@@ -1323,13 +1323,33 @@ def test_s3_object_key_at_the_byte_limit_is_left_alone():
     from litellm.integrations.s3 import get_s3_object_key
 
     start_time = datetime(2026, 8, 24, 6, 18, 41, 948021)
-    fixed_len = len("input/2026-08-24/.json")
+    s3_path = "/".join("p" * 252 for _ in range(3))
+    fixed_len = len(f"{s3_path}/2026-08-24/.json")
     file_name = "x" * (MAX_S3_OBJECT_KEY_BYTES - fixed_len)
 
-    key = get_s3_object_key(s3_path="input", prefix="", start_time=start_time, s3_file_name=file_name)
+    key = get_s3_object_key(s3_path=s3_path, prefix="", start_time=start_time, s3_file_name=file_name)
 
-    assert key == f"input/2026-08-24/{file_name}.json"
+    assert key == f"{s3_path}/2026-08-24/{file_name}.json"
     assert len(key.encode("utf-8")) == MAX_S3_OBJECT_KEY_BYTES
+
+
+@pytest.mark.parametrize("file_name", ["x" * 250, "x" * 251, "resp_" + "A" * 384, "日" * 84])
+def test_s3_object_key_bounds_file_name_below_total_key_limit(file_name: str):
+    import hashlib
+
+    from litellm.integrations.s3 import get_s3_object_key
+
+    start_time = datetime(2026, 9, 10)
+    key = get_s3_object_key("input", "team/", start_time, file_name)
+    assert len(key.rsplit("/", 1)[-1].encode("utf-8")) <= 255
+    assert key.startswith("input/team/2026-09-10/")
+    assert key == get_s3_object_key("input", "team/", start_time, file_name)
+    if len(file_name.encode("utf-8")) <= 250:
+        assert key == f"input/team/2026-09-10/{file_name}.json"
+    else:
+        assert key.endswith(f"_{hashlib.sha256(file_name.encode('utf-8')).hexdigest()}.json")
+        assert key != get_s3_object_key("input", "team/", start_time, file_name + "b")
+        assert "\ufffd" not in key
 
 
 def test_s3_object_key_is_bounded_for_oversized_response_id():
@@ -1507,12 +1527,12 @@ def test_s3_object_key_keeps_a_single_segment_path_as_far_as_it_fits():
     assert key.startswith("a" * 900)
 
 
-def test_create_s3_batch_logging_element_bounds_key_and_keeps_full_response_id():
+@pytest.mark.parametrize("response_id", ["resp_" + "A" * 384, _oversized_response_id()])
+def test_create_s3_batch_logging_element_bounds_key_and_keeps_full_response_id(response_id: str):
     """The batch element bounds the key and keeps the full response id in the payload."""
     from litellm.constants import MAX_S3_OBJECT_KEY_BYTES
 
     logger = S3Logger(s3_use_team_prefix=True, s3_use_key_prefix=True)
-    response_id = _oversized_response_id()
     payload = StandardLoggingPayload(
         id=response_id,
         metadata={"user_api_key_team_alias": "DefaultTeamProd", "user_api_key_alias": "prod-key"},
@@ -1523,6 +1543,7 @@ def test_create_s3_batch_logging_element_bounds_key_and_keeps_full_response_id()
 
     assert result is not None
     assert len(result.s3_object_key.encode("utf-8")) <= MAX_S3_OBJECT_KEY_BYTES
+    assert len(result.s3_object_key.rsplit("/", 1)[-1].encode("utf-8")) <= 255
     assert result.s3_object_key.startswith("DefaultTeamProd/prod-key/2026-08-24/")
     assert result.payload["id"] == response_id
 
