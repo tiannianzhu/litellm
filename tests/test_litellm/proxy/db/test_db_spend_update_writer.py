@@ -697,8 +697,6 @@ async def test_update_tag_db_with_valid_tags():
     """
     Test that _update_tag_db correctly processes valid tags and adds them to the spend update queue.
     """
-    from litellm.proxy._types import Litellm_EntityType, SpendUpdateQueueItem
-
     writer = DBSpendUpdateWriter()
     mock_prisma = MagicMock()
     response_cost = 0.05
@@ -3145,6 +3143,32 @@ async def test_ordinary_spend_admission_can_retry_failed_or_cancelled_enqueue(en
 
 
 @pytest.mark.asyncio
+async def test_optional_tool_metrics_cancellation_preserves_admitted_accounting():
+    writer = DBSpendUpdateWriter()
+    prisma = _tool_usage_prisma()
+    payload = {
+        **_minimal_spend_payload(),
+        "call_type": "acompletion",
+        "status": "success",
+        "mcp_namespaced_tool_name": "test_tool",
+    }
+    await prisma._tool_usage_transactions_lock.acquire()
+    update = asyncio.create_task(_update_database_with(writer, prisma, payload))
+    try:
+        queued = await asyncio.wait_for(writer.spend_update_queue.update_queue.get(), timeout=1)
+        assert queued["entity_type"] == Litellm_EntityType.USER
+        assert queued["entity_id"] == "test-user"
+        assert queued["response_cost"] == 0.25
+        assert not update.done()
+    finally:
+        update.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await update
+        prisma._tool_usage_transactions_lock.release()
+        await asyncio.gather(*tuple(writer._batch_database_update_tasks))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("inserted", "existing", "charged"),
     [
@@ -3383,6 +3407,123 @@ async def test_update_database_queues_every_other_spend_row_for_the_next_flush(p
     prisma.db.litellm_spendlogs.create_many.assert_not_called()
     assert prisma.spend_log_transactions == [payload]
     assert db_writer._batch_database_updates.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flush_waits_for_pending_enqueue_before_flushing_rollups():
+    db_writer = DBSpendUpdateWriter()
+    prisma = _spend_logs_prisma(1, None)
+    enqueue_started = asyncio.Event()
+    allow_enqueue = asyncio.Event()
+    calls: list[str] = []  # mutable-ok: records shutdown ordering
+
+    async def delayed_enqueue(**kwargs):
+        enqueue_started.set()
+        await allow_enqueue.wait()
+        calls.append("enqueue")
+
+    db_writer._batch_database_updates = AsyncMock(side_effect=delayed_enqueue)
+    assert await _update_database_with(db_writer, prisma, _logged_batch_cost_payload()) is True
+    await enqueue_started.wait()
+
+    db_writer.db_update_spend_transaction_handler = AsyncMock(side_effect=lambda **_: calls.append("rollups"))
+    import litellm.proxy.utils as utils_mod
+
+    with patch.object(  # test-quality-ok: [TQ008] Isolate scheduler dispatch while exercising the real enqueue/shutdown race
+        utils_mod, "update_daily_tag_spend", AsyncMock(side_effect=lambda **_: calls.append("tags"))
+    ):
+        shutdown_task = asyncio.create_task(
+            db_writer.flush_spend_updates_on_shutdown(prisma_client=prisma, proxy_logging_obj=MagicMock())
+        )
+        await asyncio.sleep(0)
+        assert calls == []
+
+        allow_enqueue.set()
+        await shutdown_task
+
+    assert calls == ["enqueue", "rollups", "tags"]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flush_reports_a_completed_enqueue_failure():
+    db_writer = DBSpendUpdateWriter()
+    prisma = _spend_logs_prisma(1, None)
+
+    async def failed_enqueue(**kwargs):
+        raise RuntimeError("enqueue failed")
+
+    db_writer._batch_database_updates = AsyncMock(side_effect=failed_enqueue)
+    assert await _update_database_with(db_writer, prisma, _logged_batch_cost_payload()) is True
+    await asyncio.sleep(0)
+
+    db_writer.db_update_spend_transaction_handler = AsyncMock()
+    import litellm.proxy.utils as utils_mod
+
+    with patch.object(  # test-quality-ok: [TQ008] Observe whether enqueue failure prevents the independent tag drain
+        utils_mod, "update_daily_tag_spend", AsyncMock()
+    ) as tags:
+        with pytest.raises(RuntimeError, match="before shutdown"):
+            await db_writer.flush_spend_updates_on_shutdown(prisma_client=prisma, proxy_logging_obj=MagicMock())
+
+    db_writer.db_update_spend_transaction_handler.assert_awaited_once()
+    tags.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_flush_still_drains_tags_when_other_rollups_fail():
+    import litellm.proxy.utils as utils_mod
+
+    db_writer = DBSpendUpdateWriter()
+    db_writer.db_update_spend_transaction_handler = AsyncMock(side_effect=RuntimeError("rollup write failed"))
+    with patch.object(  # test-quality-ok: [TQ008] Observe the independent tag drain after the regular writer raises
+        utils_mod, "update_daily_tag_spend", AsyncMock()
+    ) as tags:
+        with pytest.raises(RuntimeError, match="rollup write failed"):
+            await db_writer.flush_spend_updates_on_shutdown(
+                prisma_client=MagicMock(), proxy_logging_obj=MagicMock()
+            )
+
+    tags.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_spend_update_commits_do_not_overlap():
+    from litellm.proxy.db.db_transaction_queue.redis_update_buffer import RedisUpdateBuffer
+
+    db_writer = DBSpendUpdateWriter()
+    commit_started = asyncio.Event()
+    allow_commit = asyncio.Event()
+    calls: list[str] = []  # mutable-ok: records concurrent commits
+
+    async def blocked_commit(**kwargs):
+        calls.append("start")
+        commit_started.set()
+        await allow_commit.wait()
+        calls.append("finish")
+
+    db_writer._commit_spend_updates_to_db_without_redis_buffer = AsyncMock(side_effect=blocked_commit)
+
+    with patch.object(  # test-quality-ok: [TQ008] Select the in-memory configuration while exercising real commit serialization
+        RedisUpdateBuffer, "_should_commit_spend_updates_to_redis", return_value=False
+    ):
+        first = asyncio.create_task(
+            db_writer.db_update_spend_transaction_handler(
+                prisma_client=MagicMock(), n_retry_times=3, proxy_logging_obj=MagicMock()
+            )
+        )
+        await commit_started.wait()
+        second = asyncio.create_task(
+            db_writer.db_update_spend_transaction_handler(
+                prisma_client=MagicMock(), n_retry_times=3, proxy_logging_obj=MagicMock()
+            )
+        )
+        await asyncio.sleep(0)
+        assert calls == ["start"]
+
+        allow_commit.set()
+        await asyncio.gather(first, second)
+
+    assert calls == ["start", "finish", "start", "finish"]
 
 
 @pytest.mark.asyncio

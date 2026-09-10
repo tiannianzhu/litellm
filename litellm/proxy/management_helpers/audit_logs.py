@@ -21,6 +21,12 @@ from litellm.repositories.table_repositories import AuditLogRepository
 from litellm.types.utils import StandardAuditLogPayload
 
 _audit_log_callback_cache: Final[dict[str, CustomLogger]] = {}
+
+
+def get_cached_audit_log_callbacks() -> tuple[CustomLogger, ...]:
+    return tuple(_audit_log_callback_cache.values())
+
+
 ALLOW_LITELLM_CHANGED_BY_HEADER_METADATA_KEY: Final = "allow_litellm_changed_by_header"
 
 
