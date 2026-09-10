@@ -293,6 +293,11 @@ else:
     _GENERIC_API_LOGGER_CLS: Final = GenericAPILogger
 _in_memory_loggers: Final[list[CustomLogger]] = []
 
+
+def get_initialized_custom_loggers() -> tuple[CustomLogger, ...]:
+    return tuple(_in_memory_loggers)
+
+
 _STANDARD_LOGGING_METADATA_RESOLVED_KEYS: Final[frozenset[str]] = frozenset(("used_client_oauth_token", "usage_object"))
 _STANDARD_LOGGING_METADATA_KEYS: Final[frozenset[str]] = (
     frozenset(StandardLoggingMetadata.__annotations__.keys()) - _STANDARD_LOGGING_METADATA_RESOLVED_KEYS
