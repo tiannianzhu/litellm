@@ -7,7 +7,7 @@ plus the LiteLLM_DailyToolSpend rollup in one transaction.
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Final
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -285,6 +285,26 @@ def _transaction(
 
 
 class TestFlushToolUsageTransactions:
+    @pytest.mark.parametrize(
+        ("request_id", "oversized_tool"),
+        (("request", "界" * 1000), ("r" * 2020, "a_tool_name_that_exceeds_the_remaining_key_budget")),
+        ids=("utf8-tool", "composite-key"),
+    )
+    async def test_oversized_tool_statistics_do_not_discard_other_tools(
+        self, request_id: str, oversized_tool: str
+    ) -> None:
+        prisma, batcher = _prisma_with_batcher()
+        names: Final = ("tool_a", oversized_tool, "tool_b")
+        transaction: Final = _transaction(request_id, tool_names=names, spend=0.3, total_tokens=9)
+        await flush_tool_usage_transactions(prisma_client=prisma, transactions=(transaction,))
+
+        assert _index_rows_written(prisma) == [(request_id, "tool_a"), (request_id, "tool_b")]
+        assert tuple(
+            call.kwargs["where"]["date_tool_name"]["tool_name"]
+            for call in batcher.litellm_dailytoolspend.upsert.call_args_list
+        ) == ("tool_a", "tool_b")
+        assert transaction.tool_names == names
+
     @pytest.mark.asyncio
     async def test_multi_tool_request_attributes_full_spend_to_each_tool(self):
         prisma, batcher = _prisma_with_batcher()

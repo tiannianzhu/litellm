@@ -3802,8 +3802,8 @@ class SpendLogsPayload(TypedDict):
     end_user: str | None
     requester_ip_address: str | None
     custom_llm_provider: str | None
-    messages: str | list | dict | None
-    response: str | list | dict | None
+    messages: ReadOnly[str | list[JsonValue] | dict[str, JsonValue] | None]
+    response: ReadOnly[str | list[JsonValue] | dict[str, JsonValue] | None]
     proxy_server_request: str | None
     session_id: str | None
     request_duration_ms: int | None

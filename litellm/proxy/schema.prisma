@@ -762,6 +762,21 @@ model LiteLLM_SpendLogs {
   @@index([api_key, startTime])
 }
 
+model LiteLLM_SpendAccountingEvent {
+  event_key    String   @id
+  request_id   String
+  status       String
+  call_type    String
+  spend        Float
+  version      Int
+  payload_json String?
+  created_at   DateTime @default(now())
+  processed_at DateTime?
+
+  @@index([request_id, status], map: "LiteLLM_SpendAccountingEvent_request_status_idx")
+  @@index([processed_at, created_at, event_key], map: "LiteLLM_SpendAccountingEvent_pending_idx")
+}
+
 model LiteLLM_SearchQuota {
   day      DateTime @client.Date
   identity String

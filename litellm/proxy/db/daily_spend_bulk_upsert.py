@@ -70,7 +70,7 @@ def daily_spend_entity_ids(payload: Mapping[str, object], entity: DailySpendEnti
         return tuple(dict.fromkeys(tags))
     if value is None:
         return (None,) if entity == "user" else ()
-    if not isinstance(value, str) or (entity == "end_user" and not value):
+    if not isinstance(value, str) or (entity in ("org", "end_user") and not value):
         return ()
     return (value,)
 

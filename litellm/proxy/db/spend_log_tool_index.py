@@ -18,12 +18,14 @@ import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from itertools import chain, groupby
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from typing_extensions import LiteralString
 
+from litellm._logging import verbose_proxy_logger
 from litellm.constants import SPEND_LOG_WRITE_BATCH_MAX_BYTES, SPEND_LOG_WRITE_BATCH_MAX_ROWS
 from litellm.proxy._types import DB_RETRY_SAFE_ERROR_TYPES
 from litellm.proxy.common_utils.timezone_utils import get_daily_spend_date
@@ -44,6 +46,23 @@ class ToolUsageTransaction:
     tool_names: tuple[str, ...]
     spend: float
     total_tokens: int
+
+
+_TOOL_INDEX_KEY_MAX_BYTES: Final = 2048
+
+
+def indexable_tool_names(transaction: ToolUsageTransaction) -> tuple[str, ...]:
+    prefix_bytes: Final = max(len(transaction.request_id.encode()), len(transaction.date.encode()), 8)
+    names: Final = tuple(
+        name for name in transaction.tool_names if prefix_bytes + len(name.encode()) <= _TOOL_INDEX_KEY_MAX_BYTES
+    )
+    if len(names) != len(transaction.tool_names):
+        verbose_proxy_logger.warning(
+            "Skipped %d oversized tool statistics identifiers for request fingerprint %s",
+            len(transaction.tool_names) - len(names),
+            sha256(transaction.request_id.encode()).hexdigest()[:16],
+        )
+    return names
 
 
 def response_tool_call_names(completion_response: object) -> tuple[str, ...]:
@@ -196,13 +215,20 @@ async def flush_tool_usage_transactions(
     if not transactions:
         return
 
-    index_rows: Final = [
-        {"request_id": txn.request_id, "tool_name": tool_name, "start_time": txn.start_time}
-        for txn in transactions
-        for tool_name in txn.tool_names
-    ]
+    indexed: Final = tuple((txn, indexable_tool_names(txn)) for txn in transactions)
+    index_rows: Final = tuple(
+        chain.from_iterable(
+            (
+                {"request_id": txn.request_id, "tool_name": tool_name, "start_time": txn.start_time}
+                for tool_name in names
+            )
+            for txn, names in indexed
+        )
+    )
     per_tool_day: Final = sorted(
-        ((txn.date, tool_name, txn.spend, txn.total_tokens) for txn in transactions for tool_name in txn.tool_names),
+        chain.from_iterable(
+            ((txn.date, tool_name, txn.spend, txn.total_tokens) for tool_name in names) for txn, names in indexed
+        ),
         key=lambda entry: (entry[0], entry[1]),
     )
 

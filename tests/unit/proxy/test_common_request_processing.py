@@ -5508,7 +5508,7 @@ class TestStreamingClientDisconnectLogging:
             ProxyBaseLLMRequestProcessing,
         )
 
-        fire_spy = MagicMock()
+        fire_spy = MagicMock(return_value=None)
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
             fire_spy,
@@ -5542,7 +5542,7 @@ class TestStreamingClientDisconnectLogging:
             ProxyBaseLLMRequestProcessing,
         )
 
-        fire_spy = MagicMock()
+        fire_spy = MagicMock(return_value=None)
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
             fire_spy,
@@ -5576,7 +5576,7 @@ class TestStreamingClientDisconnectLogging:
 
         monkeypatch.setattr(
             "litellm.proxy.utils.ProxyLogging.fire_deferred_stream_logging",
-            MagicMock(),
+            MagicMock(return_value=None),
         )
 
         async def mock_streaming_iterator(*_args, **_kwargs):
@@ -8567,6 +8567,71 @@ class TestPreCallWithFallbacksOnLocalRateLimit:
 
         assert data["model"] == fallback_model
         assert rig[3] == [primary_model, primary_model, fallback_model]
+
+@pytest.mark.asyncio
+async def test_deferred_billed_rounds_wait_for_durable_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    from litellm.litellm_core_utils.litellm_logging import BilledRoundsDispatch, BilledRoundsSpend
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.types.utils import ModelResponse, Usage
+
+    class AdmissionLogger(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered: Final = asyncio.Event()
+            self.release: Final = asyncio.Event()
+            self.accepted: tuple[object, ...] = ()
+
+        @property
+        def requires_success_await(self) -> bool:
+            return True
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object,
+            start_time: datetime.datetime, end_time: datetime.datetime,
+        ) -> None:
+            self.entered.set()
+            await self.release.wait()
+            self.accepted = (*self.accepted, response_obj)
+
+    for registry in ("callbacks", "success_callback", "_async_success_callback"):
+        monkeypatch.setattr(litellm, registry, [])
+    admission: Final = AdmissionLogger()
+    logging_obj: Final = LiteLLMLoggingObj(
+        model="hosted_vllm/fixture", messages=[], stream=True, call_type="aresponses",
+        start_time=datetime.datetime(2026, 1, 1), litellm_call_id="deferred-billed-rounds",
+        function_id="deferred-billed-rounds", dynamic_async_success_callbacks=[admission],
+    )
+    assembled: Final = ModelResponse(
+        model="hosted_vllm/fixture", usage=Usage(prompt_tokens=8, completion_tokens=4, total_tokens=12),
+    )
+
+    async def stream() -> AsyncGenerator[bytes, None]:
+        yield b"data: response\n\n"
+
+    async def dispatch() -> None:
+        await logging_obj.dispatch_success_handlers(assembled, cache_hit=False, prefer_async_handlers=True)
+
+    response: Final = stream()
+    ProxyBaseLLMRequestProcessing(data={})._arm_deferred_stream_dispatch(
+        response=response, route_type="aresponses", user_api_key_dict=ProxyUserAPIKeyAuth(), logging_obj=logging_obj,
+    )
+    logging_obj._deferred_stream_complete_args = (
+        BilledRoundsDispatch(dispatch(), BilledRoundsSpend(assembled.usage, 0.75, None)),
+    )
+    task: Final = asyncio.create_task(ProxyLogging.await_deferred_stream_logging({"litellm_logging_obj": logging_obj}))
+    try:
+        await asyncio.wait_for(admission.entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        assert not task.done()
+        admission.release.set()
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        assert admission.accepted == (assembled,)
+    finally:
+        admission.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await GLOBAL_LOGGING_WORKER.flush()
+        await response.aclose()
+
 
 class _RecordingSuccessLogger(CustomLogger):
     def __init__(self):
