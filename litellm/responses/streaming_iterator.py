@@ -182,6 +182,11 @@ def _log_background_task_failure(task: asyncio.Task[object], *, task_name: str) 
 _PENDING_LOGGING_TASKS: Final[set[asyncio.Task[object]]] = set()  # mutable-ok: strong refs to pending logging tasks
 
 
+async def drain_pending_responses_logging_tasks() -> None:
+    while _PENDING_LOGGING_TASKS:
+        await asyncio.wait(tuple(_PENDING_LOGGING_TASKS))
+
+
 def _running_loop() -> asyncio.AbstractEventLoop | None:
     try:
         return asyncio.get_running_loop()
