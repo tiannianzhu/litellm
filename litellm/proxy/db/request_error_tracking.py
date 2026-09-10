@@ -328,8 +328,18 @@ async def flush_request_errors(
             accumulator.restore(cancelled.uncommitted)
             raise
         return
+    push_task: Final = asyncio.create_task(redis_buffer.push(snapshot))
     try:
-        await redis_buffer.push(snapshot)
+        await asyncio.shield(push_task)
+    except asyncio.CancelledError:
+        while not push_task.done():
+            try:
+                await asyncio.wait((push_task,))
+            except asyncio.CancelledError:
+                pass
+        if push_task.cancelled() or push_task.exception() is not None:
+            accumulator.restore(snapshot)
+        raise
     except Exception:  # noqa: BLE001 -- a failed push must not stop the scheduler
         accumulator.restore(snapshot)
         verbose_proxy_logger.warning(

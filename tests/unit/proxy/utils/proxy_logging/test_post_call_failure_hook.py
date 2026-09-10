@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from types import MappingProxyType
 from typing import Final
@@ -18,6 +18,7 @@ import litellm
 from litellm.constants import PROXY_REJECTED_BEFORE_ROUTING_KEY
 from litellm.exceptions import GuardrailRaisedException
 from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.proxy._types import ProxyErrorTypes, UserAPIKeyAuth
 from litellm.proxy.utils import REJECTED_BEFORE_REQUEST_SETUP, REJECTED_BEFORE_REQUEST_SETUP_KEY, ProxyLogging
 from litellm.types.utils import CachingDetails
@@ -888,6 +889,46 @@ async def test_terminal_baseline_cleanup_ignores_missing_or_untrusted_logging(
 # ---------------------------------------------------------------------------
 # _handle_logging_proxy_only_error
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller_fields", "retained_id"),
+    (
+        ({}, None),
+        ({"litellm_call_id": None}, None),
+        ({"litellm_call_id": ""}, None),
+        ({"litellm_call_id": 17}, None),
+        ({"litellm_call_id": "caller-id"}, "caller-id"),
+    ),
+)
+async def test_proxy_only_error_keeps_one_valid_id_across_request_and_logging(
+    proxy_logging: ProxyLogging, caller_fields: Mapping[str, object], retained_id: str | None
+) -> None:
+    request_data: Final[dict[str, object]] = {
+        "model": "fixture-model",
+        "messages": [],
+        "metadata": {"private_payload": "body-only-sensitive-value"},
+        **caller_fields,
+    }
+    await proxy_logging._handle_logging_proxy_only_error(
+        request_data=request_data,
+        user_api_key_dict=UserAPIKeyAuth(request_route="/v1/chat/completions"),
+        route="/v1/chat/completions",
+        original_exception=HTTPException(status_code=401, detail="expired key"),
+        error_type=ProxyErrorTypes.auth_error,
+    )
+
+    call_id: Final = request_data.get("litellm_call_id")
+    logging_obj: Final = request_data.get("litellm_logging_obj")
+    assert isinstance(call_id, str) and call_id
+    assert isinstance(logging_obj, Logging)
+    assert logging_obj.litellm_call_id == call_id
+    payload: Final = logging_obj.model_call_details["standard_logging_object"]
+    assert payload["id"] == call_id
+    assert "private_payload" not in payload["metadata"]
+    if retained_id is not None:
+        assert call_id == retained_id
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -367,6 +368,36 @@ async def test_reseed_outside_the_scope_still_re_checks_redis_itself():
 
 
 POST_CALL_KEYS = TOKEN_KEYS | {"spend:tag:prod", "spend:model_access_group:premium"}
+
+
+@pytest.mark.asyncio
+async def test_durable_accounting_counter_is_applied_before_commit_and_cannot_reappear_after_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm._internal_context import post_response_phase
+    from litellm.caching.redis_batch import flush_post_call_redis_batches, request_redis_batch_scope
+    from litellm.proxy.db.db_spend_update_writer import accounting_windows_persisted
+
+    class AccountingRedis(CountingRedis):
+        async def async_delete_cache(self, key: str, **kwargs: object) -> None:
+            self.store.pop(key, None)
+
+    key: Final = "spend:key:accounting-contract"
+    redis: Final = AccountingRedis({key: 1.0})
+    monkeypatch.setattr(ps, "spend_counter_cache", _spend_counter_cache(redis))
+    monkeypatch.setattr(ps, "prisma_client", None)
+    token: Final = accounting_windows_persisted.set(True)
+    try:
+        with request_redis_batch_scope(), post_response_phase():
+            await ps.increment_spend_counters(
+                token="accounting-contract", team_id=None, user_id=None, response_cost=0.5
+            )
+            assert redis.store[key] == 1.5
+            await ps.invalidate_spend_counter(key)
+            await flush_post_call_redis_batches()
+            assert key not in redis.store
+    finally:
+        accounting_windows_persisted.reset(token)
 
 
 @pytest.mark.asyncio

@@ -67,6 +67,10 @@ class CustomLogger:  # https://docs.litellm.ai/docs/observability/custom_callbac
     # Class variables or attributes
     server_fulfilled_tool_names: ClassVar[frozenset[str]] = frozenset()
 
+    @property
+    def requires_success_await(self) -> bool:
+        return False
+
     enforces_request_content: bool = False
     """
     Whether this hook's ``async_pre_call_hook`` judges the request payload itself.

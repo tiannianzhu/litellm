@@ -4186,9 +4186,12 @@ class ProxyLogging:
             user_api_key_dict=user_api_key_dict
         )
         if litellm_logging_obj is None:
-            from litellm._uuid import uuid
+            from litellm.proxy.common_request_processing import resolve_litellm_call_id
 
-            request_data.setdefault("litellm_call_id", str(uuid.uuid4()))
+            caller_call_id: Final = request_fields.get("litellm_call_id")
+            request_data.update(
+                litellm_call_id=resolve_litellm_call_id(caller_call_id if isinstance(caller_call_id, str) else None)
+            )
 
             litellm_logging_obj, data = litellm.utils.function_setup(
                 original_function=route or "IGNORE_THIS",
@@ -4780,9 +4783,9 @@ class ProxyLogging:
                 raise
             except Exception as e:
                 if not ProxyLogging._discard_deferred_stream_logging_for_failure(request_data, e):
-                    ProxyLogging.fire_deferred_stream_logging(request_data)
+                    await ProxyLogging.await_deferred_stream_logging(request_data)
                 raise
-            ProxyLogging.fire_deferred_stream_logging(request_data)
+            await ProxyLogging.await_deferred_stream_logging(request_data)
             return
 
         from litellm.proxy.proxy_server import llm_router
@@ -4869,7 +4872,7 @@ class ProxyLogging:
         except Exception as e:
             await ProxyLogging._record_served_stream_output(request_data, served_chunks)
             if not ProxyLogging._discard_deferred_stream_logging_for_failure(request_data, e):
-                ProxyLogging.fire_deferred_stream_logging(request_data)
+                await ProxyLogging.await_deferred_stream_logging(request_data)
             raise
 
         # Fire deferred logging AFTER all guardrail end-of-stream blocks
@@ -4877,7 +4880,7 @@ class ProxyLogging:
         # its end-of-stream block (inside current_response), so by the time
         # we reach this point the metadata is fully populated.
         await ProxyLogging._record_served_stream_output(request_data, served_chunks)
-        ProxyLogging.fire_deferred_stream_logging(request_data)
+        await ProxyLogging.await_deferred_stream_logging(request_data)
 
     async def async_post_call_event_stream_iterator_hook(
         self,
@@ -5140,7 +5143,7 @@ class ProxyLogging:
         record_served_output_texts(logging_obj.model_call_details, texts)
 
     @staticmethod
-    def fire_deferred_stream_logging(request_data: dict) -> None:
+    def fire_deferred_stream_logging(request_data: dict) -> asyncio.Task[object] | None:
         """
         Fire the deferred streaming logging callback after the full streaming
         pipeline (including guardrail end-of-stream blocks) has completed.
@@ -5159,7 +5162,20 @@ class ProxyLogging:
         if _deferred_cb is not None and _args is not None:
             logging_obj._on_deferred_stream_complete = None
             logging_obj._deferred_stream_complete_args = None
-            asyncio.create_task(_deferred_cb(*_args))
+            task: Final = asyncio.create_task(_deferred_cb(*_args))
+            if getattr(logging_obj, "requires_success_await", False) is True:
+                return task
+        return None
+
+    @staticmethod
+    async def await_deferred_stream_logging(request_data: dict) -> None:
+        task: Final = ProxyLogging.fire_deferred_stream_logging(request_data)
+        if task is not None:
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await asyncio.shield(task)
+                raise
 
     _fire_deferred_stream_logging = fire_deferred_stream_logging
 
@@ -8617,6 +8633,7 @@ async def update_spend(
     spend_logs: list,
     """
     n_retry_times: Final = 3
+    await proxy_logging_obj.db_spend_update_writer.flush_accounting(prisma_client)
     await proxy_logging_obj.db_spend_update_writer.db_update_spend_transaction_handler(
         prisma_client=prisma_client,
         n_retry_times=n_retry_times,
@@ -9014,11 +9031,14 @@ async def monitor_spend_logs_queue(
 
     while True:
         try:
+            accounting_rows = await proxy_logging_obj.db_spend_update_writer.flush_accounting(prisma_client)
             await recover_parked_spend_logs(prisma_client, proxy_logging_obj)
             # Check queue sizes with lock protection; the tool usage queue keeps
             # the monitor firing when a prior failed run left it nonempty.
             queue_size = await _total_queued_spend_transactions(prisma_client)
 
+            if accounting_rows:
+                current_interval = base_interval
             if queue_size > 0:
                 if queue_size >= threshold:
                     verbose_proxy_logger.debug(
@@ -9048,6 +9068,9 @@ async def monitor_spend_logs_queue(
                 await flush_baseline_accounting(prisma_client)
                 current_interval = min(current_interval * backoff_multiplier, max_backoff)
 
+            if accounting_rows == 20:
+                await asyncio.sleep(0)
+                continue
             if await _wait_for_spend_log_flush_request(flush_requested, current_interval):
                 current_interval = base_interval
         except Exception as e:

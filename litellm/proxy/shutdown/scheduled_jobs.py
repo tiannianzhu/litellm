@@ -46,6 +46,7 @@ async def stop_in_flight_scheduler_jobs(
     *,
     finish_timeout_seconds: float = SCHEDULED_JOB_SHUTDOWN_FINISH_TIMEOUT_SECONDS,
     cancel_timeout_seconds: float = SCHEDULED_JOB_SHUTDOWN_CANCEL_TIMEOUT_SECONDS,
+    shutdown_deadline: float | None = None,
 ) -> None:
     """
     Let in-flight jobs finish for up to finish_timeout_seconds, then stop the scheduler and wait, bounded by
@@ -56,24 +57,32 @@ async def stop_in_flight_scheduler_jobs(
     """
     if not scheduler.running:
         return
+    finish_timeout: Final = (
+        finish_timeout_seconds
+        if shutdown_deadline is None
+        else min(finish_timeout_seconds, max(0.0, shutdown_deadline - asyncio.get_running_loop().time()) / 2)
+    )
     in_flight: Final = executor.in_flight_jobs()
     if in_flight:
         verbose_proxy_logger.info(
             "Waiting up to %ss for %d in-flight scheduled job(s) to finish",
-            finish_timeout_seconds,
+            finish_timeout,
             len(in_flight),
         )
-    still_running: Final = (
-        (await asyncio.wait(in_flight, timeout=finish_timeout_seconds))[1] if in_flight else frozenset()
-    )
+    still_running: Final = (await asyncio.wait(in_flight, timeout=finish_timeout))[1] if in_flight else frozenset()
     scheduler.shutdown(wait=False)
     if not still_running:
         return
     verbose_proxy_logger.info("Cancelling %d in-flight scheduled job(s) for shutdown", len(still_running))
-    _done, pending = await asyncio.wait(still_running, timeout=cancel_timeout_seconds)
+    cancel_timeout: Final = (
+        cancel_timeout_seconds
+        if shutdown_deadline is None
+        else min(cancel_timeout_seconds, max(0.0, shutdown_deadline - asyncio.get_running_loop().time()))
+    )
+    _done, pending = await asyncio.wait(still_running, timeout=cancel_timeout)
     if pending:
         verbose_proxy_logger.warning(
             "%d scheduled job(s) did not finish within %ss of cancellation; giving up on them",
             len(pending),
-            cancel_timeout_seconds,
+            cancel_timeout,
         )

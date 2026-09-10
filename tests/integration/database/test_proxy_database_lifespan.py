@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
 
@@ -24,6 +25,7 @@ CONFIG: Final = (
     "  disable_prisma_schema_update: true\n"
     "  disable_spend_logs: true\n"
     "  disable_model_info_refresh: true\n"
+    "  accounting_capture: {flush_interval_seconds: 10}\n"
 )
 
 
@@ -47,7 +49,11 @@ async def _assert_lifespan_closed() -> None:
     from litellm.proxy import proxy_server
 
     await asyncio.sleep(0)
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
     assert proxy_server.prisma_client is None
+    assert proxy_server.usage_capture.meter is None
+    assert Logging.usage_capture_callback is None
     assert (
         tuple(
             task.get_coro().__qualname__
@@ -64,6 +70,7 @@ async def _assert_lifespan_closed() -> None:
 async def _exercise_lifespans(mode: Mode) -> None:
     from litellm.proxy import proxy_server
     from litellm.proxy.auth.master_key_boot_check import UnsafeMasterKeyError
+    from litellm.proxy.spend_tracking.usage_capture import capture_callback
 
     expected: Final = UnsafeMasterKeyError if mode == "unsafe" else ValueError
     match: Final = "master key" if mode == "unsafe" else "use_redis_transaction_buffer"
@@ -76,6 +83,8 @@ async def _exercise_lifespans(mode: Mode) -> None:
     with pytest.MonkeyPatch.context() as environment:
         environment.setenv("LITELLM_MASTER_KEY", f"sk-{uuid.uuid4().hex}")
         for cancel in (False, True, False):
+            request_id: Final = f"lifespan-{uuid.uuid4().hex}"
+            attempt_id: Final = f"{request_id}-attempt"
             try:
                 async with proxy_server.proxy_startup_event(proxy_server.app) as state:
                     database: Final = state["database"]
@@ -84,12 +93,27 @@ async def _exercise_lifespans(mode: Mode) -> None:
                     assert await database.prisma.writer_db.query_raw("SELECT 42 AS answer") == [{"answer": 42}]
                     assert await database.prisma.read_db.query_raw("SELECT 43 AS answer") == [{"answer": 43}]
                     assert psutil.Process().children(recursive=True)
+                    meter: Final = proxy_server.usage_capture.meter
+                    assert meter is not None
+                    capture_callback(
+                        meter,
+                        {"call_type": "acompletion", "litellm_call_id": request_id, "litellm_params": {}},
+                        {"id": attempt_id, "usage": {"total_tokens": 3}},
+                        datetime(2026, 1, 1),
+                        datetime(2026, 1, 1),
+                    )
                     if cancel:
                         raise asyncio.CancelledError
             except asyncio.CancelledError:
                 if not cancel:
                     raise
             await _assert_lifespan_closed()
+            persisted: Final = await asyncio.to_thread(
+                read_rows,
+                'SELECT event_id FROM "LiteLLM_AccountingEvent" WHERE event_id IN (%s, %s) ORDER BY event_id',
+                (f"{request_id}:inbound", attempt_id),
+            )
+            assert {row["event_id"] for row in persisted} == {f"{request_id}:inbound", attempt_id}
 
 
 @pytest.mark.parametrize("mode", ("late", "unsafe"))

@@ -103,7 +103,12 @@ class PassThroughStreamingHandler:
         success_logging: Callable[[], Coroutine[None, None, None]],
     ) -> None:
         if error_event is None:
-            GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success_logging())
+            success: Final = success_logging()
+            if litellm_logging_obj.requires_success_await is True:
+                bind_budget_reservation_to_callbacks(litellm_logging_obj.litellm_params)
+                await success
+            else:
+                GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success)
             return
         error_type, message, status_code = error_event
         await PassThroughStreamingHandler.schedule_stream_failure_logging(
@@ -306,6 +311,8 @@ class PassThroughStreamingHandler:
                     )
                 except Exception as e:
                     verbose_proxy_logger.error("Error scheduling chunk_processor logging: %s", e)
+                    if litellm_logging_obj.requires_success_await is True:
+                        raise
                 else:
                     bind_budget_reservation_to_callbacks(litellm_logging_obj.litellm_params)
 
@@ -420,6 +427,8 @@ class PassThroughStreamingHandler:
             )
         except Exception as e:
             verbose_proxy_logger.error("Error in _route_streaming_logging_to_handler: %s", e)
+            if litellm_logging_obj.requires_success_await is True:
+                raise
 
     _route_streaming_logging_to_handler = route_streaming_logging_to_handler
 

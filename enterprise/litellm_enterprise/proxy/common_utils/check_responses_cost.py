@@ -201,11 +201,13 @@ async def log_billed_background_response(billed: BilledBackgroundResponse) -> Bi
     cost: Final = logging_obj.response_cost_calculator(result=unpriced)
     end_time: Final = datetime.now()
     logging_obj.capture_usage_before_logging(unpriced, logging_obj.start_time, end_time)
-    GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(
-        async_coroutine=logging_obj.async_success_handler(
-            result=unpriced, start_time=logging_obj.start_time, end_time=end_time
-        )
+    success_logging: Final = logging_obj.async_success_handler(
+        result=unpriced, start_time=logging_obj.start_time, end_time=end_time
     )
+    if logging_obj.requires_success_await:
+        await success_logging
+    else:
+        GLOBAL_LOGGING_WORKER.ensure_initialized_and_enqueue(async_coroutine=success_logging)
     logging_obj.handle_sync_success_callbacks_for_async_calls(
         result=unpriced, start_time=logging_obj.start_time, end_time=end_time
     )
