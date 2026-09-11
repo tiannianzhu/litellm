@@ -505,6 +505,37 @@ def _make_standard_logging_payload_with_usage_object(usage_object: dict) -> Stan
     )
 
 
+@pytest.mark.parametrize(
+    ("request_call_type", "logged_call_type", "expected"),
+    [
+        (None, "acompletion", "acompletion"),
+        ("", "anthropic_messages", "anthropic_messages"),
+        (None, "aresponses", "aresponses"),
+        ("acompletion", "aresponses", "acompletion"),
+        (None, None, ""),
+    ],
+)
+def test_failure_payload_preserves_call_type(
+    request_call_type: str | None, logged_call_type: str | None, expected: str
+) -> None:
+    standard_log: Final = create_dummy_standard_logging_payload() if logged_call_type is not None else None
+    if standard_log is not None and logged_call_type is not None:
+        standard_log["call_type"] = logged_call_type
+    now: Final = datetime.datetime.now(timezone.utc)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-model",
+            "call_type": request_call_type,
+            "standard_logging_object": standard_log,
+            "litellm_params": {"metadata": {"status": "failure"}},
+        },
+        response_obj=RuntimeError("provider failed"),
+        start_time=now,
+        end_time=now,
+    )
+    assert payload["call_type"] == expected
+
+
 def test_get_logging_payload_preserves_standard_logging_client_disconnect_error_information():
     standard_logging_payload: Final = create_dummy_standard_logging_payload()
     error_information: Final = {

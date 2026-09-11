@@ -1128,7 +1128,8 @@ async def test_callback_handles_every_status_the_interactions_api_can_return():
 
 
 @pytest.mark.asyncio
-async def test_async_post_call_failure_hook_propagates_trace_id_from_logging_obj():
+@pytest.mark.parametrize("call_type", ["acompletion", "anthropic_messages", "aresponses"])
+async def test_async_post_call_failure_hook_propagates_trace_id_from_logging_obj(call_type: str):
     """
     When an LLM call fails, the proxy calls post_call_failure_hook with
     request_data that doesn't contain standard_logging_object. But the
@@ -1150,6 +1151,7 @@ async def test_async_post_call_failure_hook_propagates_trace_id_from_logging_obj
     # the standard_logging_object (as set by _failure_handler_helper_fn)
     mock_logging_obj = MagicMock()
     mock_logging_obj.litellm_trace_id = "trace-id-from-logging-obj"
+    mock_logging_obj.call_type = call_type
     mock_logging_obj.model_call_details = {
         "standard_logging_object": {
             "trace_id": "trace-id-from-logging-obj",
@@ -1184,6 +1186,7 @@ async def test_async_post_call_failure_hook_propagates_trace_id_from_logging_obj
         assert call_kwargs["standard_logging_object"]["trace_id"] == "trace-id-from-logging-obj"
         # litellm_trace_id should also be propagated as a fallback
         assert call_kwargs.get("litellm_trace_id") == "trace-id-from-logging-obj"
+        assert call_kwargs["call_type"] == call_type
 
 
 @pytest.mark.asyncio

@@ -361,7 +361,10 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
     litellm_params: Final = kwargs.get("litellm_params", {})
     metadata: Final = get_litellm_metadata_from_kwargs(kwargs)
     completion_start_time: Final = kwargs.get("completion_start_time", end_time)
-    call_type: Final = kwargs.get("call_type")
+    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
+    call_type: Final = kwargs.get("call_type") or (
+        standard_logging_payload.get("call_type") if standard_logging_payload is not None else None
+    )
     cache_hit: Final = kwargs.get("cache_hit", False)
 
     # Convert response_obj to dict first
@@ -392,7 +395,6 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
         usage = _combined_usage.model_dump()
 
     id = get_spend_logs_id(call_type or "acompletion", response_obj_dict, kwargs)
-    standard_logging_payload: Final = cast(StandardLoggingPayload | None, kwargs.get("standard_logging_object", None))
 
     end_user_id = get_end_user_id_for_cost_tracking(litellm_params)
 

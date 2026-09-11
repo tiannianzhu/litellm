@@ -220,6 +220,9 @@ class _ProxyDBLogger(CustomLogger):
         # instance so the failure row carries the same trace_id Langfuse received.
         _litellm_logging_obj: Final = request_data.get("litellm_logging_obj")
         if _litellm_logging_obj is not None:
+            logging_call_type: Final = getattr(_litellm_logging_obj, "call_type", None)
+            if not request_data.get("call_type") and isinstance(logging_call_type, str):
+                request_data["call_type"] = logging_call_type
             if not request_data.get("standard_logging_object"):
                 request_data["standard_logging_object"] = getattr(_litellm_logging_obj, "model_call_details", {}).get(
                     "standard_logging_object"
