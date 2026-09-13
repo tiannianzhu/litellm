@@ -584,3 +584,39 @@ def test_watsonx_chat_tools_are_rewritten_without_touching_the_callers_tool() ->
         }
     ]
     assert tools == tools_before
+
+
+def test_watsonx_tools_remove_strict_switch_and_preserve_strict_parameter() -> None:
+    tools: Final = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"strict": {"type": "boolean"}},
+                    "required": ["strict"],
+                },
+            },
+        }
+    ]
+    original_tools: Final = copy.deepcopy(tools)
+    optional_params: Final = IBMWatsonXChatConfig().map_openai_params(
+        non_default_params={"tools": tools}, optional_params={}, model="ibm/granite-4-h-small", drop_params=False
+    )
+
+    assert optional_params["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"strict": {"type": "boolean"}},
+                    "required": ["strict"],
+                },
+            },
+        }
+    ]
+    assert tools == original_tools

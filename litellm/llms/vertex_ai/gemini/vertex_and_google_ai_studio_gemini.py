@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Optional, Proto
 
 import httpx
 from pydantic import JsonValue, TypeAdapter, ValidationError
+from pydantic_core import to_jsonable_python
 from typing_extensions import ReadOnly, TypedDict
 
 import litellm
@@ -806,6 +807,17 @@ class VertexAIBaseConfig:
         ]
 
 
+def _validated_function_definition(value: JsonValue) -> ChatCompletionToolParamFunctionChunk:
+    definition: Final = TypeAdapter(dict[str, JsonValue]).validate_python(value)
+    return TypeAdapter(ChatCompletionToolParamFunctionChunk).validate_python(
+        {
+            key: {"type": "object"} if key == "parameters" and item == "" else item
+            for key, item in definition.items()
+            if key != "parameters" or item is not None
+        }
+    )
+
+
 class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
     """
     Reference: https://cloud.google.com/vertex-ai/docs/generative-ai/chat/test-chat-prompts
@@ -1331,22 +1343,22 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         google_maps_retrieval_config: dict | None = None
         computerUse: dict | None = None
         # remove 'additionalProperties' from tools
-        schema_value: Final[JsonValue] = deepcopy(cast(JsonValue, value))  # cast-ok: tools are JSON request data
+        schema_value: Final[JsonValue] = TypeAdapter[JsonValue](JsonValue).validate_python(to_jsonable_python(value))
+        inlined_tools: Final = _with_namespace_members_inlined(schema_value, outside_declarations)
         parameters_json_schemas: Final = _parameters_json_schemas(
-            _with_namespace_members_inlined(schema_value, outside_declarations),
+            inlined_tools,
             allow_parameters_json_schema,
             _function_names_forced_by(tool_choice, [*_listed(schema_value), *_listed(outside_declarations)]),
         )
-        remove_additional_properties(schema_value)
-        # remove 'strict' from tools
-        remove_strict_from_schema(schema_value)
+        supported_schema: Final = remove_additional_properties(inlined_tools)
+        supported_tools: Final = TypeAdapter(list[dict[str, JsonValue]]).validate_python(
+            remove_strict_from_schema(supported_schema)
+        )
 
-        inlined_tools: Final = _with_namespace_members_inlined(schema_value, outside_declarations)
-        for index, parameters_json_schema in enumerate(parameters_json_schemas):
-            tool = cast(list[dict], inlined_tools)[index]  # cast-ok: a deep copy keeps the caller's tool shape
+        for tool, parameters_json_schema in zip(supported_tools, parameters_json_schemas, strict=True):
             openai_function_object: ChatCompletionToolParamFunctionChunk | None = None
             if "function" in tool:  # tools list
-                _openai_function_object = ChatCompletionToolParamFunctionChunk(**tool["function"])
+                _openai_function_object = _validated_function_definition(tool["function"])
 
                 if (
                     parameters_json_schema is None
@@ -1361,7 +1373,7 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 openai_function_object = _openai_function_object
 
             elif "name" in tool:  # functions list
-                openai_function_object = ChatCompletionToolParamFunctionChunk(**tool)
+                openai_function_object = _validated_function_definition(tool)
 
             if "type" in tool and tool["type"] == "computer_use":
                 computer_use_config = {k: v for k, v in tool.items() if k != "type"}
@@ -1422,10 +1434,6 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 )
                 _description = openai_function_object.get("description", None)
                 _parameters = openai_function_object.get("parameters", None)
-                if isinstance(_parameters, str) and len(_parameters) == 0:
-                    _parameters = {
-                        "type": "object",
-                    }
                 if _description is not None:
                     gtool_func_declaration["description"] = _description
                 if _parameters is not None and parameters_json_schema is None:
