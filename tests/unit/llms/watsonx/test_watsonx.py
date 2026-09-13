@@ -443,3 +443,59 @@ def test_watsonx_deployment_space_id_embedding(monkeypatch, watsonx_embedding_ca
 
     # nor space_id or project_id is required by wx.ai API when inferencing deployment
     assert "project_id" not in json_data and "space_id" not in json_data
+
+
+def test_watsonx_tools_remove_strict_switch_and_preserve_strict_parameter(monkeypatch):
+    from unittest.mock import patch
+
+    import httpx
+
+    from litellm import completion
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    monkeypatch.setenv("WATSONX_PROJECT_ID", "test-project-id")
+    monkeypatch.setenv("WATSONX_API_BASE", "https://test-api.watsonx.ai")
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"strict": {"type": "boolean"}},
+                    "required": ["strict"],
+                },
+            },
+        }
+    ]
+    client = HTTPHandler()
+    token_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"access_token": "mock_access_token", "expires_in": 3600},
+            )
+        )
+    )
+    monkeypatch.setattr(litellm.module_level_client, "client", token_client)
+
+    with patch.object(client, "post") as mock_post:
+        try:
+            completion(
+                model="watsonx/test-model",
+                messages=[{"role": "user", "content": "Test"}],
+                api_key="test_api_key",
+                client=client,
+                tools=tools,
+            )
+        except Exception as e:
+            print(f"Caught expected exception: {e}")
+        finally:
+            token_client.close()
+
+    request_tools = json.loads(mock_post.call_args.kwargs["data"])["tools"]
+    assert "strict" not in request_tools[0]["function"]
+    assert request_tools[0]["function"]["parameters"] == tools[0]["function"]["parameters"]
+    assert tools[0]["function"]["strict"] is False

@@ -4137,21 +4137,20 @@ def remove_additional_properties(schema: _SchemaT) -> _SchemaT:
 
     Relevant Issues: https://github.com/BerriAI/litellm/issues/6136, https://github.com/BerriAI/litellm/issues/6088
     """
+    cleaned: Final[_SchemaT] = copy.deepcopy(schema)
+    _remove_additional_properties_from_copy(cleaned)
+    return cleaned
+
+
+def _remove_additional_properties_from_copy(schema: object) -> None:
     if isinstance(schema, dict):
-        # Remove the 'additionalProperties' key if it exists and is set to False
-        if "additionalProperties" in schema and schema["additionalProperties"] is False:
-            del schema["additionalProperties"]
-
-        # Recursively process all dictionary values
-        for key, value in schema.items():
-            remove_additional_properties(value)
-
+        if schema.get("additionalProperties") is False:
+            del schema["additionalProperties"]  # rebind-ok: schema is an owned provider JSON copy
+        for value in schema.values():
+            _remove_additional_properties_from_copy(value)
     elif isinstance(schema, list):
-        # Recursively process all items in the list
         for item in schema:
-            remove_additional_properties(item)
-
-    return schema
+            _remove_additional_properties_from_copy(item)
 
 
 _remove_additional_properties = remove_additional_properties
@@ -4159,23 +4158,35 @@ _remove_additional_properties = remove_additional_properties
 
 def remove_strict_from_schema(schema: _SchemaT) -> _SchemaT:
     """
+    Remove provider-unsupported strict-mode switches without changing the input schema.
+
     Relevant Issues: https://github.com/BerriAI/litellm/issues/6136, https://github.com/BerriAI/litellm/issues/6088
     """
-    if isinstance(schema, dict):
-        # Remove the 'additionalProperties' key if it exists and is set to False
-        if "strict" in schema:
-            del schema["strict"]
+    cleaned: Final[_SchemaT] = copy.deepcopy(schema)
+    json_schema: Final = cleaned.get("json_schema") if isinstance(cleaned, dict) else None
+    if isinstance(cleaned, dict) and cleaned.get("type") == "json_schema" and isinstance(json_schema, dict):
+        if "strict" in json_schema:
+            del json_schema["strict"]
+        return cleaned
+    if isinstance(cleaned, list):
+        for tool in cleaned:
+            _remove_strict_from_tool_copy(tool)
 
-        # Recursively process all dictionary values
-        for key, value in schema.items():
-            remove_strict_from_schema(value)
+    return cleaned
 
-    elif isinstance(schema, list):
-        # Recursively process all items in the list
-        for item in schema:
-            remove_strict_from_schema(item)
 
-    return schema
+def _remove_strict_from_tool_copy(tool: object) -> None:
+    if not isinstance(tool, dict):
+        return
+
+    function: Final[object] = tool.get("function")
+    if isinstance(function, dict) and "name" in function:
+        if "strict" in function:
+            del function["strict"]
+        return
+    if "name" in tool and "parameters" in tool:
+        if "strict" in tool:
+            del tool["strict"]  # rebind-ok: tool is an owned provider JSON copy
 
 
 _remove_strict_from_schema = remove_strict_from_schema
