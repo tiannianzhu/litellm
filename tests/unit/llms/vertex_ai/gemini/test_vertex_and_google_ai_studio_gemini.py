@@ -1233,6 +1233,30 @@ def test_vertex_ai_map_tools():
     assert tools == new_tools
 
 
+def test_vertex_ai_tools_remove_strict_switch_and_preserve_strict_parameter():
+    v = VertexGeminiConfig()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"strict": {"type": "boolean"}},
+                    "required": ["strict"],
+                },
+            },
+        }
+    ]
+
+    mapped_tools = v._map_function(value=tools, optional_params={})
+    parameters = mapped_tools[0]["function_declarations"][0]["parameters"]
+
+    assert parameters == tools[0]["function"]["parameters"]
+    assert tools[0]["function"]["strict"] is False
+
+
 def test_vertex_ai_map_tool_with_anyof():
     """
     Related issue: https://github.com/BerriAI/litellm/issues/11164

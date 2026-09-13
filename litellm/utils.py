@@ -289,7 +289,7 @@ except (ImportError, AttributeError, TypeError):
 claude_json_str = json.dumps(json_data)
 import importlib.metadata
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, TypeVar, cast, runtime_checkable
 
 from typing_extensions import assert_never
 
@@ -4071,48 +4071,66 @@ def get_optional_params_embeddings(
     return final_params
 
 
-def _remove_additional_properties(schema):
+_SchemaT: Final = TypeVar("_SchemaT")
+
+
+def _remove_additional_properties(schema: _SchemaT) -> _SchemaT:
     """
     clean out 'additionalProperties = False'. Causes vertexai/gemini OpenAI API Schema errors - https://github.com/langchain-ai/langchainjs/issues/5240
 
     Relevant Issues: https://github.com/BerriAI/litellm/issues/6136, https://github.com/BerriAI/litellm/issues/6088
     """
+    cleaned: Final[_SchemaT] = copy.deepcopy(schema)
+    _remove_additional_properties_from_copy(cleaned)
+    return cleaned
+
+
+def _remove_additional_properties_from_copy(schema: object) -> None:
     if isinstance(schema, dict):
-        # Remove the 'additionalProperties' key if it exists and is set to False
-        if "additionalProperties" in schema and schema["additionalProperties"] is False:
-            del schema["additionalProperties"]
-
-        # Recursively process all dictionary values
-        for key, value in schema.items():
-            _remove_additional_properties(value)
-
+        if schema.get("additionalProperties") is False:
+            del schema["additionalProperties"]  # rebind-ok: schema is an owned provider JSON copy
+        for value in schema.values():
+            _remove_additional_properties_from_copy(value)
     elif isinstance(schema, list):
-        # Recursively process all items in the list
         for item in schema:
-            _remove_additional_properties(item)
-
-    return schema
+            _remove_additional_properties_from_copy(item)
 
 
-def _remove_strict_from_schema(schema):
+def _remove_strict_from_schema(schema: _SchemaT) -> _SchemaT:
     """
+    Remove provider-unsupported strict-mode switches without changing the input schema.
+
     Relevant Issues: https://github.com/BerriAI/litellm/issues/6136, https://github.com/BerriAI/litellm/issues/6088
     """
-    if isinstance(schema, dict):
-        # Remove the 'additionalProperties' key if it exists and is set to False
-        if "strict" in schema:
-            del schema["strict"]
+    cleaned: Final[_SchemaT] = copy.deepcopy(schema)
+    if (
+        isinstance(cleaned, dict)
+        and cleaned.get("type") == "json_schema"
+        and isinstance(cleaned.get("json_schema"), dict)
+    ):
+        json_schema: Final = cleaned["json_schema"]
+        if "strict" in json_schema:
+            del json_schema["strict"]
+        return cleaned
+    if isinstance(cleaned, list):
+        for tool in cleaned:
+            _remove_strict_from_tool_copy(tool)
 
-        # Recursively process all dictionary values
-        for key, value in schema.items():
-            _remove_strict_from_schema(value)
+    return cleaned
 
-    elif isinstance(schema, list):
-        # Recursively process all items in the list
-        for item in schema:
-            _remove_strict_from_schema(item)
 
-    return schema
+def _remove_strict_from_tool_copy(tool: object) -> None:
+    if not isinstance(tool, dict):
+        return
+
+    function: Final[object] = tool.get("function")
+    if isinstance(function, dict) and "name" in function:
+        if "strict" in function:
+            del function["strict"]
+        return
+    if "name" in tool and "parameters" in tool:
+        if "strict" in tool:
+            del tool["strict"]  # rebind-ok: tool is an owned provider JSON copy
 
 
 def _remove_json_schema_refs(schema, max_depth=10):

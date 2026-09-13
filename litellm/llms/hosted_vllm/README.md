@@ -30,3 +30,11 @@ Some vLLM Chat Completions payloads expose cache creation usage as
 - Remove when: upstream LiteLLM performs this mapping, or vLLM consistently
   emits the standard cache-creation field consumed by LiteLLM
 - Tests: `tests/test_litellm/test_utils.py`
+
+## Tool schemas
+
+Chat Completions forwards function-level `strict` and JSON Schema constraints,
+including nested `additionalProperties: false`, unchanged. Custom-to-function
+conversion also preserves the supplied input schema. Constraint enforcement
+depends on the deployed vLLM version, tool parser, and tool choice; forwarding
+these fields does not guarantee enforcement for every configuration

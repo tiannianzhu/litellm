@@ -79,7 +79,97 @@ from litellm.utils import (
     get_prompt_cache_min_tokens,
     is_cached_message,
     is_prompt_caching_valid_prompt,
+    _remove_strict_from_schema,
 )
+
+
+def test_remove_strict_from_schema_preserves_strict_parameter():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "strict": {
+                            "type": "boolean",
+                            "default": True,
+                            "enum": [True, False],
+                            "examples": [True],
+                        },
+                        "nested": {
+                            "type": "object",
+                            "properties": {
+                                "strict": {"type": "string", "enum": ["yes", "no"]},
+                            },
+                            "required": ["strict"],
+                        },
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"strict": {"type": "integer"}},
+                                "required": ["strict"],
+                            },
+                        },
+                    },
+                    "required": ["strict", "nested", "items"],
+                },
+            },
+        }
+    ]
+
+    cleaned = _remove_strict_from_schema(tools)
+
+    assert "strict" not in cleaned[0]["function"]
+    assert cleaned[0]["function"]["parameters"] == tools[0]["function"]["parameters"]
+    assert tools[0]["function"]["strict"] is False
+
+
+def test_remove_strict_from_schema_removes_response_format_strict():
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {"type": "object", "properties": {"strict": {"type": "boolean"}}},
+        },
+    }
+
+    cleaned = _remove_strict_from_schema(response_format)
+
+    assert "strict" not in cleaned["json_schema"]
+    assert cleaned["json_schema"]["schema"] == response_format["json_schema"]["schema"]
+    assert response_format["json_schema"]["strict"] is True
+
+
+def test_remove_strict_from_schema_removes_legacy_function_strict():
+    functions = [{"name": "run_task", "strict": False, "parameters": {"type": "object"}}]
+
+    cleaned = _remove_strict_from_schema(functions)
+
+    assert "strict" not in cleaned[0]
+    assert cleaned[0]["parameters"] == functions[0]["parameters"]
+    assert functions[0]["strict"] is False
+
+
+def test_remove_strict_from_schema_handles_function_without_parameters():
+    tools = [{"type": "function", "function": {"name": "run_task", "strict": False}}]
+
+    cleaned = _remove_strict_from_schema(tools)
+
+    assert cleaned == [{"type": "function", "function": {"name": "run_task"}}]
+
+
+def test_remove_strict_from_schema_preserves_custom_tools():
+    tools = [{"type": "custom", "custom": {"name": "run_task"}}]
+
+    cleaned = _remove_strict_from_schema(tools)
+
+    assert cleaned == tools
+
 
 # Adds the parent directory to the system path
 
