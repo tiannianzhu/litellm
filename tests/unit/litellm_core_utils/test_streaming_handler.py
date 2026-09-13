@@ -2510,6 +2510,72 @@ async def test_stream_that_sends_no_chunks_keeps_the_default_stop(
     assert [c.choices[0].finish_reason for c in received if c.choices and c.choices[0].finish_reason] == ["stop"]
 
 
+@pytest.mark.asyncio
+async def test_hosted_responses_bridge_propagates_clean_eof_with_partial_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
+    )
+    from litellm.types.llms.openai import OutputTextDeltaEvent, ResponseCompletedEvent
+
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "hosted_vllm/fixture",
+        {"input_cost_per_token": 0.001, "output_cost_per_token": 0.002, "litellm_provider": "hosted_vllm"},
+    )
+    logger: Final = Logging(
+        model="fixture",
+        messages=[{"role": "user", "content": "Hi"}],
+        stream=True,
+        call_type="acompletion",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="hosted-responses-eof",
+        function_id="hosted-responses-eof",
+    )
+    logger.update_environment_variables(
+        model="fixture", optional_params={}, litellm_params={}, custom_llm_provider="hosted_vllm"
+    )
+    chunk: Final = ModelResponseStream(
+        id="chatcmpl-cut",
+        created=1,
+        model="fixture",
+        choices=[StreamingChoices(index=0, delta=Delta(role="assistant", content="partial"))],
+        usage=Usage(prompt_tokens=5, completion_tokens=2, total_tokens=7),
+    )
+    wrapper: Final = CustomStreamWrapper(
+        completion_stream=_as_async(iter((chunk,))),
+        model="fixture",
+        logging_obj=logger,
+        custom_llm_provider="hosted_vllm",
+        stream_options={"include_usage": True},
+    )
+    responses: Final = LiteLLMCompletionStreamingIterator(
+        model="fixture",
+        litellm_custom_stream_wrapper=wrapper,
+        request_input="Hi",
+        responses_api_request={},
+        custom_llm_provider="hosted_vllm",
+    )
+
+    async def events_until_failure() -> AsyncIterator[object]:
+        try:
+            async for event in responses:
+                yield event
+        except MidStreamFallbackError as error:
+            yield error
+
+    events: Final = tuple([event async for event in events_until_failure()])
+    assert isinstance(events[-1], MidStreamFallbackError)
+    assert any(isinstance(event, OutputTextDeltaEvent) and event.delta == "partial" for event in events)
+    assert not any(isinstance(event, ResponseCompletedEvent) for event in events)
+    usage: Final = logger.model_call_details.get("combined_usage_object")
+    assert isinstance(usage, Usage)
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (5, 2, 7)
+    assert logger.model_call_details.get("response_cost") == pytest.approx(0.009)
+    await wrapper.wait_for_failure_logging(timeout=5)
+
+
 _ANTHROPIC_PARTIAL_EVENTS: Final[tuple[dict[str, object], ...]] = (
     {
         "type": "message_start",
@@ -9235,6 +9301,204 @@ async def test_openai_compatible_tool_stream_finish_reason(
             await client.close()
         else:
             client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.parametrize("legacy", [True, False])
+async def test_hosted_raw_stream_normalizes_tool_finish_per_choice(
+    sync_mode: bool, legacy: bool
+) -> None:
+    from litellm.types.utils import ChatCompletionDeltaToolCall, Function
+
+    logger: Final = Logging(
+        model="fixture",
+        messages=[{"role": "user", "content": "Hi"}],
+        stream=True,
+        call_type="completion" if sync_mode else "acompletion",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="hosted-tool-choices",
+        function_id="hosted-tool-choices",
+    )
+    logger.update_environment_variables(
+        model="fixture",
+        optional_params={"n": 2, **({"functions": [{"name": "lookup"}]} if legacy else {})},
+        litellm_params={},
+    )
+    tool: Final = ChatCompletionDeltaToolCall(
+        index=0, id="call-1", type="function", function=Function(name="lookup", arguments='{"query":"x"}')
+    )
+    chunks: Final = (
+        ModelResponseStream(
+            id="chatcmpl-multi",
+            model="fixture",
+            created=1,
+            system_fingerprint="fp-fixture",
+            choices=[
+                StreamingChoices(index=0, delta=Delta(content="hello")),
+                StreamingChoices(index=1, delta=Delta(tool_calls=[tool])),
+            ],
+        ),
+        ModelResponseStream(
+            id="chatcmpl-multi",
+            model="fixture",
+            created=1,
+            choices=[
+                StreamingChoices(index=0, delta=Delta(), finish_reason="stop"),
+                StreamingChoices(index=1, delta=Delta(), finish_reason="stop"),
+            ],
+        ),
+        ModelResponseStream(
+            id="chatcmpl-multi",
+            model="fixture",
+            created=1,
+            choices=[],
+            usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+        ),
+    )
+    wrapper: Final = CustomStreamWrapper(
+        completion_stream=ModelResponseListIterator(model_responses=list(chunks)),
+        model="fixture",
+        logging_obj=logger,
+        custom_llm_provider="hosted_vllm",
+        stream_options={"include_usage": True},
+    )
+
+    received: Final = await _collect(wrapper, sync_mode)
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in received))
+    assert [(choice.index, choice.finish_reason) for choice in choices if choice.finish_reason] == [
+        (0, "stop"),
+        (1, "function_call" if legacy else "tool_calls"),
+    ]
+    assert "".join(choice.delta.content or "" for choice in choices if choice.index == 0) == "hello"
+    tool_choice: Final = next(
+        choice
+        for choice in choices
+        if choice.index == 1 and (choice.delta.function_call is not None or choice.delta.tool_calls)
+    )
+    if legacy:
+        assert tool_choice.delta.function_call is not None
+        assert (tool_choice.delta.function_call.name, tool_choice.delta.function_call.arguments) == (
+            "lookup",
+            '{"query":"x"}',
+        )
+        assert tool_choice.delta.tool_calls is None
+    else:
+        assert tool_choice.delta.tool_calls is not None
+        assert tool_choice.delta.tool_calls[0].id == "call-1"
+    assert received[-1].usage is not None
+    assert received[-1].usage.total_tokens == 5
+    assert {chunk.system_fingerprint for chunk in received} == {"fp-fixture"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.parametrize("complete", [True, False])
+async def test_hosted_multi_choice_eof_requires_each_choice_to_finish(
+    logging_obj: Logging, sync_mode: bool, complete: bool
+) -> None:
+    logging_obj.update_environment_variables(model="gpt-4o", optional_params={"n": 2}, litellm_params={})
+    initial: Final = ModelResponseStream(
+        id="chatcmpl-multi-eof",
+        created=1,
+        model="gpt-4o",
+        choices=[
+            StreamingChoices(index=0, delta=Delta(content="first")),
+            StreamingChoices(index=1, delta=Delta(content="second")),
+        ],
+    )
+    first_finished: Final = ModelResponseStream(
+        id="chatcmpl-multi-eof",
+        created=1,
+        model="gpt-4o",
+        choices=[StreamingChoices(index=0, delta=Delta(), finish_reason="stop")],
+    )
+    second_finished: Final = ModelResponseStream(
+        id="chatcmpl-multi-eof",
+        created=1,
+        model="gpt-4o",
+        choices=[
+            StreamingChoices(index=0, delta=Delta()),
+            StreamingChoices(index=1, delta=Delta(), finish_reason="stop"),
+        ],
+    )
+    usage_chunk: Final = ModelResponseStream(
+        id="chatcmpl-multi-eof",
+        created=1,
+        model="gpt-4o",
+        choices=[],
+        usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+    )
+    chunks: Final = (initial, first_finished, *((second_finished,) if complete else ()), usage_chunk)
+    wrapper: Final = CustomStreamWrapper(
+        completion_stream=ModelResponseListIterator(model_responses=list(chunks)),
+        model="gpt-4o",
+        logging_obj=logging_obj,
+        custom_llm_provider="hosted_vllm",
+        stream_options={"include_usage": True},
+    )
+
+    async def events_until_failure() -> AsyncIterator[object]:
+        try:
+            if sync_mode:
+                for chunk in wrapper:
+                    yield chunk
+            else:
+                async for chunk in wrapper:
+                    yield chunk
+        except MidStreamFallbackError as error:
+            yield error
+
+    events: Final = tuple([event async for event in events_until_failure()])
+    relayed: Final = tuple(event for event in events if isinstance(event, ModelResponseStream))
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in relayed))
+    assert [(choice.index, choice.finish_reason) for choice in choices if choice.finish_reason] == (
+        [(0, "stop"), (1, "stop")] if complete else [(0, "stop")]
+    )
+    if complete:
+        assert not isinstance(events[-1], MidStreamFallbackError)
+        assert relayed[-1].usage is not None and relayed[-1].usage.total_tokens == 5
+        return
+    assert isinstance(events[-1], MidStreamFallbackError)
+    assert all(getattr(chunk, "usage", None) is None for chunk in relayed)
+    usage: Final = logging_obj.model_call_details.get("combined_usage_object")
+    assert isinstance(usage, Usage)
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (2, 3, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync_mode", [True, False])
+async def test_hosted_sdk_stream_finishes_without_false_eof(logging_obj: Logging, sync_mode: bool) -> None:
+    logging_obj.update_environment_variables(model="gpt-4o", optional_params={"n": 2}, litellm_params={})
+    chunks: Final = tuple(
+        ChatCompletionChunk.model_validate(
+            {
+                "id": "chatcmpl-sdk",
+                "created": 1,
+                "model": "gpt-4o",
+                "object": "chat.completion.chunk",
+                "choices": choices,
+            }
+        )
+        for choices in (
+            [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}],
+            [
+                {"index": 0, "delta": {}, "finish_reason": "stop"},
+                {"index": 1, "delta": {}, "finish_reason": "stop"},
+            ],
+        )
+    )
+    wrapper: Final = CustomStreamWrapper(
+        completion_stream=ModelResponseListIterator(model_responses=list(chunks)),
+        model="gpt-4o",
+        logging_obj=logging_obj,
+        custom_llm_provider="hosted_vllm",
+    )
+
+    received: Final = await _collect(wrapper, sync_mode)
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in received))
+    assert "".join(choice.delta.content or "" for choice in choices) == "hello"
+    assert any(choice.finish_reason == "stop" for choice in choices)
 
 
 def test_unit_test_custom_stream_wrapper_function_call():
