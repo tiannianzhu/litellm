@@ -35,6 +35,7 @@ from litellm.litellm_core_utils.hidden_params import (
     get_hidden_params,
     set_extra_attribute,
     set_hidden_param,
+    set_hidden_params,
     stored_attribute,
 )
 from litellm.litellm_core_utils.model_response_utils import (
@@ -48,8 +49,10 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
     CHOICE_LOGPROBS_OR_JSON,
     CacheCreationTokenDetails,
+    ChatCompletionDeltaToolCall,
     CompletionTokensDetailsWrapper,
     Delta,
+    FunctionCall,
     LlmProviders,
     ModelResponse,
     ModelResponseStream,
@@ -378,6 +381,15 @@ class CustomStreamWrapper:
         self._provider_response_model: str | None = None
         self._upstream_provider: str | None = None
         self.received_finish_reason: str | None = None
+        optional_params: Final[object] = getattr(logging_obj, "optional_params", None)
+        choice_count: Final[object] = optional_params.get("n") if isinstance(optional_params, Mapping) else None
+        self._hosted_vllm_pending_choices: frozenset[int] = (
+            frozenset(range(choice_count))
+            if custom_llm_provider == "hosted_vllm" and isinstance(choice_count, int) and choice_count > 1
+            else frozenset()
+        )
+        self._hosted_vllm_finished_choices: frozenset[int] = frozenset()
+        self._hosted_vllm_tool_choices: frozenset[int] = frozenset()
         self.intermittent_finish_reason: str | None = None  # finish reasons that show up mid-stream
         self.received_any_finish_reason = False  # a later chunk can reset intermittent_finish_reason
         self.special_tokens = [
@@ -1014,7 +1026,7 @@ class CustomStreamWrapper:
 
     def is_chunk_non_empty(
         self,
-        completion_obj: dict[str, Any],
+        completion_obj: Mapping[str, Any],
         model_response: ModelResponseStream,
         response_obj: Mapping[str, object],
     ) -> bool:
@@ -1667,6 +1679,94 @@ class CustomStreamWrapper:
                     )
         return _ProviderChunkParsed(response_obj)
 
+    def _process_hosted_vllm_chunk(
+        self, chunk: ModelResponseStream, model_response: ModelResponseStream
+    ) -> ModelResponseStream | None:
+        self.uses_openai_chat_stream = True
+        self.received_any_finish_reason = self.received_any_finish_reason or any(
+            choice.finish_reason for choice in chunk.choices
+        )
+        self._hosted_vllm_tool_choices = self._hosted_vllm_tool_choices | frozenset(
+            choice.index for choice in chunk.choices if choice.delta.tool_calls
+        )
+        if chunk.system_fingerprint is not None:
+            self.system_fingerprint = chunk.system_fingerprint
+        normalized_choices: Final = [
+            choice.model_copy(update=MappingProxyType({"finish_reason": "tool_calls"}))
+            if choice.finish_reason == "stop" and choice.index in self._hosted_vllm_tool_choices
+            else choice
+            for choice in chunk.choices
+        ]
+        choices: Final = (
+            [
+                choice.model_copy(
+                    update=MappingProxyType(
+                        {
+                            "delta": choice.delta.model_copy(
+                                update=MappingProxyType(
+                                    {
+                                        "function_call": FunctionCall(
+                                            name=choice.delta.tool_calls[0].function.name,
+                                            arguments=choice.delta.tool_calls[0].function.arguments,
+                                        )
+                                        if choice.delta.tool_calls
+                                        and isinstance(choice.delta.tool_calls[0], ChatCompletionDeltaToolCall)
+                                        else choice.delta.function_call,
+                                        "tool_calls": None,
+                                    }
+                                )
+                            ),
+                            "finish_reason": "function_call"
+                            if choice.finish_reason == "tool_calls"
+                            else choice.finish_reason,
+                        }
+                    )
+                )
+                for choice in normalized_choices
+            ]
+            if self.is_function_call
+            else normalized_choices
+        )
+        response: Final = chunk.model_copy(
+            update=MappingProxyType(
+                {
+                    "model": model_response.model,
+                    "id": model_response.id,
+                    "created": model_response.created,
+                    "system_fingerprint": self.system_fingerprint,
+                    "choices": choices,
+                }
+            )
+        )
+        set_hidden_params(
+            response,
+            {**(get_hidden_params(chunk) or {}), **(get_hidden_params(model_response) or {})},
+        )
+        if not response.choices:
+            if self.send_stream_usage:
+                return response
+            self._record_usage_only_chunk(response)
+            return None
+
+        if self.is_chunk_non_empty(
+            MappingProxyType({"content": response.choices[0].delta.content}), response, MappingProxyType({})
+        ):
+            self.raise_on_model_repetition()
+
+        self._hosted_vllm_finished_choices = self._hosted_vllm_finished_choices | frozenset(
+            choice.index for choice in response.choices if choice.finish_reason
+        )
+        self._hosted_vllm_pending_choices = (
+            self._hosted_vllm_pending_choices | frozenset(choice.index for choice in response.choices)
+        ) - self._hosted_vllm_finished_choices
+        self.sent_last_chunk = not self._hosted_vllm_pending_choices
+        if self.sent_last_chunk:
+            self.received_finish_reason = response.choices[0].finish_reason
+        self._optional_combine_thinking_block_in_choices(response)
+        if self.sent_last_chunk and (close_tag := self._close_open_think_block()) is not None:
+            response.choices[0].delta.content = (response.choices[0].delta.content or "") + close_tag
+        return response
+
     def chunk_creator(self, chunk: Any):
         if isinstance(chunk, ModelResponseStream) and chunk.provider_specific_fields:
             self.logging_obj.record_native_bedrock_guardrail(chunk.provider_specific_fields)
@@ -1694,6 +1794,8 @@ class CustomStreamWrapper:
             ),
             delta=prebuilt_delta,
         )
+        if self.custom_llm_provider == "hosted_vllm" and isinstance(chunk, ModelResponseStream):
+            return self._process_hosted_vllm_chunk(chunk, model_response)
         response_obj: dict[str, Any] = {}
         try:
             # return this for all models
@@ -2011,12 +2113,17 @@ class CustomStreamWrapper:
         return model_response
 
     def _should_fail_on_clean_eof(self) -> bool:
+        missing_finish_reason: Final = (
+            self.received_finish_reason is None
+            and self.intermittent_finish_reason is None
+            and not self.received_any_finish_reason
+        )
         return (
             not self.is_mock
             and self.uses_openai_chat_stream
-            and self.received_finish_reason is None
-            and self.intermittent_finish_reason is None
-            and not self.received_any_finish_reason
+            and (
+                missing_finish_reason or bool(self._hosted_vllm_finished_choices and self._hosted_vllm_pending_choices)
+            )
         )
 
     @staticmethod
