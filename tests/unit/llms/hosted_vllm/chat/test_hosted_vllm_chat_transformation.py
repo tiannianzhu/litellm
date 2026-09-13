@@ -1,6 +1,8 @@
 import asyncio
 import copy
 import json
+from contextlib import nullcontext
+from itertools import chain
 from typing import Final
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,7 @@ from litellm.constants import (
     DEFAULT_REASONING_EFFORT_HIGH_THINKING_BUDGET,
     DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET,
 )
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.types.utils import ModelResponse
@@ -120,6 +123,295 @@ def test_hosted_vllm_supports_reasoning_effort():
         drop_params=False,
     )
     assert optional_params["reasoning_effort"] == "high"
+
+
+def _hosted_vllm_sse_chunk(choices, created, usage=None, system_fingerprint=None):
+    payload = {
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": "fixture",
+        "choices": choices,
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    if system_fingerprint is not None:
+        payload["system_fingerprint"] = system_fingerprint
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _hosted_vllm_multi_choice_sse(finish_reason, tool_and_finish_share_chunk):
+    tool_delta = {
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call_fixture",
+                "type": "function",
+                "function": {"name": "echo", "arguments": '{"strict":true}'},
+            }
+        ]
+    }
+    text_delta = {"content": "hello", "tool_calls": []}
+    tool_choice = {
+        "index": 1,
+        "delta": tool_delta,
+        "finish_reason": finish_reason if tool_and_finish_share_chunk else None,
+    }
+    text_choice = {"index": 0, "delta": text_delta, "finish_reason": None}
+    text_finish = {"index": 0, "delta": {}, "finish_reason": "stop"}
+    tool_finish = {"index": 1, "delta": {}, "finish_reason": finish_reason}
+    first_chunk = _hosted_vllm_sse_chunk([tool_choice, text_choice], created=1, system_fingerprint="fp-fixture")
+    usage_chunk = _hosted_vllm_sse_chunk(
+        [], created=3, usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+    )
+    return (
+        first_chunk
+        + _hosted_vllm_sse_chunk([text_finish], created=2)
+        + ("" if tool_and_finish_share_chunk else _hosted_vllm_sse_chunk([tool_finish], created=4))
+        + usage_chunk
+        + "data: [DONE]\n\n"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "contents, should_raise",
+    [(("repeat",) * 5, True), (("ab",) * 5, False), (("one", "two", "three", "four", "five"), False)],
+    ids=["repetition", "short-tokens", "distinct-text"],
+)
+async def test_hosted_vllm_streaming_repetition_guard(
+    monkeypatch: pytest.MonkeyPatch, async_mode: bool, contents: tuple[str, ...], should_raise: bool
+) -> None:
+    monkeypatch.setattr(litellm, "REPEATED_STREAMING_CHUNK_LIMIT", 3)
+    stream_body: Final = (
+        "".join(
+            _hosted_vllm_sse_chunk([{"index": 0, "delta": {"content": content}, "finish_reason": None}], created=1)
+            for content in contents
+        )
+        + _hosted_vllm_sse_chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}], created=1)
+        + "data: [DONE]\n\n"
+    )
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=stream_body)
+
+    request: Final = {
+        "model": "hosted_vllm/fixture",
+        "messages": [{"role": "user", "content": "echo"}],
+        "api_base": "https://fixture.invalid/v1",
+        "api_key": "fixture",
+        "stream": True,
+    }
+    expectation: Final = (
+        pytest.raises(litellm.exceptions.MidStreamFallbackError, match="repeating the same chunk")
+        if should_raise
+        else nullcontext()
+    )
+    if async_mode:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as async_transport:
+            async_handler: Final = AsyncHTTPHandler()
+            await async_handler.client.aclose()
+            async_handler.client = async_transport
+            async_stream: Final = await litellm.acompletion(**request, client=async_handler)
+            with expectation:
+                async_chunks: Final = [chunk async for chunk in async_stream]
+                assert "".join(chunk.choices[0].delta.content or "" for chunk in async_chunks) == "".join(contents)
+    else:
+        with httpx.Client(transport=httpx.MockTransport(respond)) as sync_transport:
+            sync_stream: Final = litellm.completion(**request, client=HTTPHandler(client=sync_transport))
+            with expectation:
+                sync_chunks: Final = list(sync_stream)
+                assert "".join(chunk.choices[0].delta.content or "" for chunk in sync_chunks) == "".join(contents)
+
+
+def _stream_choice_sequence(chunks):
+    return [
+        [
+            (choice.index, choice.delta.content, bool(choice.delta.tool_calls), choice.finish_reason)
+            for choice in chunk.choices
+        ]
+        for chunk in chunks
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+async def test_hosted_vllm_reasoning_only_stream_closes_think_tags(async_mode: bool, finish_reason: str) -> None:
+    stream_body: Final = (
+        "".join(
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-fixture",
+                    "model": "fixture",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "choices": [choice],
+                }
+            )
+            + "\n\n"
+            for choice in (
+                {"index": 0, "delta": {"reasoning_content": "Think carefully"}, "finish_reason": None},
+                {"index": 0, "delta": {}, "finish_reason": finish_reason},
+            )
+        )
+        + "data: [DONE]\n\n"
+    )
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=stream_body)
+
+    handler: Final = (
+        AsyncHTTPHandler(transport=httpx.MockTransport(respond))
+        if async_mode
+        else HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(respond)))
+    )
+    request: Final = {
+        "model": "hosted_vllm/fixture",
+        "messages": [{"role": "user", "content": "Think"}],
+        "api_base": "https://fixture.invalid/v1",
+        "api_key": "fixture",
+        "stream": True,
+        "merge_reasoning_content_in_choices": True,
+    }
+    try:
+        stream: Final = (
+            await litellm.acompletion(**request, client=handler)
+            if async_mode
+            else litellm.completion(**request, client=handler)
+        )
+        chunks: Final = tuple([chunk async for chunk in stream]) if async_mode else tuple(stream)
+    finally:
+        if isinstance(handler, AsyncHTTPHandler):
+            await handler.client.aclose()
+        else:
+            handler.client.close()
+
+    assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices) == (
+        "<think>Think carefully</think>"
+    )
+    assert tuple(
+        chunk.choices[0].finish_reason
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].finish_reason is not None
+    ) == (finish_reason,)
+
+
+def _assert_hosted_vllm_multi_choice_stream(chunks, finish_reason, tool_and_finish_share_chunk):
+    tool_finish_reason = "tool_calls" if finish_reason == "stop" else finish_reason
+    assert _stream_choice_sequence(chunks) == [
+        [(1, None, True, tool_finish_reason if tool_and_finish_share_chunk else None), (0, "hello", False, None)],
+        [(0, None, False, "stop")],
+    ] + ([] if tool_and_finish_share_chunk else [[(1, None, False, tool_finish_reason)]]) + [[]]
+    assert [usage.total_tokens for chunk in chunks if (usage := getattr(chunk, "usage", None)) is not None] == [3]
+    assert {chunk.created for chunk in chunks} == {chunks[0].created}
+    assert [chunk.system_fingerprint for chunk in chunks] == ["fp-fixture"] * len(chunks)
+
+
+@pytest.mark.parametrize(
+    "finish_reason, tool_and_finish_share_chunk",
+    [
+        ("stop", True),
+        ("stop", False),
+        ("length", False),
+        ("content_filter", False),
+    ],
+)
+def test_hosted_vllm_sync_multi_choice_stream_keeps_every_terminal(finish_reason, tool_and_finish_share_chunk):
+    stream_body = _hosted_vllm_multi_choice_sse(finish_reason, tool_and_finish_share_chunk)
+
+    def respond(_request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=stream_body)
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as transport:
+        stream = litellm.completion(
+            model="hosted_vllm/fixture",
+            messages=[{"role": "user", "content": "echo"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            stream_options={"include_usage": True},
+            n=2,
+            client=HTTPHandler(client=transport),
+        )
+        chunks = list(stream)
+
+    _assert_hosted_vllm_multi_choice_stream(chunks, finish_reason, tool_and_finish_share_chunk)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_reason, tool_and_finish_share_chunk",
+    [
+        ("stop", True),
+        ("stop", False),
+        ("length", False),
+        ("content_filter", False),
+    ],
+)
+async def test_hosted_vllm_async_multi_choice_stream_keeps_every_terminal(finish_reason, tool_and_finish_share_chunk):
+    stream_body = _hosted_vllm_multi_choice_sse(finish_reason, tool_and_finish_share_chunk)
+
+    async def respond(_request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=stream_body)
+
+    client = AsyncHTTPHandler()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream = await litellm.acompletion(
+            model="hosted_vllm/fixture",
+            messages=[{"role": "user", "content": "echo"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            stream_options={"include_usage": True},
+            n=2,
+            client=client,
+        )
+        chunks = [chunk async for chunk in stream]
+    finally:
+        await client.client.aclose()
+
+    _assert_hosted_vllm_multi_choice_stream(chunks, finish_reason, tool_and_finish_share_chunk)
+
+
+@pytest.mark.asyncio
+async def test_hosted_vllm_legacy_function_stream_preserves_each_choice() -> None:
+    stream_body: Final = _hosted_vllm_multi_choice_sse("stop", False)
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=stream_body)
+
+    client: Final = AsyncHTTPHandler()
+    await client.client.aclose()
+    client.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/fixture",
+            messages=[{"role": "user", "content": "echo"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            n=2,
+            functions=[{"name": "echo", "parameters": {"type": "object", "properties": {}}}],
+            client=client,
+        )
+        chunks: Final = [chunk async for chunk in stream]
+    finally:
+        await client.client.aclose()
+
+    choices: Final = tuple(chain.from_iterable(chunk.choices for chunk in chunks))
+    assert tuple((choice.index, choice.finish_reason) for choice in choices if choice.finish_reason) == (
+        (0, "stop"),
+        (1, "function_call"),
+    )
+    assert "".join(choice.delta.content or "" for choice in choices if choice.index == 0) == "hello"
+    functions: Final = tuple(choice.delta.function_call for choice in choices if choice.delta.function_call is not None)
+    assert tuple((function.name, function.arguments) for function in functions) == (("echo", '{"strict":true}'),)
+    assert all(choice.delta.tool_calls is None for choice in choices)
 
 
 def test_hosted_vllm_supports_thinking():
