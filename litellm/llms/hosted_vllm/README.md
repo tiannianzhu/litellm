@@ -70,7 +70,7 @@ output, and history replay before removing the mapping
 
 ## Responses developer messages
 
-For a backend whose chat encoder rejects the `developer` role, set
+For a backend whose chat encoder rejects or drops `developer` messages, set
 `model_info.supports_developer_messages: false` on that deployment. Native
 Responses then maps developer messages to system messages, retaining message
 order, content parts, other message fields, and the original system instructions.
@@ -82,4 +82,13 @@ backend itself does not represent. It applies to ordinary conversations and
 structured output alike, independently of tools or prompt text
 
 - Code and tests: the hosted-vLLM Responses transformation and its mapped tests
-- Remove or disable per deployment when its encoder accepts developer messages
+- Remove or disable per deployment when its complete request preprocessing
+  preserves developer content, including multiple messages and content parts
+
+## Tool schemas
+
+Chat Completions forwards function-level `strict` and JSON Schema constraints,
+including nested `additionalProperties: false`, unchanged. Custom-to-function
+conversion also preserves the supplied input schema. Constraint enforcement
+depends on the deployed vLLM version, tool parser, and tool choice; forwarding
+these fields does not guarantee enforcement for every configuration

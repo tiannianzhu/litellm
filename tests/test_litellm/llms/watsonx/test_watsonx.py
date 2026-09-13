@@ -3,6 +3,7 @@ import json
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 
 import litellm
@@ -36,9 +37,7 @@ def watsonx_chat_completion_call():
 
             with (
                 patch.object(client, "post") as mock_post,
-                patch.object(
-                    litellm.module_level_client, "post", return_value=mock_response
-                ) as mock_get,
+                patch.object(litellm.module_level_client, "post", return_value=mock_response) as mock_get,
             ):
                 try:
                     completion(
@@ -71,9 +70,7 @@ def watsonx_chat_completion_call():
     return _call
 
 
-def test_watsonx_deployment_model_id_not_in_payload(
-    monkeypatch, watsonx_chat_completion_call
-):
+def test_watsonx_deployment_model_id_not_in_payload(monkeypatch, watsonx_chat_completion_call):
     """Test that deployment models do not include 'model_id' in the request payload"""
     monkeypatch.setenv("WATSONX_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("WATSONX_API_BASE", "https://test-api.watsonx.ai")
@@ -90,9 +87,7 @@ def test_watsonx_deployment_model_id_not_in_payload(
     assert "project_id" not in json_data or json_data["project_id"] is None
 
 
-def test_watsonx_regular_model_includes_model_id(
-    monkeypatch, watsonx_chat_completion_call
-):
+def test_watsonx_regular_model_includes_model_id(monkeypatch, watsonx_chat_completion_call):
     """Test that regular models include 'model_id' in the request payload"""
     monkeypatch.setenv("WATSONX_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("WATSONX_API_BASE", "https://test-api.watsonx.ai")
@@ -134,9 +129,7 @@ def watsonx_completion_call():
 
             with (
                 patch.object(client, "post") as mock_post,
-                patch.object(
-                    litellm.module_level_client, "post", return_value=mock_response
-                ) as mock_get,
+                patch.object(litellm.module_level_client, "post", return_value=mock_response) as mock_get,
             ):
                 try:
                     litellm.text_completion(
@@ -169,9 +162,7 @@ def watsonx_completion_call():
     return _call
 
 
-def test_watsonx_completion_deployment_model_id_not_in_payload(
-    monkeypatch, watsonx_completion_call
-):
+def test_watsonx_completion_deployment_model_id_not_in_payload(monkeypatch, watsonx_completion_call):
     """Test that deployment models do not include 'model_id' in completion request payload"""
     monkeypatch.setenv("WATSONX_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("WATSONX_API_BASE", "https://test-api.watsonx.ai")
@@ -188,9 +179,7 @@ def test_watsonx_completion_deployment_model_id_not_in_payload(
     assert "project_id" not in json_data
 
 
-def test_watsonx_completion_regular_model_includes_model_id(
-    monkeypatch, watsonx_completion_call
-):
+def test_watsonx_completion_regular_model_includes_model_id(monkeypatch, watsonx_completion_call):
     """Test that regular models include 'model_id' in completion request payload"""
     monkeypatch.setenv("WATSONX_PROJECT_ID", "test-project-id")
     monkeypatch.setenv("WATSONX_API_BASE", "https://test-api.watsonx.ai")
@@ -264,9 +253,7 @@ def test_watsonx_gpt_oss_prompt_transformation(monkeypatch):
 
     with (
         patch.object(client, "post") as mock_post,
-        patch.object(
-            litellm.module_level_client, "post", return_value=mock_token_response
-        ),
+        patch.object(litellm.module_level_client, "post", return_value=mock_token_response),
     ):
         try:
             completion(
@@ -279,9 +266,7 @@ def test_watsonx_gpt_oss_prompt_transformation(monkeypatch):
             print(f"Caught expected exception: {e}")
 
     # Verify the POST was called
-    assert (
-        mock_post.call_count == 1
-    ), f"POST should have been called exactly once, got {mock_post.call_count}"
+    assert mock_post.call_count == 1, f"POST should have been called exactly once, got {mock_post.call_count}"
 
     # Get the request body
     call_args = mock_post.call_args
@@ -304,12 +289,57 @@ def test_watsonx_gpt_oss_prompt_transformation(monkeypatch):
     assert "<|start|>" in transformed_prompt, "Prompt should contain <|start|> tag"
     assert "<|message|>" in transformed_prompt, "Prompt should contain <|message|> tag"
     assert "<|end|>" in transformed_prompt, "Prompt should contain <|end|> tag"
-    assert (
-        "You are chatgpt" in transformed_prompt
-    ), "Prompt should contain system message content"
-    assert (
-        "Hi there" in transformed_prompt
-    ), "Prompt should contain user message content"
+    assert "You are chatgpt" in transformed_prompt, "Prompt should contain system message content"
+    assert "Hi there" in transformed_prompt, "Prompt should contain user message content"
+
+
+def test_watsonx_tools_remove_strict_switch_and_preserve_strict_parameter(monkeypatch):
+    monkeypatch.setenv("WATSONX_PROJECT_ID", "test-project-id")
+    monkeypatch.setenv("WATSONX_API_BASE", "https://test-api.watsonx.ai")
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"strict": {"type": "boolean"}},
+                    "required": ["strict"],
+                },
+            },
+        }
+    ]
+    client = HTTPHandler()
+    token_client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={"access_token": "mock_access_token", "expires_in": 3600},
+            )
+        )
+    )
+    monkeypatch.setattr(litellm.module_level_client, "client", token_client)
+
+    with patch.object(client, "post") as mock_post:
+        try:
+            completion(
+                model="watsonx/test-model",
+                messages=[{"role": "user", "content": "Test"}],
+                api_key="test_api_key",
+                client=client,
+                tools=tools,
+            )
+        except Exception as e:
+            print(f"Caught expected exception: {e}")
+        finally:
+            token_client.close()
+
+    request_tools = json.loads(mock_post.call_args.kwargs["data"])["tools"]
+    assert "strict" not in request_tools[0]["function"]
+    assert request_tools[0]["function"]["parameters"] == tools[0]["function"]["parameters"]
+    assert tools[0]["function"]["strict"] is False
 
 
 @pytest.mark.asyncio
@@ -350,9 +380,9 @@ async def test_watsonx_gpt_oss_uses_async_http_handler():
         call_args = mock_get.call_args
         assert call_args is not None, "get should have been called with arguments"
         called_url = call_args.kwargs.get("url", "")
-        assert (
-            "huggingface.co/test/model" in called_url
-        ), f"Should call HuggingFace API for test/model, got: {called_url}"
+        assert "huggingface.co/test/model" in called_url, (
+            f"Should call HuggingFace API for test/model, got: {called_url}"
+        )
         assert result["status"] == "success", "Should return success status"
 
 
@@ -388,7 +418,9 @@ async def test_watsonx_text_gpt_oss_async_completion_fetches_hf_template_off_the
         return httpx.Response(200, json={"chat_template": chat_template, "bos_token": None, "eos_token": None})
 
     monkeypatch.setattr(huggingface_template_handler, "_get_httpx_client", forbid_sync_client)
-    monkeypatch.setattr(huggingface_template_handler, "get_async_httpx_client", lambda **kwargs: Mock(get=serve_hf_file))
+    monkeypatch.setattr(
+        huggingface_template_handler, "get_async_httpx_client", lambda **kwargs: Mock(get=serve_hf_file)
+    )
 
     def handle(request):
         captured["body"] = json.loads(request.content)
@@ -447,9 +479,7 @@ def test_watsonx_chat_completion_with_reasoning_effort(monkeypatch):
     # Call litellm.completion with the new parameter
     with (
         patch.object(client, "post") as mock_post,
-        patch.object(
-            litellm.module_level_client, "post", return_value=mock_token_response
-        ),
+        patch.object(litellm.module_level_client, "post", return_value=mock_token_response),
     ):
         try:
             completion(
@@ -463,9 +493,7 @@ def test_watsonx_chat_completion_with_reasoning_effort(monkeypatch):
             print(f"Caught expected exception: {e}")
 
     # Verify the parameter is in the final request payload
-    assert (
-        mock_post.call_count == 1
-    ), "The completion endpoint should have been called once."
+    assert mock_post.call_count == 1, "The completion endpoint should have been called once."
 
     # Get the JSON data sent in the POST request
     request_kwargs = mock_post.call_args.kwargs
@@ -475,12 +503,8 @@ def test_watsonx_chat_completion_with_reasoning_effort(monkeypatch):
     print(json.dumps(json_data, indent=2))
 
     # Check for the parameter at the top level of the payload
-    assert (
-        "reasoning_effort" in json_data
-    ), "'reasoning_effort' should be at the top level of the payload."
-    assert (
-        json_data["reasoning_effort"] == "low"
-    ), "The value of 'reasoning_effort' should be 'low'."
+    assert "reasoning_effort" in json_data, "'reasoning_effort' should be at the top level of the payload."
+    assert json_data["reasoning_effort"] == "low", "The value of 'reasoning_effort' should be 'low'."
 
 
 def test_watsonx_zen_api_key_from_client(monkeypatch, watsonx_chat_completion_call):
@@ -511,9 +535,7 @@ def test_watsonx_zen_api_key_from_client(monkeypatch, watsonx_chat_completion_ca
             print(f"Caught expected exception: {e}")
 
     # Verify the request was made
-    assert (
-        mock_post.call_count == 1
-    ), "The completion endpoint should have been called once."
+    assert mock_post.call_count == 1, "The completion endpoint should have been called once."
 
     # Get the headers sent in the POST request
     request_kwargs = mock_post.call_args.kwargs
@@ -558,9 +580,7 @@ def test_watsonx_zen_api_key_from_env(monkeypatch, watsonx_chat_completion_call)
             print(f"Caught expected exception: {e}")
 
     # Verify the request was made
-    assert (
-        mock_post.call_count == 1
-    ), "The completion endpoint should have been called once."
+    assert mock_post.call_count == 1, "The completion endpoint should have been called once."
 
     # Get the headers sent in the POST request
     request_kwargs = mock_post.call_args.kwargs
