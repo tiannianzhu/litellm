@@ -51,6 +51,7 @@ from litellm.litellm_core_utils.hidden_params import (
     get_hidden_params,
     set_extra_attribute,
     set_hidden_param,
+    set_hidden_params,
     stored_attribute,
 )
 from litellm.litellm_core_utils.llm_cost_calc.guardrail_cost import object_items
@@ -67,8 +68,10 @@ from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
     CHOICE_LOGPROBS_OR_JSON,
     CacheCreationTokenDetails,
+    ChatCompletionDeltaToolCall,
     CompletionTokensDetailsWrapper,
     Delta,
+    FunctionCall,
     LlmProviders,
     ModelResponse,
     ModelResponseStream,
@@ -614,6 +617,15 @@ class CustomStreamWrapper:
         self.received_finish_choice_fields: Mapping[int, Mapping[str, object]] = _NO_CHOICE_FIELDS_BY_INDEX
         self.received_finish_reasons: Mapping[int, str] = _NO_FINISH_REASONS_BY_INDEX
         self.carried_chunk_choice_fields: Mapping[int, Mapping[str, object]] = _NO_CHOICE_FIELDS_BY_INDEX
+        optional_params: Final = as_str_mapping(getattr(logging_obj, "optional_params", None))
+        choice_count: Final = optional_params.get("n") if optional_params is not None else None
+        self._hosted_vllm_pending_choices: frozenset[int] = (
+            frozenset(range(choice_count))
+            if custom_llm_provider == "hosted_vllm" and isinstance(choice_count, int) and choice_count > 1
+            else frozenset()
+        )
+        self._hosted_vllm_finished_choices: frozenset[int] = frozenset()
+        self._hosted_vllm_tool_choices: frozenset[int] = frozenset()
         self.intermittent_finish_reason: str | None = None  # finish reasons that show up mid-stream
         self.received_any_finish_reason = False  # a later chunk can reset intermittent_finish_reason
         self.special_tokens = [
@@ -2017,6 +2029,111 @@ class CustomStreamWrapper:
                     )
         return _ProviderChunkParsed(response_obj)
 
+    def _process_hosted_vllm_chunk(
+        self, chunk: ModelResponseStream, model_response: ModelResponseStream
+    ) -> ModelResponseStream | None:
+        self.uses_openai_chat_stream = True
+        self.received_any_finish_reason = self.received_any_finish_reason or any(
+            choice.finish_reason for choice in chunk.choices
+        )
+        indexed_choices: Final = tuple((choice.index or 0, choice) for choice in chunk.choices)
+        self._hosted_vllm_tool_choices = self._hosted_vllm_tool_choices | frozenset(
+            index for index, choice in indexed_choices if choice.delta.tool_calls
+        )
+        if chunk.system_fingerprint is not None:
+            self.system_fingerprint = chunk.system_fingerprint
+        normalized_choices: Final = [
+            choice.model_copy(
+                update=MappingProxyType(
+                    {
+                        "index": index,
+                        "delta": choice.delta.model_copy(),
+                        "finish_reason": "tool_calls"
+                        if choice.finish_reason == "stop" and index in self._hosted_vllm_tool_choices
+                        else choice.finish_reason,
+                    }
+                )
+            )
+            for index, choice in indexed_choices
+        ]
+        choices: Final = (
+            [
+                choice.model_copy(
+                    update=MappingProxyType(
+                        {
+                            "delta": choice.delta.model_copy(
+                                update=MappingProxyType(
+                                    {
+                                        "function_call": FunctionCall(
+                                            name=choice.delta.tool_calls[0].function.name,
+                                            arguments=choice.delta.tool_calls[0].function.arguments,
+                                        )
+                                        if choice.delta.tool_calls
+                                        and isinstance(choice.delta.tool_calls[0], ChatCompletionDeltaToolCall)
+                                        else choice.delta.function_call,
+                                        "tool_calls": None,
+                                    }
+                                )
+                            ),
+                            "finish_reason": "function_call"
+                            if choice.finish_reason == "tool_calls"
+                            else choice.finish_reason,
+                        }
+                    )
+                )
+                for choice in normalized_choices
+            ]
+            if self.is_function_call
+            else normalized_choices
+        )
+        response: Final = chunk.model_copy(
+            update=MappingProxyType(
+                {
+                    "model": model_response.model,
+                    "id": model_response.id,
+                    "created": model_response.created,
+                    "system_fingerprint": self.system_fingerprint,
+                    "choices": choices,
+                }
+            )
+        )
+        set_hidden_params(
+            response,
+            {**(get_hidden_params(chunk) or {}), **(get_hidden_params(model_response) or {})},
+        )
+        if not response.choices:
+            if not self.sent_first_chunk:
+                self._hold_attributes_before_first_choice(chunk)
+            if self.send_stream_usage:
+                if not self.proxy_drops_choiceless_chunks:
+                    self._release_attributes_before_first_choice(response)
+                return response
+            self._record_usage_only_chunk(response)
+            return None
+
+        if self.is_chunk_non_empty(
+            MappingProxyType({"content": response.choices[0].delta.content}), response, MappingProxyType({})
+        ):
+            self.raise_on_model_repetition()
+
+        self._hosted_vllm_finished_choices = self._hosted_vllm_finished_choices | frozenset(
+            choice.index for choice in response.choices if choice.finish_reason
+        )
+        self._hosted_vllm_pending_choices = (
+            self._hosted_vllm_pending_choices | frozenset(choice.index for choice in response.choices)
+        ) - self._hosted_vllm_finished_choices
+        self.sent_last_chunk = not self._hosted_vllm_pending_choices
+        if self.sent_last_chunk:
+            self.received_finish_reason = response.choices[0].finish_reason
+        self._optional_combine_thinking_block_in_choices(response)
+        if self.sent_last_chunk and (close_tag := self._close_open_think_block()) is not None:
+            response.choices[0].delta.content = (response.choices[0].delta.content or "") + close_tag
+        if not self.sent_first_chunk:
+            self._release_attributes_before_first_choice(response)
+            self._add_mcp_list_tools_to_first_chunk(response)
+        self._set_role_on_fresh_delta(response)
+        return response
+
     def chunk_creator(self, chunk: object):
         if isinstance(chunk, ModelResponseStream) and chunk.provider_specific_fields:
             self.logging_obj.record_native_bedrock_guardrail(chunk.provider_specific_fields)
@@ -2044,6 +2161,8 @@ class CustomStreamWrapper:
             ),
             delta=prebuilt_delta,
         )
+        if self.custom_llm_provider == "hosted_vllm" and isinstance(chunk, ModelResponseStream):
+            return _without_token_ids_under_post_call_rules(self._process_hosted_vllm_chunk(chunk, model_response))
         response_obj: Mapping[str, object] = {}
         try:
             # return this for all models
@@ -2251,14 +2370,10 @@ class CustomStreamWrapper:
             if hasattr(chunk, "choices") and chunk.choices:
                 for choice in chunk.choices:
                     if isinstance(choice, StreamingChoices) and hasattr(choice, "delta") and choice.delta:
-                        # Get existing provider_specific_fields or create new dict
-                        provider_fields = getattr(choice.delta, "provider_specific_fields", None) or {}
-
-                        # Add only mcp_list_tools to first chunk
-                        provider_fields["mcp_list_tools"] = mcp_list_tools
-
-                        # Set the provider_specific_fields
-                        setattr(choice.delta, "provider_specific_fields", provider_fields)
+                        choice.delta.provider_specific_fields = {
+                            **(choice.delta.provider_specific_fields or {}),
+                            "mcp_list_tools": mcp_list_tools,
+                        }
 
         except Exception as e:
             from litellm._logging import verbose_logger
@@ -2467,12 +2582,17 @@ class CustomStreamWrapper:
         return model_response
 
     def _should_fail_on_clean_eof(self) -> bool:
+        missing_finish_reason: Final = (
+            self.received_finish_reason is None
+            and self.intermittent_finish_reason is None
+            and not self.received_any_finish_reason
+        )
         return (
             not self.is_mock
             and self.uses_openai_chat_stream
-            and self.received_finish_reason is None
-            and self.intermittent_finish_reason is None
-            and not self.received_any_finish_reason
+            and (
+                missing_finish_reason or bool(self._hosted_vllm_finished_choices and self._hosted_vllm_pending_choices)
+            )
         )
 
     @staticmethod
