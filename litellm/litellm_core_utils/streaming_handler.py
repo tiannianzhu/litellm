@@ -233,6 +233,13 @@ class CustomStreamWrapper:
         self.system_fingerprint: str | None = None
         self._provider_response_model: str | None = None
         self.received_finish_reason: str | None = None
+        optional_params: Final[object] = getattr(logging_obj, "optional_params", None)
+        choice_count: Final[object] = optional_params.get("n") if isinstance(optional_params, Mapping) else None
+        self._hosted_vllm_pending_choices: frozenset[int] = (
+            frozenset(range(choice_count))
+            if custom_llm_provider == "hosted_vllm" and isinstance(choice_count, int) and choice_count > 1
+            else frozenset()
+        )
         self.intermittent_finish_reason: str | None = None  # finish reasons that show up mid-stream
         self.special_tokens = [
             "<|assistant|>",
@@ -814,9 +821,9 @@ class CustomStreamWrapper:
 
     def is_chunk_non_empty(
         self,
-        completion_obj: dict[str, Any],
+        completion_obj: Mapping[str, Any],
         model_response: ModelResponseStream,
-        response_obj: dict[str, Any],
+        response_obj: Mapping[str, Any],
     ) -> bool:
         if (
             "content" in completion_obj
@@ -1396,6 +1403,45 @@ class CustomStreamWrapper:
                     )
         return _ProviderChunkParsed(response_obj)
 
+    def _process_hosted_vllm_chunk(
+        self, chunk: ModelResponseStream, model_response: ModelResponseStream
+    ) -> ModelResponseStream | None:
+        if chunk.system_fingerprint is not None:
+            self.system_fingerprint = chunk.system_fingerprint
+        response: Final = chunk.model_copy(
+            update=MappingProxyType(
+                {
+                    "model": model_response.model,
+                    "id": model_response.id,
+                    "created": model_response.created,
+                    "system_fingerprint": self.system_fingerprint,
+                }
+            )
+        )
+        response._hidden_params = {  # pyright: ignore[reportPrivateUsage]  # stream metadata is an internal response contract; mutable-ok: hooks update this dict
+            **chunk._hidden_params,  # pyright: ignore[reportPrivateUsage]  # preserve provider stream metadata
+            **model_response._hidden_params,  # pyright: ignore[reportPrivateUsage]  # normalized stream metadata takes precedence
+        }
+        if not response.choices:
+            if self.send_stream_usage:
+                return response
+            self._record_usage_only_chunk(response)
+            return None
+
+        if self.is_chunk_non_empty(
+            MappingProxyType({"content": response.choices[0].delta.content}), response, MappingProxyType({})
+        ):
+            self.raise_on_model_repetition()
+
+        self._hosted_vllm_pending_choices = (
+            self._hosted_vllm_pending_choices | frozenset(choice.index for choice in response.choices)
+        ) - frozenset(choice.index for choice in response.choices if choice.finish_reason is not None)
+        self.sent_last_chunk = not self._hosted_vllm_pending_choices
+        if self.sent_last_chunk:
+            self.received_finish_reason = response.choices[0].finish_reason
+        self._optional_combine_thinking_block_in_choices(response)
+        return response
+
     def chunk_creator(self, chunk: Any):
         if hasattr(chunk, "id"):
             self.response_id = chunk.id
@@ -1405,6 +1451,8 @@ class CustomStreamWrapper:
         model_response = self.model_response_creator(
             hidden_params=_provider_hidden_params(chunk, self._provider_response_model)
         )
+        if self.custom_llm_provider == "hosted_vllm" and isinstance(chunk, ModelResponseStream):
+            return self._process_hosted_vllm_chunk(chunk, model_response)
         response_obj: dict[str, Any] = {}
         try:
             # return this for all models
@@ -1916,6 +1964,8 @@ class CustomStreamWrapper:
 
                 if self.sent_stream_usage is False and self.send_stream_usage is True:
                     self.sent_stream_usage = True
+                    if self.custom_llm_provider == "hosted_vllm":
+                        response.choices.clear()
                     return response
                 self._restore_consumer_correlation_context()
                 raise  # Re-raise StopIteration
@@ -2147,6 +2197,8 @@ class CustomStreamWrapper:
 
             if self.sent_stream_usage is False and self.send_stream_usage is True:
                 self.sent_stream_usage = True
+                if self.custom_llm_provider == "hosted_vllm":
+                    response.choices.clear()
                 return response
 
             _deferred_cb: Final = getattr(

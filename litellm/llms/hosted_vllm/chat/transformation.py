@@ -3,7 +3,7 @@ Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
 import json
-from collections.abc import Coroutine, Mapping
+from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping
 from typing import Final, Literal, cast, overload
 
 from pydantic import TypeAdapter
@@ -24,9 +24,13 @@ from litellm.types.llms.openai import (
     ChatCompletionVideoObject,
     ChatCompletionVideoUrlObject,
 )
+from litellm.types.utils import ModelResponse, ModelResponseStream
 
 from ....utils import _remove_additional_properties, _remove_strict_from_schema
-from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+from ...openai.chat.gpt_transformation import (
+    OpenAIChatCompletionStreamingHandler,
+    OpenAIGPTConfig,
+)
 from ..reasoning import get_reasoning_effort_config
 
 _JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
@@ -78,6 +82,18 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
             converted_tools.append({"type": "function", "function": function_definition})
 
         return converted_tools
+
+    def get_model_response_iterator(
+        self,
+        streaming_response: Iterator[str] | AsyncIterator[str] | ModelResponse,
+        sync_stream: bool,
+        json_mode: bool | None = False,
+    ) -> "HostedVLLMChatStreamingHandler":
+        return HostedVLLMChatStreamingHandler(
+            streaming_response=streaming_response,
+            sync_stream=sync_stream,
+            json_mode=json_mode,
+        )
 
     def get_supported_openai_params(self, model: str) -> list[str]:
         params: Final = super().get_supported_openai_params(model)
@@ -271,3 +287,32 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
             return super()._transform_messages(messages, model, is_async=cast(Literal[True], True))
         else:
             return super()._transform_messages(messages, model, is_async=cast(Literal[False], False))
+
+
+class HostedVLLMChatStreamingHandler(OpenAIChatCompletionStreamingHandler):
+    def __init__(
+        self,
+        streaming_response: Iterator[str] | AsyncIterator[str] | ModelResponse,
+        sync_stream: bool,
+        json_mode: bool | None = False,
+    ) -> None:
+        super().__init__(
+            streaming_response=streaming_response,
+            sync_stream=sync_stream,
+            json_mode=json_mode,
+        )
+        self._choices_with_tool_calls: frozenset[int] = frozenset()
+
+    def chunk_parser(self, chunk: dict[str, object]) -> ModelResponseStream:
+        parsed_chunk: Final = super().chunk_parser(chunk)
+        fingerprint: Final = chunk.get("system_fingerprint")
+        if isinstance(fingerprint, str):
+            parsed_chunk.system_fingerprint = fingerprint
+        for choice, choice_index, tool_calls in (
+            (choice, choice.index, choice.delta.tool_calls) for choice in parsed_chunk.choices
+        ):
+            if tool_calls:
+                self._choices_with_tool_calls = self._choices_with_tool_calls | frozenset((choice_index,))
+            if choice.finish_reason == "stop" and choice_index in self._choices_with_tool_calls:
+                choice.finish_reason = "tool_calls"
+        return parsed_chunk
