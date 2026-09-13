@@ -1,6 +1,6 @@
-import copy
 import json
 from contextlib import nullcontext
+from copy import deepcopy
 from itertools import chain
 from typing import Final
 from unittest.mock import MagicMock, patch
@@ -69,6 +69,73 @@ def test_hosted_vllm_supports_reasoning_effort():
         drop_params=False,
     )
     assert optional_params["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_hosted_vllm_tool_schema_preserves_constraints(strict: bool) -> None:
+    config: Final = HostedVLLMChatConfig()
+    tools: Final = [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_task",
+                "strict": strict,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "strict": {"type": "boolean"},
+                        "options": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["strict", "options"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+    original_tools: Final = deepcopy(tools)
+    mapped_params: Final = config.map_openai_params(
+        non_default_params={"tools": tools},
+        optional_params={},
+        model="hosted_vllm/test-model",
+        drop_params=False,
+    )
+
+    assert mapped_params["tools"] == original_tools
+    assert tools == original_tools
+
+
+def test_hosted_vllm_custom_tool_schema_is_converted_preserving_constraints():
+    config = HostedVLLMChatConfig()
+    tools = [
+        {
+            "type": "custom",
+            "name": "run_task",
+            "input_schema": {
+                "type": "object",
+                "properties": {"strict": {"type": "boolean"}},
+                "required": ["strict"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+
+    mapped_params = config.map_openai_params(
+        non_default_params={"tools": tools},
+        optional_params={},
+        model="hosted_vllm/test-model",
+        drop_params=False,
+    )
+
+    mapped_tool = mapped_params["tools"][0]
+    assert mapped_tool["type"] == "function"
+    assert "strict" not in mapped_tool["function"]
+    assert mapped_tool["function"]["parameters"] == tools[0]["input_schema"]
 
 
 def test_hosted_vllm_streaming_usage_only_chunk_is_unchanged():
@@ -1031,27 +1098,15 @@ def _strict_weather_tool() -> dict[str, object]:
     }
 
 
-def test_hosted_vllm_tools_are_rewritten_without_touching_the_callers_tool() -> None:
+def test_hosted_vllm_tools_preserve_constraints_without_touching_the_callers_tool() -> None:
     tools: Final = [_strict_weather_tool()]
-    tools_before: Final = copy.deepcopy(tools)
+    tools_before: Final = deepcopy(tools)
 
     optional_params: Final = HostedVLLMChatConfig().map_openai_params(
         non_default_params={"tools": tools}, optional_params={}, model="gpt-oss-120b", drop_params=False
     )
 
-    assert optional_params["tools"] == [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                },
-            },
-        }
-    ]
+    assert optional_params["tools"] == tools_before
     assert tools == tools_before
 
 
