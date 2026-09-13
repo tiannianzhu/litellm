@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, Protocol, Union, cast, get_args
 
 import httpx
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter
 
 import litellm
 from litellm import verbose_logger
@@ -711,14 +711,18 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         computerUse: dict | None = None
         # remove 'additionalProperties' from tools
         schema_value: Final[JsonValue] = cast(JsonValue, value)  # cast-ok: tool schemas come from JSON request data
-        remove_additional_properties(schema_value)
+        supported_schema: Final = remove_additional_properties(schema_value)
         # remove 'strict' from tools
-        remove_strict_from_schema(schema_value)
+        supported_tools: Final = TypeAdapter(list[dict[str, JsonValue]]).validate_python(
+            remove_strict_from_schema(supported_schema)
+        )
 
-        for tool in value:
+        for tool in supported_tools:
             openai_function_object: ChatCompletionToolParamFunctionChunk | None = None
             if "function" in tool:  # tools list
-                _openai_function_object = ChatCompletionToolParamFunctionChunk(**tool["function"])
+                _openai_function_object = TypeAdapter(ChatCompletionToolParamFunctionChunk).validate_python(
+                    tool["function"]
+                )
 
                 if (
                     "parameters" in _openai_function_object
@@ -730,7 +734,7 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 openai_function_object = _openai_function_object
 
             elif "name" in tool:  # functions list
-                openai_function_object = ChatCompletionToolParamFunctionChunk(**tool)
+                openai_function_object = TypeAdapter(ChatCompletionToolParamFunctionChunk).validate_python(tool)
 
             if "type" in tool and tool["type"] == "computer_use":
                 computer_use_config = {k: v for k, v in tool.items() if k != "type"}
