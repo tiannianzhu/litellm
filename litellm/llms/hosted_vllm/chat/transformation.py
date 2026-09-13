@@ -2,7 +2,6 @@
 Translate from OpenAI's `/v1/chat/completions` to VLLM's `/v1/chat/completions`
 """
 
-import copy
 import json
 from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator, Mapping, Sequence
 from typing import Final, Literal, cast, overload
@@ -31,7 +30,6 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.utils import ModelResponse
 
-from ....utils import remove_additional_properties, remove_strict_from_schema
 from ...openai.chat.gpt_transformation import (
     OpenAIChatCompletionStreamingHandler,
     OpenAIGPTConfig,
@@ -188,14 +186,11 @@ class HostedVLLMChatConfig(OpenAIGPTConfig):
             for key, value in params.items()
             if params.get("tools") != [] or key not in ("tools", "tool_choice", "parallel_tool_calls")
         }
-        _tools = mapped_params.pop("tools", None)
+        _tools: Final = mapped_params.pop("tools", None)
         if _tools is not None:
-            _tools = remove_additional_properties(copy.deepcopy(_tools))  # pyright: ignore[reportArgumentType]  # tools arrive untyped through the bare-dict params
-            _tools = remove_strict_from_schema(_tools)
-            if isinstance(_tools, list):
-                _tools = self._convert_custom_tools_to_function_tools(_tools)
-        if _tools is not None:
-            mapped_params["tools"] = _tools
+            mapped_params["tools"] = (
+                self._convert_custom_tools_to_function_tools(_tools) if isinstance(_tools, list) else _tools
+            )
 
         thinking: Final = mapped_params.pop("thinking", None)
         thinking_effort: Final = (
