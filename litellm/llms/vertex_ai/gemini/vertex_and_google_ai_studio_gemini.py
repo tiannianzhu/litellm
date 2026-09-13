@@ -733,6 +733,17 @@ class VertexAIBaseConfig:
         ]
 
 
+def _validated_function_definition(value: JsonValue) -> ChatCompletionToolParamFunctionChunk:
+    definition: Final = TypeAdapter(dict[str, JsonValue]).validate_python(value)
+    return TypeAdapter(ChatCompletionToolParamFunctionChunk).validate_python(
+        {
+            key: {"type": "object"} if key == "parameters" and item == "" else item
+            for key, item in definition.items()
+            if key != "parameters" or item is not None
+        }
+    )
+
+
 class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
     """
     Reference: https://cloud.google.com/vertex-ai/docs/generative-ai/chat/test-chat-prompts
@@ -1253,16 +1264,18 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         google_maps_retrieval_config: dict | None = None
         computerUse: dict | None = None
         # remove 'additionalProperties' from tools
-        schema_value: Final[JsonValue] = deepcopy(cast(JsonValue, value))  # cast-ok: tools are JSON request data
-        remove_additional_properties(schema_value)
-        # remove 'strict' from tools
-        remove_strict_from_schema(schema_value)
-
+        schema_value: Final[JsonValue] = cast(JsonValue, value)  # cast-ok: tools are JSON request data
         inlined_tools: Final = _with_namespace_members_inlined(schema_value, outside_declarations)
-        for tool in cast(list[dict], inlined_tools):  # cast-ok: a deep copy keeps the caller's tool shape
+        supported_schema: Final = remove_additional_properties(inlined_tools)
+        # remove 'strict' from tools
+        supported_tools: Final = TypeAdapter(list[dict[str, JsonValue]]).validate_python(
+            remove_strict_from_schema(supported_schema)
+        )
+
+        for tool in supported_tools:
             openai_function_object: ChatCompletionToolParamFunctionChunk | None = None
             if "function" in tool:  # tools list
-                _openai_function_object = ChatCompletionToolParamFunctionChunk(**tool["function"])
+                _openai_function_object = _validated_function_definition(tool["function"])
 
                 if (
                     "parameters" in _openai_function_object
@@ -1276,7 +1289,7 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 openai_function_object = _openai_function_object
 
             elif "name" in tool:  # functions list
-                openai_function_object = ChatCompletionToolParamFunctionChunk(**tool)
+                openai_function_object = _validated_function_definition(tool)
 
             if "type" in tool and tool["type"] == "computer_use":
                 computer_use_config = {k: v for k, v in tool.items() if k != "type"}
@@ -1333,10 +1346,6 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 )
                 _description = openai_function_object.get("description", None)
                 _parameters = openai_function_object.get("parameters", None)
-                if isinstance(_parameters, str) and len(_parameters) == 0:
-                    _parameters = {
-                        "type": "object",
-                    }
                 if _description is not None:
                     gtool_func_declaration["description"] = _description
                 if _parameters is not None:

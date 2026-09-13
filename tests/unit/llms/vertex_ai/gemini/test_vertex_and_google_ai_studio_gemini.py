@@ -2069,6 +2069,33 @@ def test_vertex_ai_tool_choice_naming_a_namespace_gemini_gets_no_member_of(
     assert dropped["tools"][0]["function_declarations"]
 
 
+@pytest.mark.parametrize("parameter", ["tools", "functions"])
+def test_vertex_ai_tools_remove_strict_switch_and_preserve_strict_parameter(parameter: str) -> None:
+    function: Final = {
+        "name": "run_task",
+        "strict": False,
+        "parameters": {
+            "type": "object",
+            "properties": {"strict": {"type": "boolean"}},
+            "required": ["strict"],
+            "additionalProperties": False,
+        },
+    }
+    definitions: Final = [{"type": "function", "function": function}] if parameter == "tools" else [function]
+    original: Final = deepcopy(definitions)
+    mapped: Final = VertexGeminiConfig().map_openai_params(
+        non_default_params={parameter: definitions}, optional_params={}, model="fixture-model", drop_params=False
+    )
+    parameters: Final = mapped["tools"][0]["function_declarations"][0]["parameters"]
+
+    assert parameters == {
+        "type": "object",
+        "properties": {"strict": {"type": "boolean"}},
+        "required": ["strict"],
+    }
+    assert definitions == original
+
+
 def test_vertex_ai_map_tool_with_anyof():
     """
     Related issue: https://github.com/BerriAI/litellm/issues/11164
@@ -2586,7 +2613,17 @@ def test_gemini_thinking(respx_mock: respx.MockRouter) -> None:
 
 
 @pytest.mark.respx(assert_all_called=True)
-def test_gemini_with_empty_function_call_arguments(respx_mock: respx.MockRouter) -> None:
+@pytest.mark.parametrize("entry_point", ["tools", "functions"])
+@pytest.mark.parametrize(
+    ("parameters", "expected_declaration"),
+    [("", {"name": "ping", "parameters": {"type": "object"}}), (None, {"name": "ping"})],
+)
+def test_gemini_with_empty_function_call_arguments(
+    respx_mock: respx.MockRouter,
+    entry_point: Literal["tools", "functions"],
+    parameters: str | None,
+    expected_declaration: dict[str, object],
+) -> None:
     route: Final = respx_mock.post(
         url__regex=r"https://generativelanguage\.googleapis\.com/v1beta/models/gemini-2\.5-flash:generateContent.*"
     ).mock(
@@ -2600,17 +2637,24 @@ def test_gemini_with_empty_function_call_arguments(respx_mock: respx.MockRouter)
             },
         )
     )
-    completion(
+    function: Final = {"name": "ping", "parameters": parameters}
+    request_params: Final = {
+        entry_point: [{"type": "function", "function": function}] if entry_point == "tools" else [function]
+    }
+    original_params: Final = deepcopy(request_params)
+    response: Final = completion(
         model="gemini/gemini-2.5-flash",
         messages=[{"role": "user", "content": "Call ping"}],
-        tools=[{"type": "function", "function": {"name": "ping", "parameters": ""}}],
         api_key="test-api-key",
         client=HTTPHandler(),
+        **request_params,
     )
     request_body: Final = json.loads(route.calls.last.request.content)
 
     assert route.called
-    assert request_body["tools"] == [{"function_declarations": [{"name": "ping", "parameters": {"type": "object"}}]}]
+    assert request_body["tools"] == [{"function_declarations": [expected_declaration]}]
+    assert response.choices[0].message.content == "Ready"
+    assert request_params == original_params
 
 
 @pytest.mark.usefixtures("_gemini_httpx_transport")
