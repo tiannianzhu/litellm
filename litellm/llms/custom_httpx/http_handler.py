@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import AsyncIterable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterable, Mapping
 from http.cookiejar import CookieJar, DefaultCookiePolicy
 from io import BytesIO
 from types import MappingProxyType
@@ -622,6 +622,36 @@ class MaskedHTTPStatusError(httpx.HTTPStatusError):
         self.status_code = original_error.response.status_code
 
 
+class _HandlerOwnedStream(httpx.AsyncByteStream):
+    def __init__(
+        self,
+        stream: httpx.AsyncByteStream,
+        owner: "AsyncHTTPHandler",
+        *,
+        client_to_close: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._stream = stream
+        self._owner: AsyncHTTPHandler | None = owner
+        self._client_to_close = client_to_close
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._owner is None:
+            return
+        try:
+            await self._stream.aclose()
+        finally:
+            self._owner = None
+            if self._client_to_close is not None:
+                await self._client_to_close.aclose()
+
+
 class AsyncHTTPHandler:
     def __init__(
         self,
@@ -701,11 +731,30 @@ class AsyncHTTPHandler:
 
         # Get default headers (User-Agent, overridable via LITELLM_USER_AGENT)
         default_headers: Final = get_default_headers()
+        owner_ref: Final = weakref.ref(self)
+
+        async def retain_stream_owner(response: httpx.Response) -> None:
+            owner: Final = owner_ref()
+            if owner is not None and not response.is_closed and isinstance(response.stream, httpx.AsyncByteStream):
+                response.stream = _HandlerOwnedStream(response.stream, owner)  # rebind-ok: Wrap HTTPX body.
+
+        existing_hooks: Final[Mapping[str, list[Callable[..., object]]]] = (
+            event_hooks if event_hooks is not None else MappingProxyType({})
+        )
+        hooks: Final = MappingProxyType(
+            {
+                **existing_hooks,
+                "response": [
+                    retain_stream_owner,
+                    *existing_hooks.get("response", ()),
+                ],
+            }
+        )
 
         return httpx.AsyncClient(
             transport=transport,
             mounts=AsyncHTTPHandler.create_httpx_proxy_mounts(transport, verify=ssl_config, cert=cert),
-            event_hooks=event_hooks,
+            event_hooks=hooks,
             timeout=timeout,
             verify=ssl_config,
             cert=cert,
@@ -867,8 +916,9 @@ class AsyncHTTPHandler:
                     stream=stream,
                     content=content,
                 )
-            finally:
+            except BaseException:
                 await new_client.aclose()
+                raise
         except httpx.TimeoutException as e:
             end_time: Final = time.time()
             time_delta: Final = round(end_time - start_time, 3)
@@ -942,9 +992,10 @@ class AsyncHTTPHandler:
                     retried.raise_for_status()
                 except httpx.HTTPStatusError as retried_error:
                     await _raise_masked_async_error(retried_error, stream)
-                return retried
-            finally:
+                return await self._retain_retry_client(retried, new_client)
+            except BaseException:
                 await new_client.aclose()
+                raise
         except httpx.TimeoutException as e:
             headers = {}
             error_response: Final[httpx.Response | None] = getattr(e, "response", None)
@@ -1009,8 +1060,9 @@ class AsyncHTTPHandler:
                     stream=stream,
                     content=content,
                 )
-            finally:
+            except BaseException:
                 await new_client.aclose()
+                raise
         except httpx.TimeoutException as e:
             headers = {}
             error_response: Final[httpx.Response | None] = getattr(e, "response", None)
@@ -1077,8 +1129,9 @@ class AsyncHTTPHandler:
                     stream=stream,
                     content=content,
                 )
-            finally:
+            except BaseException:
                 await new_client.aclose()
+                raise
         except httpx.HTTPStatusError as e:
             await _raise_masked_async_error(e, stream)
         except Exception as e:
@@ -1115,6 +1168,15 @@ class AsyncHTTPHandler:
         )
         response: Final = await client.send(req, stream=stream)
         response.raise_for_status()
+        return await self._retain_retry_client(response, client)
+
+    async def _retain_retry_client(self, response: httpx.Response, client: httpx.AsyncClient) -> httpx.Response:
+        if not response.is_closed and isinstance(response.stream, httpx.AsyncByteStream):
+            response.stream = _HandlerOwnedStream(  # rebind-ok: Response owns the private retry client.
+                response.stream, self, client_to_close=client
+            )
+        else:
+            await client.aclose()
         return response
 
     # Strong references to finalizer-scheduled client-close tasks. A bare
@@ -1762,7 +1824,8 @@ def get_async_httpx_client(
             except Exception:
                 pass
 
-    _cache_key_name: Final = "async_httpx_client" + _params_key_name + llm_provider
+    session_key: Final = f"_session_{id(shared_session)}" if shared_session is not None else ""
+    _cache_key_name: Final = "async_httpx_client" + _params_key_name + llm_provider + session_key
 
     # Lazily initialize the global in-memory client cache to avoid relying on
     # litellm globals being fully populated during import time.

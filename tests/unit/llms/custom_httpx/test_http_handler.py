@@ -6,7 +6,7 @@ import pathlib
 import ssl
 import threading
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Final
 from unittest.mock import MagicMock, patch
@@ -14,8 +14,9 @@ from unittest.mock import MagicMock, patch
 import certifi
 import httpx
 import pytest
+import pytest_asyncio
 import respx
-from aiohttp import ClientSession, TCPConnector
+from aiohttp import ClientSession, TCPConnector, web
 
 import litellm
 from litellm.caching.llm_caching_handler import LLMClientCache
@@ -27,6 +28,7 @@ from litellm.llms.custom_httpx.http_handler import (
     MaskedHTTPStatusError,
     get_httpx_client,
     get_shared_realtime_ssl_context,
+    get_async_httpx_client,
     get_ssl_configuration,
     realtime_ssl_for_url,
 )
@@ -36,6 +38,160 @@ from litellm.exceptions import Timeout as LitellmTimeout
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 from litellm.utils import _invalidate_model_cost_lowercase_map
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def gated_stream_server():
+    release = asyncio.Event()
+
+    async def stream(request):
+        response = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b"data: first\n\n")
+        await release.wait()
+        if request.query.get("abort"):
+            request.transport.close()
+            return response
+        try:
+            await response.write(b"data: last\n\n")
+            await response.write_eof()
+        except ConnectionResetError:
+            pass
+        return response
+
+    app = web.Application()
+    app.router.add_get("/", stream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}/", release
+    finally:
+        release.set()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "close", "cancel", "error"])
+async def test_evicted_handler_keeps_concurrent_streams_alive(gated_stream_server, ending):
+    from litellm.caching.evicted_client_closer import EvictedClientCloser
+    from litellm.caching.llm_caching_handler import LLMClientCache
+
+    url, release = gated_stream_server
+    cache = LLMClientCache(evicted_client_closer=EvictedClientCloser(grace_seconds=0))
+    handler = AsyncHTTPHandler()
+    cache.set_cache("stream-owner", handler, litellm_owned_client=True)
+    first = await handler.client.send(handler.client.build_request("GET", url), stream=True)
+    second_url = url + "?abort=1" if ending == "error" else url
+    second = await handler.client.send(handler.client.build_request("GET", second_url), stream=True)
+    iterator = second.aiter_bytes()
+    assert await anext(iterator) == b"data: first\n\n"
+    session = handler.client._transport.client
+    owner = weakref.ref(handler)
+    cache._remove_key(cache.update_cache_key_with_event_loop("stream-owner"))
+    del handler
+    gc.collect()
+    await asyncio.sleep(0)
+    try:
+        assert owner() is not None
+        assert not session.closed
+        await first.aclose()
+        cache.evicted_client_closer.reap()
+        await asyncio.sleep(0)
+        assert owner() is not None
+        assert not session.closed
+        if ending == "complete":
+            release.set()
+            assert await asyncio.wait_for(anext(iterator), 2) == b"data: last\n\n"
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+        elif ending == "cancel":
+            pending = asyncio.create_task(anext(iterator))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        elif ending == "error":
+            release.set()
+            with pytest.raises(httpx.ReadError):
+                await asyncio.wait_for(anext(iterator), 2)
+        else:
+            await second.aclose()
+        gc.collect()
+        await asyncio.sleep(0)
+        assert owner() is None
+        assert session.closed
+    finally:
+        await first.aclose()
+        await second.aclose()
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_fails", [False, True])
+async def test_stream_owner_preserves_hooks_and_releases_nonstream_responses(gated_stream_server, hook_fails):
+    url, release = gated_stream_server
+    observed = []
+
+    async def on_request(request):
+        observed.append(request.method)
+
+    async def on_response(response):
+        observed.append(response.status_code)
+        if hook_fails:
+            raise ValueError("fixture hook error")
+        await response.aread()
+
+    hooks = {"request": [on_request], "response": [on_response]}
+    handler = AsyncHTTPHandler(event_hooks=hooks)
+    owner = weakref.ref(handler)
+    release.set()
+    try:
+        if hook_fails:
+            with pytest.raises(ValueError, match="fixture hook error"):
+                await handler.client.get(url)
+        else:
+            response = await handler.client.get(url)
+            assert response.content == b"data: first\n\ndata: last\n\n"
+            assert response.is_closed
+        assert observed == ["GET", 200]
+        assert hooks == {"request": [on_request], "response": [on_response]}
+    finally:
+        session = handler.client._transport.client
+        del handler
+        gc.collect()
+        await asyncio.sleep(0)
+        try:
+            assert owner() is None
+            assert session.closed
+        finally:
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cached_handlers_do_not_mix_shared_sessions(monkeypatch):
+    from litellm.caching.llm_caching_handler import LLMClientCache
+
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    async with ClientSession() as first_session, ClientSession() as second_session:
+        private = get_async_httpx_client("openai")
+        first = get_async_httpx_client("openai", shared_session=first_session)
+        second = get_async_httpx_client("openai", shared_session=second_session)
+        try:
+            assert first is not private
+            assert first is not second
+            assert first.shared_session is first_session
+            assert second.shared_session is second_session
+            assert get_async_httpx_client("openai", shared_session=first_session) is first
+            assert get_async_httpx_client("openai") is private
+        finally:
+            await private.close()
+            await first.close()
+            await second.close()
+        assert not first_session.closed
+        assert not second_session.closed
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1631,87 @@ class _RetryClientHandler(AsyncHTTPHandler):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+@pytest.mark.parametrize("ending", ["complete", "close", "cancel", "error"])
+async def test_streaming_retry_keeps_client_open_until_stream_ends(method: str, ending: str) -> None:
+    blocked: Final = asyncio.Event()
+
+    class RetriedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for chunk in (b"first", b"last"):
+                if retry.is_closed:
+                    raise httpx.ReadError("Connection closed.")
+                if chunk == b"last" and ending == "cancel":
+                    await blocked.wait()
+                if chunk == b"last" and ending == "error":
+                    raise httpx.ReadError("fixture read failure")
+                yield chunk
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+
+    body: Final = RetriedStream()
+
+    async def connection_fault(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("fixture connection failure", request=request)
+
+    async def retry_response(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, stream=body)
+
+    first: Final = httpx.AsyncClient(transport=httpx.MockTransport(connection_fault))
+    retry: Final = httpx.AsyncClient(transport=httpx.MockTransport(retry_response))
+    async with first, retry:
+        handler: Final = _RetryClientHandler(first=first, retry=retry)
+        response: Final = await getattr(handler, method)("https://api.example.com/stream", stream=True)
+        assert not retry.is_closed, "returning the response must keep its retry connection open"
+        iterator: Final = response.aiter_bytes()
+        assert await anext(iterator) == b"first"
+        if ending == "complete":
+            assert await anext(iterator) == b"last"
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+        elif ending == "cancel":
+            pending: Final = asyncio.create_task(anext(iterator))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        elif ending == "error":
+            with pytest.raises(httpx.ReadError, match="fixture read failure"):
+                await anext(iterator)
+        else:
+            await response.aclose()
+        assert retry.is_closed, "ending the response stream must release its private retry client"
+        await response.aclose()
+        assert body.close_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+@pytest.mark.parametrize("failure", ["send", "status"])
+async def test_streaming_retry_closes_client_when_no_response_is_returned(method: str, failure: str) -> None:
+    async def connection_fault(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("fixture connection failure", request=request)
+
+    async def retry_failure(request: httpx.Request) -> httpx.Response:
+        if failure == "send":
+            raise httpx.ConnectError("fixture retry failure", request=request)
+        return httpx.Response(400, request=request, content=b"fixture status failure")
+
+    first: Final = httpx.AsyncClient(transport=httpx.MockTransport(connection_fault))
+    retry: Final = httpx.AsyncClient(transport=httpx.MockTransport(retry_failure))
+    async with first, retry:
+        handler: Final = _RetryClientHandler(first=first, retry=retry)
+        expected_error: Final = httpx.ConnectError if failure == "send" else httpx.HTTPStatusError
+        with pytest.raises(expected_error):
+            await getattr(handler, method)("https://api.example.com/stream", stream=True)
+        assert retry.is_closed, "an unsuccessful retry must not leak its private client"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
 async def test_connection_error_retry_forwards_content(method: str):
     captured: Final[list[tuple[str, bytes]]] = []  # mutable-ok: async closure capture buffer
 
@@ -1494,6 +1731,7 @@ async def test_connection_error_retry_forwards_content(method: str):
         await getattr(handler, method)("https://api.example.com/runs/batch", content=body)
 
         assert captured == [(method.upper(), body)]
+        assert retry.is_closed, "a completed nonstream response must release its retry client"
         await handler.close()
 
 
@@ -1543,6 +1781,7 @@ async def test_idempotent_disconnect_is_replayed(method: str) -> None:
 
         assert response.status_code == 200
         assert captured == [(method.upper(), body)]
+        assert retry.is_closed, "a completed nonstream response must release its retry client"
         await handler.close()
 
 
