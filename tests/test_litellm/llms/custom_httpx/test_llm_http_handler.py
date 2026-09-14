@@ -2912,6 +2912,84 @@ async def test_generic_http_handler_async_streaming_forwards_provider_response_h
     assert "".join([chunk.choices[0].delta.content or "" for chunk in collected]) == "hi"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fake_stream", (False, True))
+async def test_async_streaming_reuses_the_provided_aiohttp_session(
+    monkeypatch: pytest.MonkeyPatch, fake_stream: bool
+) -> None:
+    from aiohttp import ClientSession, TraceConfig, web
+
+    from litellm.caching.llm_caching_handler import LLMClientCache
+    from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
+
+    async def completion_stream(_: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await response.prepare(_)
+        await response.write(_GENERIC_STREAM_SSE)
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/", completion_stream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f"http://127.0.0.1:{port}/"
+    shared_request_urls: list[str] = []
+    trace_config = TraceConfig()
+
+    async def record_shared_session_request(_, __, params) -> None:
+        shared_request_urls.append(str(params.url))
+
+    trace_config.on_request_start.append(record_shared_session_request)
+    shared_session = ClientSession(trace_configs=[trace_config])
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    provider_config = Mock()
+    provider_config.validate_environment.return_value = {}
+    provider_config.get_complete_url.return_value = url
+    provider_config.transform_request.return_value = {"model": "test-model", "messages": []}
+    provider_config.sign_request.return_value = ({}, None)
+    provider_config.max_retry_on_unprocessable_entity_error = 0
+    provider_config.should_fake_stream.return_value = fake_stream
+    provider_config.has_custom_stream_wrapper = False
+    provider_config.uses_async_transform_request = False
+    provider_config.get_model_response_iterator.side_effect = lambda streaming_response, sync_stream: (
+        BaseModelResponseIterator(streaming_response, sync_stream)
+    )
+    provider_config.transform_response.return_value = ModelResponse()
+    handler = BaseLLMHTTPHandler()
+    logging_obj = Mock()
+    logging_obj.model_call_details = {"litellm_params": {}}
+    logging_obj.dynamic_success_callbacks = []
+
+    try:
+        stream = await handler.completion(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            api_base=url,
+            custom_llm_provider="hosted_vllm",
+            model_response=ModelResponse(),
+            encoding=None,
+            logging_obj=logging_obj,
+            optional_params={},
+            timeout=5,
+            litellm_params={},
+            acompletion=True,
+            stream=True,
+            provider_config=provider_config,
+            shared_session=shared_session,
+        )
+        _ = [chunk async for chunk in stream]
+
+        assert shared_request_urls == [url]
+        assert shared_session.closed is False
+    finally:
+        await shared_session.close()
+        await runner.cleanup()
+
+
 @pytest.mark.parametrize(
     "custom_llm_provider, enabled, expected",
     [("openai", True, True), ("openai", False, False), ("azure", True, False),
