@@ -42,11 +42,36 @@ from litellm.llms.custom_httpx.http_handler import (
     MaskedHTTPStatusError,
     get_httpx_client,
     get_shared_realtime_ssl_context,
+    get_async_httpx_client,
     get_ssl_configuration,
     realtime_ssl_for_url,
 )
 from litellm.types.llms.custom_http import VerifyTypes
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
+
+
+@pytest.mark.asyncio
+async def test_cached_handlers_do_not_mix_shared_sessions(monkeypatch):
+    from litellm.caching.llm_caching_handler import LLMClientCache
+
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    async with ClientSession() as first_session, ClientSession() as second_session:
+        private = get_async_httpx_client("openai")
+        first = get_async_httpx_client("openai", shared_session=first_session)
+        second = get_async_httpx_client("openai", shared_session=second_session)
+        try:
+            assert first is not private
+            assert first is not second
+            assert first.shared_session is first_session
+            assert second.shared_session is second_session
+            assert get_async_httpx_client("openai", shared_session=first_session) is first
+            assert get_async_httpx_client("openai") is private
+        finally:
+            await private.close()
+            await first.close()
+            await second.close()
+        assert not first_session.closed
+        assert not second_session.closed
 
 
 @pytest.mark.asyncio
@@ -1655,6 +1680,97 @@ class _RetryClientHandler(AsyncHTTPHandler):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "ending"),
+    [
+        ("post", "complete"),
+        ("put", "complete"),
+        ("patch", "complete"),
+        ("delete", "complete"),
+        ("post", "close"),
+        ("post", "cancel"),
+        ("post", "error"),
+    ],
+)
+async def test_streaming_retry_keeps_client_open_until_stream_ends(method: str, ending: str) -> None:
+    blocked: Final = asyncio.Event()
+
+    class RetriedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            for chunk in (b"first", b"last"):
+                if retry.is_closed:
+                    raise httpx.ReadError("Connection closed.")
+                if chunk == b"last" and ending == "cancel":
+                    await blocked.wait()
+                if chunk == b"last" and ending == "error":
+                    raise httpx.ReadError("fixture read failure")
+                yield chunk
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+
+    body: Final = RetriedStream()
+
+    async def connection_fault(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("fixture connection failure", request=request)
+
+    async def retry_response(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, stream=body)
+
+    first: Final = httpx.AsyncClient(transport=httpx.MockTransport(connection_fault))
+    retry: Final = httpx.AsyncClient(transport=httpx.MockTransport(retry_response))
+    async with first, retry:
+        handler: Final = _RetryClientHandler(first=first, retry=retry)
+        response: Final = await getattr(handler, method)("https://api.example.com/stream", stream=True)
+        assert not retry.is_closed, "returning the response must keep its retry connection open"
+        iterator: Final = response.aiter_bytes()
+        assert await anext(iterator) == b"first"
+        if ending == "complete":
+            assert await anext(iterator) == b"last"
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+        elif ending == "cancel":
+            pending: Final = asyncio.create_task(anext(iterator))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        elif ending == "error":
+            with pytest.raises(httpx.ReadError, match="fixture read failure"):
+                await anext(iterator)
+        else:
+            await response.aclose()
+        assert retry.is_closed, "ending the response stream must release its private retry client"
+        await response.aclose()
+        assert body.close_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+@pytest.mark.parametrize("failure", ["send", "status"])
+async def test_streaming_retry_closes_client_when_no_response_is_returned(method: str, failure: str) -> None:
+    async def connection_fault(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("fixture connection failure", request=request)
+
+    async def retry_failure(request: httpx.Request) -> httpx.Response:
+        if failure == "send":
+            raise httpx.ConnectError("fixture retry failure", request=request)
+        return httpx.Response(400, request=request, content=b"fixture status failure")
+
+    first: Final = httpx.AsyncClient(transport=httpx.MockTransport(connection_fault))
+    retry: Final = httpx.AsyncClient(transport=httpx.MockTransport(retry_failure))
+    async with first, retry:
+        handler: Final = _RetryClientHandler(first=first, retry=retry)
+        expected_error: Final = httpx.ConnectError if failure == "send" else httpx.HTTPStatusError
+        with pytest.raises(expected_error):
+            await getattr(handler, method)("https://api.example.com/stream", stream=True)
+        assert retry.is_closed, "an unsuccessful retry must not leak its private client"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
 async def test_connection_error_retry_forwards_content(method: str):
     captured: Final[list[tuple[str, bytes]]] = []  # mutable-ok: async closure capture buffer
@@ -1675,6 +1791,7 @@ async def test_connection_error_retry_forwards_content(method: str):
         await getattr(handler, method)("https://api.example.com/runs/batch", content=body)
 
         assert captured == [(method.upper(), body)]
+        assert retry.is_closed, "a completed nonstream response must release its retry client"
         await handler.close()
 
 
@@ -1853,6 +1970,7 @@ async def test_idempotent_disconnect_is_replayed(method: str) -> None:
 
         assert response.status_code == 200
         assert captured == [(method.upper(), body)]
+        assert retry.is_closed, "a completed nonstream response must release its retry client"
         await handler.close()
 
 
