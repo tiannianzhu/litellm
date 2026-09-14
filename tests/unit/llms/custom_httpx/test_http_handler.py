@@ -13,7 +13,8 @@ from unittest.mock import MagicMock, patch
 import certifi
 import httpx
 import pytest
-from aiohttp import ClientSession, TCPConnector
+import pytest_asyncio
+from aiohttp import ClientSession, TCPConnector, web
 
 import litellm
 from litellm.llms.custom_httpx.aiohttp_transport import LiteLLMAiohttpTransport
@@ -23,9 +24,164 @@ from litellm.llms.custom_httpx.http_handler import (
     HTTPHandler,
     MaskedHTTPStatusError,
     _get_httpx_client,
+    get_async_httpx_client,
     get_ssl_configuration,
 )
 from litellm.types.llms.custom_http import VerifyTypes
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def gated_stream_server():
+    release = asyncio.Event()
+
+    async def stream(request):
+        response = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b"data: first\n\n")
+        await release.wait()
+        if request.query.get("abort"):
+            request.transport.close()
+            return response
+        try:
+            await response.write(b"data: last\n\n")
+            await response.write_eof()
+        except ConnectionResetError:
+            pass
+        return response
+
+    app = web.Application()
+    app.router.add_get("/", stream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}/", release
+    finally:
+        release.set()
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["complete", "close", "cancel", "error"])
+async def test_evicted_handler_keeps_concurrent_streams_alive(gated_stream_server, ending):
+    from litellm.caching.evicted_client_closer import EvictedClientCloser
+    from litellm.caching.llm_caching_handler import LLMClientCache
+
+    url, release = gated_stream_server
+    cache = LLMClientCache(evicted_client_closer=EvictedClientCloser(grace_seconds=0))
+    handler = AsyncHTTPHandler()
+    cache.set_cache("stream-owner", handler, litellm_owned_client=True)
+    first = await handler.client.send(handler.client.build_request("GET", url), stream=True)
+    second_url = url + "?abort=1" if ending == "error" else url
+    second = await handler.client.send(handler.client.build_request("GET", second_url), stream=True)
+    iterator = second.aiter_bytes()
+    assert await anext(iterator) == b"data: first\n\n"
+    session = handler.client._transport.client
+    owner = weakref.ref(handler)
+    cache._remove_key(cache.update_cache_key_with_event_loop("stream-owner"))
+    del handler
+    gc.collect()
+    await asyncio.sleep(0)
+    try:
+        assert owner() is not None
+        assert not session.closed
+        await first.aclose()
+        cache.evicted_client_closer.reap()
+        await asyncio.sleep(0)
+        assert owner() is not None
+        assert not session.closed
+        if ending == "complete":
+            release.set()
+            assert await asyncio.wait_for(anext(iterator), 2) == b"data: last\n\n"
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+        elif ending == "cancel":
+            pending = asyncio.create_task(anext(iterator))
+            await asyncio.sleep(0)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        elif ending == "error":
+            release.set()
+            with pytest.raises(httpx.ReadError):
+                await asyncio.wait_for(anext(iterator), 2)
+        else:
+            await second.aclose()
+        gc.collect()
+        await asyncio.sleep(0)
+        assert owner() is None
+        assert session.closed
+    finally:
+        await first.aclose()
+        await second.aclose()
+        await session.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_fails", [False, True])
+async def test_stream_owner_preserves_hooks_and_releases_nonstream_responses(gated_stream_server, hook_fails):
+    url, release = gated_stream_server
+    observed = []
+
+    async def on_request(request):
+        observed.append(request.method)
+
+    async def on_response(response):
+        observed.append(response.status_code)
+        if hook_fails:
+            raise ValueError("fixture hook error")
+        await response.aread()
+
+    hooks = {"request": [on_request], "response": [on_response]}
+    handler = AsyncHTTPHandler(event_hooks=hooks)
+    owner = weakref.ref(handler)
+    release.set()
+    try:
+        if hook_fails:
+            with pytest.raises(ValueError, match="fixture hook error"):
+                await handler.client.get(url)
+        else:
+            response = await handler.client.get(url)
+            assert response.content == b"data: first\n\ndata: last\n\n"
+            assert response.is_closed
+        assert observed == ["GET", 200]
+        assert hooks == {"request": [on_request], "response": [on_response]}
+    finally:
+        session = handler.client._transport.client
+        del handler
+        gc.collect()
+        await asyncio.sleep(0)
+        try:
+            assert owner() is None
+            assert session.closed
+        finally:
+            await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cached_handlers_do_not_mix_shared_sessions(monkeypatch):
+    from litellm.caching.llm_caching_handler import LLMClientCache
+
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    async with ClientSession() as first_session, ClientSession() as second_session:
+        private = get_async_httpx_client("openai")
+        first = get_async_httpx_client("openai", shared_session=first_session)
+        second = get_async_httpx_client("openai", shared_session=second_session)
+        try:
+            assert first is not private
+            assert first is not second
+            assert first.shared_session is first_session
+            assert second.shared_session is second_session
+            assert get_async_httpx_client("openai", shared_session=first_session) is first
+            assert get_async_httpx_client("openai") is private
+        finally:
+            await private.close()
+            await first.close()
+            await second.close()
+        assert not first_session.closed
+        assert not second_session.closed
 
 
 @pytest.mark.asyncio
