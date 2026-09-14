@@ -3526,6 +3526,86 @@ async def test_generic_http_handler_async_streaming_forwards_provider_response_h
     assert "".join([chunk.choices[0].delta.content or "" for chunk in collected]) == "hi"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fake_stream", (False, True))
+async def test_async_streaming_reuses_the_provided_aiohttp_session(
+    monkeypatch: pytest.MonkeyPatch, fake_stream: bool
+) -> None:
+    from aiohttp import ClientSession, TraceConfig, web
+
+    from litellm.caching.llm_caching_handler import LLMClientCache
+    from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
+
+    async def completion_stream(request: web.Request) -> web.StreamResponse:
+        body: Final = await request.json()
+        assert body.get("stream", False) is (not fake_stream)
+        if fake_stream:
+            return web.json_response(
+                {
+                    "id": "chatcmpl-session",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "test-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+            )
+        response = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(_GENERIC_STREAM_SSE)
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/chat/completions", completion_stream)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    url = f"http://127.0.0.1:{port}/chat/completions"
+    shared_request_urls: list[str] = []
+    trace_config = TraceConfig()
+
+    async def record_shared_session_request(_, __, params) -> None:
+        shared_request_urls.append(str(params.url))
+
+    trace_config.on_request_start.append(record_shared_session_request)
+    shared_session = ClientSession(trace_configs=[trace_config])
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", LLMClientCache())
+    provider_config: Final = HostedVLLMChatConfig()
+    handler: Final = BaseLLMHTTPHandler()
+    logging_obj: Final = _streaming_logging_obj()
+
+    try:
+        stream = await handler.completion(
+            model="test-model",
+            messages=[{"role": "user", "content": "hello"}],
+            api_base=url,
+            custom_llm_provider="hosted_vllm",
+            model_response=ModelResponse(),
+            encoding=None,
+            logging_obj=logging_obj,
+            optional_params={},
+            timeout=5,
+            litellm_params={},
+            acompletion=True,
+            stream=True,
+            provider_config=provider_config,
+            shared_session=shared_session,
+            fake_stream=fake_stream,
+        )
+        chunks: Final = [chunk async for chunk in stream]
+
+        assert "".join(chunk.choices[0].delta.content or "" for chunk in chunks) == "hi"
+
+        assert shared_request_urls == [url]
+        assert shared_session.closed is False
+    finally:
+        await shared_session.close()
+        await runner.cleanup()
+
+
 @pytest.mark.parametrize("custom_llm_provider", ["openai", "azure", "hosted_vllm", None])
 def test_the_rust_responses_websocket_stays_on_python_with_the_switch_on(custom_llm_provider, monkeypatch):
     from litellm.rust_bridge import configuration
