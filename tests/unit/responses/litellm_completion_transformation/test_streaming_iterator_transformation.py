@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import litellm
+from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
 from litellm.responses.litellm_completion_transformation.streaming_iterator import (
     LiteLLMCompletionStreamingIterator,
 )
@@ -36,6 +38,16 @@ from litellm.types.utils import (
 CHAT_COMPLETION_ID = "chatcmpl-77d33d09-effa-4cd2-9c0d-c742d4358256"
 RESPONSE_ID_EVENT_TYPES = frozenset(
     {"response.created", "response.in_progress", "response.completed"}
+)
+_HOSTED_EXEC_GRAMMAR: Final = "\n".join(
+    (
+        "start: pragma_source | plain_source",
+        "pragma_source: PRAGMA_LINE NEWLINE SOURCE",
+        "plain_source: SOURCE",
+        r"PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/",
+        r"NEWLINE: /\r?\n/",
+        r"SOURCE: /[\s\S]+/",
+    )
 )
 
 
@@ -83,12 +95,16 @@ class _FakeStreamWrapper:
         return chunk
 
 
-def _build_iterator(chunks, custom_llm_provider: str = "anthropic") -> LiteLLMCompletionStreamingIterator:
+def _build_iterator(
+    chunks,
+    custom_llm_provider: str = "anthropic",
+    responses_api_request=None,
+) -> LiteLLMCompletionStreamingIterator:
     return LiteLLMCompletionStreamingIterator(
         model="claude-haiku-4-5",
         litellm_custom_stream_wrapper=_FakeStreamWrapper(chunks),
         request_input="What is the weather in San Francisco?",
-        responses_api_request={},
+        responses_api_request=responses_api_request or {},
         custom_llm_provider=custom_llm_provider,
         litellm_metadata={},
     )
@@ -950,6 +966,34 @@ def _tool_call_chunk(finish_reason: str | None = None) -> ModelResponseStream:
     )
 
 
+def _custom_tool_call_chunk(
+    wire_name: str,
+    arguments: str,
+    call_id: str | None,
+    finish_reason: str | None = None,
+) -> ModelResponseStream:
+    tool_call = {
+        "index": 0,
+        "type": "function",
+        "function": {"name": wire_name, "arguments": arguments},
+    }
+    if call_id is not None:
+        tool_call["id"] = call_id
+    return ModelResponseStream(
+        id=CHAT_COMPLETION_ID,
+        created=1748575031,
+        model="claude-haiku-4-5",
+        object="chat.completion.chunk",
+        choices=[
+            StreamingChoices(
+                index=0,
+                delta=Delta(role="assistant", content=None, tool_calls=[tool_call]),
+                finish_reason=finish_reason,
+            )
+        ],
+    )
+
+
 def test_streamed_named_tool_choice_is_echoed_in_responses_api_shape() -> None:
     iterator: Final = LiteLLMCompletionStreamingIterator(
         model="claude-haiku-4-5",
@@ -1031,6 +1075,18 @@ async def _collect_events(
     if sync_mode:
         return list(iterator)
     return [event async for event in iterator]
+
+
+async def _collect_events_until_bad_gateway(
+    iterator: LiteLLMCompletionStreamingIterator, sync_mode: bool
+) -> tuple[tuple[BaseLiteLLMOpenAIResponseObject, ...], litellm.BadGatewayError]:
+    events = []
+    while True:
+        try:
+            event = next(iterator) if sync_mode else await iterator.__anext__()
+        except litellm.BadGatewayError as exc:
+            return tuple(events), exc
+        events.append(event)
 
 
 def _is_message_item(event: BaseLiteLLMOpenAIResponseObject) -> bool:
@@ -1382,7 +1438,7 @@ def test_streaming_hosted_custom_wire_name_does_not_shadow_an_ordinary_function(
                     {
                         "type": "custom",
                         "name": "exec",
-                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+                        "format": {"type": "grammar", "syntax": "lark", "definition": _HOSTED_EXEC_GRAMMAR},
                     }
                 ],
             },
@@ -1470,6 +1526,131 @@ def test_streaming_custom_wire_name_rejects_invalid_content_envelope():
                 ],
             )
         )
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.parametrize("arguments", ('{"content":""}', "invalid"))
+@pytest.mark.asyncio
+async def test_hosted_exec_grammar_rejects_invalid_input_before_custom_done(sync_mode: bool, arguments: str):
+    request: Final = {
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": _HOSTED_EXEC_GRAMMAR},
+            }
+        ]
+    }
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map(request)))
+    iterator: Final = _build_iterator(
+        [_custom_tool_call_chunk(wire_name, arguments, "call_exec", finish_reason="tool_calls")],
+        custom_llm_provider="hosted_vllm",
+        responses_api_request=request,
+    )
+
+    events, error = await _collect_events_until_bad_gateway(iterator, sync_mode)
+    payloads: Final = tuple(event.model_dump(mode="json", exclude_none=True) for event in events)
+
+    assert error.status_code == 502
+    assert json.dumps(payloads, ensure_ascii=False)
+    assert all(payload["type"] != ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE for payload in payloads)
+    assert all(
+        payload["type"] != ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        or payload["item"]["type"] != "custom_tool_call"
+        for payload in payloads
+    )
+    assert all(payload["type"] != ResponsesAPIStreamEvents.RESPONSE_COMPLETED for payload in payloads)
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_hosted_exec_grammar_preserves_fragmented_unicode_whitespace(sync_mode: bool):
+    request: Final = {
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "shell",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": _HOSTED_EXEC_GRAMMAR},
+                    }
+                ],
+            }
+        ]
+    }
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map(request)))
+    custom_input: Final = "\tλ\n "
+    arguments: Final = json.dumps({"content": custom_input, "extra": "ignored"}, ensure_ascii=False)
+    split: Final = len(arguments) // 2
+    iterator: Final = _build_iterator(
+        [
+            _custom_tool_call_chunk(wire_name, arguments[:split], "call_exec"),
+            _custom_tool_call_chunk(wire_name, arguments[split:], None, finish_reason="tool_calls"),
+        ],
+        custom_llm_provider="hosted_vllm",
+        responses_api_request=request,
+    )
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    payloads: Final = tuple(event.model_dump(mode="json", exclude_none=True) for event in events)
+    input_done: Final = next(
+        payload for payload in payloads if payload["type"] == ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE
+    )
+    item_done: Final = next(
+        payload
+        for payload in payloads
+        if payload["type"] == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        and payload["item"]["type"] == "custom_tool_call"
+    )
+
+    assert json.dumps(payloads, ensure_ascii=False)
+    assert input_done["item_id"] == item_done["item"]["call_id"] == "call_exec"
+    assert input_done["input"] == item_done["item"]["input"] == custom_input
+    assert item_done["item"]["name"] == "exec"
+    assert item_done["item"]["namespace"] == "shell"
+    assert any(payload["type"] == ResponsesAPIStreamEvents.RESPONSE_COMPLETED for payload in payloads)
+
+
+@pytest.mark.parametrize(
+    "tool_format",
+    (
+        None,
+        {"type": "text"},
+        {"type": "grammar", "syntax": "lark", "definition": 'start: ""'},
+    ),
+)
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_hosted_nonexec_custom_tool_preserves_empty_custom_input(sync_mode: bool, tool_format):
+    tool = {"type": "custom", "name": "write"}
+    if tool_format is not None:
+        tool["format"] = tool_format
+    request: Final = {"tools": [tool]}
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map(request)))
+    iterator: Final = _build_iterator(
+        [
+            _custom_tool_call_chunk(
+                wire_name,
+                '{"content":"","extra":"preserved"}',
+                "call_write",
+                finish_reason="tool_calls",
+            )
+        ],
+        custom_llm_provider="hosted_vllm",
+        responses_api_request=request,
+    )
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    payloads: Final = tuple(event.model_dump(mode="json", exclude_none=True) for event in events)
+    input_done: Final = next(
+        payload for payload in payloads if payload["type"] == ResponsesAPIStreamEvents.CUSTOM_TOOL_CALL_INPUT_DONE
+    )
+
+    assert json.dumps(payloads)
+    assert input_done["input"] == ""
+    assert any(payload["type"] == ResponsesAPIStreamEvents.RESPONSE_COMPLETED for payload in payloads)
 
 
 @pytest.mark.parametrize("sync_mode", [True, False])

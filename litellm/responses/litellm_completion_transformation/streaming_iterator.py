@@ -10,11 +10,13 @@ import litellm
 from litellm.main import stream_chunk_builder
 from litellm.responses.litellm_completion_transformation.custom_tools import (
     build_tool_call_item_kwargs,
+    custom_tool_minimum_lengths,
     extract_custom_tool_names,
     is_custom_tool_call,
     native_responses_custom_tool_name_map,
     serialize_tool_call_arguments,
     unwrap_custom_tool_arguments_strict,
+    unwrap_custom_tool_arguments_with_min_length,
 )
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
@@ -606,7 +608,24 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         tool_namespace: str | None,
         arguments: str,
     ) -> None:
-        custom_input: Final = unwrap_custom_tool_arguments_strict(arguments)
+        minimum_lengths: Final = (
+            custom_tool_minimum_lengths(self.responses_api_request)
+            if self.custom_llm_provider == "hosted_vllm"
+            else None
+        )
+        try:
+            custom_input: Final = (
+                unwrap_custom_tool_arguments_with_min_length(
+                    arguments,
+                    minimum_lengths[(tool_name, tool_namespace)],
+                )
+                if minimum_lengths is not None
+                else unwrap_custom_tool_arguments_strict(arguments)
+            )
+        except ValueError as exc:
+            if self.custom_llm_provider != "hosted_vllm":
+                raise
+            raise litellm.BadGatewayError(message=str(exc), model=self.model, llm_provider="hosted_vllm") from exc
         for index in range(0, len(custom_input), 10):
             self._sequence_number += 1
             self._pending_tool_events.append(

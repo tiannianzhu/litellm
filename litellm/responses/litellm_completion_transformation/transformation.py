@@ -36,7 +36,7 @@ from typing_extensions import ReadOnly, TypedDict
 from litellm._logging import verbose_logger
 from litellm.caching import InMemoryCache
 from litellm.constants import REDACTED_BY_LITELLM, REDACTED_TOOL_CALL_ARGUMENTS_PLACEHOLDER
-from litellm.exceptions import BadRequestError
+from litellm.exceptions import BadGatewayError, BadRequestError
 from litellm.litellm_core_utils.get_supported_openai_params import (
     get_supported_openai_params,
 )
@@ -99,6 +99,7 @@ from litellm.types.utils import (
 
 from .custom_tools import (
     convert_custom_tool_to_function_tool,
+    custom_tool_minimum_lengths,
     extract_custom_tool_names,
     native_responses_custom_tool_name_map,
     normalize_native_responses_custom_tools,
@@ -106,6 +107,7 @@ from .custom_tools import (
     restrict_chat_tools_for_allowed_choice,
     serialize_tool_call_arguments,
     unwrap_custom_tool_arguments_strict,
+    unwrap_custom_tool_arguments_with_min_length,
     validated_allowed_callers,
 )
 
@@ -445,11 +447,14 @@ class LiteLLMCompletionResponsesConfig:
         """
         Transform a Responses API request into a Chat Completion request
         """
-        normalized: Final = (
-            normalize_native_responses_custom_tools(MappingProxyType({**responses_api_request, "input": input}))
-            if custom_llm_provider == "hosted_vllm"
-            else None
-        )
+        try:
+            normalized: Final = (
+                normalize_native_responses_custom_tools(MappingProxyType({**responses_api_request, "input": input}))
+                if custom_llm_provider == "hosted_vllm"
+                else None
+            )
+        except ValueError as exc:
+            raise BadRequestError(message=str(exc), model=model, llm_provider=custom_llm_provider or "") from exc
         if normalized is not None:
             input_error: Final = LiteLLMCompletionResponsesConfig._hosted_bridge_input_error(normalized.get("input"))
             if input_error is not None:
@@ -2244,6 +2249,11 @@ class LiteLLMCompletionResponsesConfig:
             if custom_llm_provider == "hosted_vllm"
             else MappingProxyType({name: (name, None) for name in extract_custom_tool_names(request_tools)})
         )
+        minimum_lengths: Final = (
+            custom_tool_minimum_lengths(responses_api_request or MappingProxyType({}))
+            if custom_llm_provider == "hosted_vllm"
+            else MappingProxyType({})
+        )
         namespace_tool_names: Final = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(request_tools)
 
         web_search_calls: Final = LiteLLMCompletionResponsesConfig._web_search_calls_by_call_id(
@@ -2264,8 +2274,18 @@ class LiteLLMCompletionResponsesConfig:
                     responses_tools.append(web_search_call)
                 elif tool_name in custom_wire_names:
                     # Build custom_tool_call output item
-                    input_str = unwrap_custom_tool_arguments_strict(tool_arguments)
                     original_name, custom_namespace = custom_wire_names.get(tool_name, (tool_name, None))
+                    if custom_llm_provider == "hosted_vllm":
+                        try:
+                            input_str = unwrap_custom_tool_arguments_with_min_length(
+                                tool_arguments, minimum_lengths[(original_name, custom_namespace)]
+                            )
+                        except ValueError as exc:
+                            raise BadGatewayError(
+                                message=str(exc), model=chat_completion_response.model, llm_provider="hosted_vllm"
+                            ) from exc
+                    else:
+                        input_str = unwrap_custom_tool_arguments_strict(tool_arguments)
                     custom_item = CustomToolCallOutputItem(
                         type="custom_tool_call",
                         call_id=tool_id,

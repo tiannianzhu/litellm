@@ -767,3 +767,107 @@ def test_hosted_bridge_rejects_unsupported_history_before_sending(item, message)
                 input=[item, {"role": "user", "content": "Continue"}],
             )
     assert error.value.status_code == 400
+
+
+_NONEMPTY_EXEC_GRAMMAR: Final = r"""
+start: pragma_source | plain_source
+pragma_source: PRAGMA_LINE NEWLINE SOURCE
+plain_source: SOURCE
+PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+"""
+
+
+@pytest.mark.parametrize("content", ("", " ", "\n", "not JavaScript; 非空", "// @exec: {}\nfixture()"))
+def test_hosted_bridge_known_exec_grammar_enforces_nonempty_content_before_return(content: str) -> None:
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    tools: Final = [
+        {"type": "namespace", "name": "workspace", "tools": [{
+            "type": "custom", "name": "exec", "description": "Execute input",
+            "format": {"type": "grammar", "syntax": "lark", "definition": _NONEMPTY_EXEC_GRAMMAR},
+        }]},
+        {"type": "function", "name": "workspace__exec", "parameters": {"type": "object"}},
+    ]
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map({"tools": tools})))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        custom: Final = next(tool["function"] for tool in body["tools"] if tool["function"]["name"] == wire_name)
+        assert custom["strict"] is True
+        assert custom["parameters"]["properties"]["content"]["minLength"] == 1
+        assert custom["parameters"]["required"] == ["content"]
+        assert custom["parameters"]["additionalProperties"] is False
+        ordinary: Final = next(tool["function"] for tool in body["tools"]
+                               if tool["function"]["name"] == "workspace__exec")
+        assert ordinary["parameters"] == {"type": "object"}
+        return httpx.Response(200, json={
+            "id": "chatcmpl_fixture", "object": "chat.completion", "created": 1, "model": "fixture",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "tool_calls": [{"id": "call_fixture", "type": "function", "function": {
+                    "name": wire_name, "arguments": json.dumps({"content": content})}}],
+            }}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        request: Final = {
+            "model": "hosted_vllm/fixture", "api_base": "https://fixture.invalid/v1", "api_key": "fixture",
+            "client": HTTPHandler(client=client), "use_chat_completions_api": True, "num_retries": 0,
+            "input": "Call the fixture tool", "tools": tools,
+        }
+        if not content:
+            with pytest.raises(litellm.BadGatewayError, match="content must be nonempty"):
+                litellm.responses(**request)
+            return
+        result: Final = litellm.responses(**request)
+    assert result.output[0].type == "custom_tool_call"
+    assert result.output[0].name == "exec"
+    assert result.output[0].namespace == "workspace"
+    assert result.output[0].call_id == "call_fixture"
+    assert result.output[0].input == content
+
+
+@pytest.mark.parametrize(
+    "name, fmt",
+    (
+        ("exec", None),
+        ("exec", {"type": "text"}),
+        ("exec", {"type": "grammar", "syntax": "lark", "definition": 'start: "ok"'}),
+        ("exec", {"type": "grammar", "syntax": "regex", "definition": ".*"}),
+        ("other", {"type": "grammar", "syntax": "lark", "definition": _NONEMPTY_EXEC_GRAMMAR}),
+    ),
+)
+def test_hosted_bridge_preserves_empty_input_for_other_custom_formats(
+    name: str, fmt: dict[str, str] | None
+) -> None:
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    tools: Final = [{"type": "custom", "name": name, **({"format": fmt} if fmt is not None else {})}]
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map({"tools": tools})))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        function: Final = body["tools"][0]["function"]
+        assert function.get("strict") is not True
+        assert "minLength" not in function["parameters"]["properties"]["content"]
+        return httpx.Response(200, json={
+            "id": "chatcmpl_fixture", "object": "chat.completion", "created": 1, "model": "fixture",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "tool_calls": [{"id": "call_fixture", "type": "function", "function": {
+                    "name": wire_name, "arguments": '{"content":""}'}}],
+            }}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result: Final = litellm.responses(
+            model="hosted_vllm/fixture", api_base="https://fixture.invalid/v1", api_key="fixture",
+            client=HTTPHandler(client=client), use_chat_completions_api=True, num_retries=0,
+            input="Call the fixture tool", tools=tools,
+        )
+    assert result.output[0].type == "custom_tool_call"
+    assert result.output[0].name == name
+    assert result.output[0].call_id == "call_fixture"
+    assert result.output[0].input == ""
