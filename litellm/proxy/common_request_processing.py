@@ -3177,7 +3177,9 @@ class ProxyBaseLLMRequestProcessing:
                 if requested_model_from_client:
                     self.data["_litellm_client_requested_model"] = requested_model_from_client
 
-                if _post_call_guardrails_active:
+                if _post_call_guardrails_active or (
+                    route_type == "aresponses" and logging_obj.requires_success_await is True
+                ):
                     self._arm_deferred_stream_dispatch(
                         response=response,
                         route_type=route_type,

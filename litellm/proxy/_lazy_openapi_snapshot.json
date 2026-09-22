@@ -23770,6 +23770,17 @@
               "title": "Name",
               "type": "string"
             },
+            "namespace": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Namespace"
+            },
             "status": {
               "anyOf": [
                 {
