@@ -26,6 +26,7 @@ from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 from litellm.types.llms.openai import (
     ChatCompletionToolParam,
     ChatCompletionToolParamFunctionChunk,
+    OpenAIMcpServerTool,
 )
 
 _MAX_ARGUMENTS_LEN: Final = 1_000_000
@@ -648,6 +649,64 @@ def validated_allowed_callers(value: object) -> list[str] | None:
         return _ALLOWED_CALLERS_ADAPTER.validate_python(value, strict=True)
     except ValidationError as exc:
         raise ValueError("allowed_callers must be a list of strings") from exc
+
+
+def restrict_chat_tools_for_allowed_choice(
+    tools: Sequence[ChatCompletionToolParam | OpenAIMcpServerTool], choice: object
+) -> tuple[tuple[ChatCompletionToolParam | OpenAIMcpServerTool, ...], str | None]:
+    original_tools: Final = tuple(tools)
+    choice_object: Final = _json_object(choice)
+    if choice_object is None or choice_object.get("type") != "allowed_tools":
+        return original_tools, None
+
+    mode: Final[object] = choice_object.get("mode")
+    if mode not in ("auto", "required"):
+        raise ValueError("allowed_tools mode must be 'auto' or 'required'")
+
+    entries: Final = _json_object_sequence(choice_object.get("tools"))
+    if not entries:
+        raise ValueError("allowed_tools must contain at least one function")
+
+    allowed_names: Final = tuple(
+        name
+        for entry in entries
+        if entry.get("type") == "function"
+        for name in (entry.get("name"),)
+        if isinstance(name, str) and name
+    )
+    if len(allowed_names) != len(entries):
+        raise ValueError("allowed_tools entries must be named functions")
+    if len(frozenset(allowed_names)) != len(allowed_names):
+        raise ValueError("allowed_tools entries must be unique")
+
+    declared_names: Final = tuple(
+        name
+        for tool in original_tools
+        for tool_object in (_json_object(tool),)
+        if tool_object is not None and tool_object.get("type") == "function"
+        for function_object in (_json_object(tool_object.get("function")),)
+        if function_object is not None
+        for name in (function_object.get("name"),)
+        if isinstance(name, str) and name
+    )
+    if len(frozenset(declared_names)) != len(declared_names):
+        raise ValueError("chat function tool names must be unique")
+    unknown_names: Final = frozenset(allowed_names) - frozenset(declared_names)
+    if unknown_names:
+        raise ValueError("allowed_tools entries must reference declared functions")
+
+    allowed_name_set: Final = frozenset(allowed_names)
+    restricted_tools: Final = tuple(
+        tool
+        for tool in original_tools
+        for tool_object in (_json_object(tool),)
+        for function_object in (_json_object(tool_object.get("function")) if tool_object is not None else None,)
+        if tool_object is not None
+        and tool_object.get("type") == "function"
+        and function_object is not None
+        and function_object.get("name") in allowed_name_set
+    )
+    return restricted_tools, mode
 
 
 def custom_tool_grammar_suffix(fmt: object) -> str:

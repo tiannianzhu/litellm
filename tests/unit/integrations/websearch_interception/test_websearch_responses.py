@@ -329,49 +329,38 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
     monkeypatch: pytest.MonkeyPatch,
 ):
     tool_input: Final = "const result = await tools.exec_command({ cmd: 'true' });"
-    function_call: Final = {
-        "type": "function_call",
-        "id": "fc_fixture_exec",
-        "call_id": "call_fixture_exec",
-        "name": "exec",
-        "arguments": json.dumps({"content": tool_input}),
-        "status": "completed",
-    }
     response_body: Final = {
-        "id": "resp_fixture",
-        "object": "response",
+        "id": "chatcmpl_fixture",
+        "object": "chat.completion",
         "created_at": 1,
         "model": "fixture",
-        "status": "completed",
-        "output": [function_call],
-        "error": None,
-        "incomplete_details": None,
-        "instructions": None,
-        "metadata": {},
-        "parallel_tool_calls": True,
-        "temperature": None,
-        "tool_choice": "none",
-        "tools": [],
-        "top_p": None,
-        "max_output_tokens": None,
-        "previous_response_id": None,
-        "reasoning": None,
-        "text": {},
-        "truncation": None,
-        "user": None,
-        "store": False,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_fixture_exec",
+                            "type": "function",
+                            "function": {"name": "exec", "arguments": json.dumps({"content": tool_input})},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
         "usage": {
-            "input_tokens": 2,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens": 3,
-            "output_tokens_details": {"reasoning_tokens": 0},
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
             "total_tokens": 5,
         },
     }
     sent: list[dict[str, object]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/responses"
+        assert request.url.path == "/v1/chat/completions"
         sent.append(json.loads(request.content))
         return httpx.Response(200, json=response_body)
 
@@ -387,6 +376,7 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
             api_base="https://fixture.invalid/v1",
             api_key="fixture",
             stream=True,
+            use_chat_completions_api=True,
             tool_choice="none",
             tools=[
                 {
@@ -405,7 +395,7 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
     assert len(sent) == 1
     upstream: Final = sent[0]
     assert upstream["stream"] is False
-    assert [tool["name"] for tool in upstream["tools"]] == ["exec", "litellm_web_search"]
+    assert [tool["function"]["name"] for tool in upstream["tools"]] == ["exec", "litellm_web_search"]
     event_types: Final = [
         getattr(getattr(event, "type", None), "value", getattr(event, "type", None)) for event in events
     ]
@@ -415,7 +405,9 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
         < event_types.index("response.output_item.done")
         < event_types.index("response.completed")
     )
-    assert [event.sequence_number for event in events] == list(range(len(events)))
+    sequence_numbers: Final = [event.sequence_number for event in events]
+    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + len(events)))
+    assert events[-1].model_dump()["sequence_number"] == sequence_numbers[-1]
     added: Final = next(
         event for event in events if getattr(event.type, "value", event.type) == "response.output_item.added"
     )

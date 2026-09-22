@@ -66,7 +66,10 @@ class _FakeStreamWrapper:
     def __next__(self):
         if not self._chunks:
             raise StopIteration
-        return self._chunks.pop(0)
+        chunk = self._chunks.pop(0)
+        if isinstance(chunk, Exception):
+            raise chunk
+        return chunk
 
     def __aiter__(self):
         return self
@@ -74,16 +77,19 @@ class _FakeStreamWrapper:
     async def __anext__(self):
         if not self._chunks:
             raise StopAsyncIteration
-        return self._chunks.pop(0)
+        chunk = self._chunks.pop(0)
+        if isinstance(chunk, Exception):
+            raise chunk
+        return chunk
 
 
-def _build_iterator(chunks) -> LiteLLMCompletionStreamingIterator:
+def _build_iterator(chunks, custom_llm_provider: str = "anthropic") -> LiteLLMCompletionStreamingIterator:
     return LiteLLMCompletionStreamingIterator(
         model="claude-haiku-4-5",
         litellm_custom_stream_wrapper=_FakeStreamWrapper(chunks),
         request_input="What is the weather in San Francisco?",
         responses_api_request={},
-        custom_llm_provider="anthropic",
+        custom_llm_provider=custom_llm_provider,
         litellm_metadata={},
     )
 
@@ -741,6 +747,37 @@ async def test_streaming_response_id_falls_back_when_upstream_yields_nothing():
     assert response_ids[0].startswith("resp_")
 
 
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_hosted_stream_without_finish_reason_emits_failed_event(sync_mode: bool):
+    iterator = _build_iterator([_chunk("partial")], custom_llm_provider="hosted_vllm")
+
+    events = await _collect_events(iterator, sync_mode)
+    event_types = tuple(event.type for event in events)
+    failed_event = next(event for event in events if event.type == ResponsesAPIStreamEvents.RESPONSE_FAILED)
+
+    assert ResponsesAPIStreamEvents.RESPONSE_COMPLETED not in event_types
+    assert failed_event.response.status == "failed"
+    assert failed_event.response.error == {
+        "code": "server_error",
+        "message": "upstream stream ended without a finish reason",
+    }
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_hosted_stream_transport_error_is_reraised(sync_mode: bool):
+    iterator = _build_iterator(
+        [_chunk("partial"), RuntimeError("transport closed")],
+        custom_llm_provider="hosted_vllm",
+    )
+
+    with pytest.raises(RuntimeError, match="transport closed"):
+        await _collect_events(iterator, sync_mode)
+
+    assert iterator.finished is True
+
+
 def test_completed_event_restores_usage_hidden_by_stream_options_none():
     final_chunk = _chunk("", finish_reason="stop")
     final_chunk._hidden_params = {"usage": Usage(prompt_tokens=117, completion_tokens=5, total_tokens=122)}
@@ -978,6 +1015,16 @@ def _reasoning_chunk(reasoning: str, finish_reason: str | None = None) -> ModelR
     )
 
 
+def _role_only_chunk() -> ModelResponseStream:
+    return ModelResponseStream(
+        id=CHAT_COMPLETION_ID,
+        created=1748575031,
+        model="claude-haiku-4-5",
+        object="chat.completion.chunk",
+        choices=[StreamingChoices(index=0, delta=Delta(role="assistant"), finish_reason=None)],
+    )
+
+
 async def _collect_events(
     iterator: LiteLLMCompletionStreamingIterator, sync_mode: bool
 ) -> list[BaseLiteLLMOpenAIResponseObject]:
@@ -1086,6 +1133,347 @@ async def test_reasoning_item_closes_before_message_item_opens():
 
 @pytest.mark.parametrize("sync_mode", [True, False])
 @pytest.mark.asyncio
+async def test_role_only_chunk_does_not_preempt_reasoning_item(sync_mode: bool):
+    iterator: Final = _build_iterator(
+        [
+            _role_only_chunk(),
+            _reasoning_chunk("first reasoning part "),
+            _reasoning_chunk("second reasoning part"),
+            _chunk("answer"),
+            _tool_call_chunk(finish_reason="tool_calls"),
+        ]
+    )
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    output_item_events: Final = [
+        event
+        for event in events
+        if getattr(event, "type", None)
+        in (ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED, ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE)
+    ]
+    reasoning_events: Final = [
+        event for event in output_item_events if getattr(event.item, "type", None) == "reasoning"
+    ]
+    message_events: Final = [event for event in output_item_events if _is_message_item(event)]
+    tool_events: Final = [event for event in output_item_events if getattr(event.item, "type", None) == "function_call"]
+
+    assert output_item_events[0].item.type == "reasoning"
+    assert [event.type for event in reasoning_events] == [
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+    ]
+    assert reasoning_events[0].item.id == reasoning_events[1].item.id
+    assert reasoning_events[1].item.content[0].text == "first reasoning part second reasoning part"
+    assert [event.type for event in message_events] == [
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+    ]
+    assert [event.type for event in tool_events] == [
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+    ]
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_reasoning_done_item_matches_completed_reasoning_content(sync_mode: bool):
+    iterator: Final = _build_iterator(
+        [
+            _reasoning_chunk("first reasoning part "),
+            _reasoning_chunk("second reasoning part"),
+            _chunk("answer", finish_reason="stop"),
+        ]
+    )
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    reasoning_done: Final = next(
+        event
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        and getattr(event.item, "type", None) == "reasoning"
+    )
+    completed: Final = next(
+        event for event in events if getattr(event, "type", None) == ResponsesAPIStreamEvents.RESPONSE_COMPLETED
+    )
+    completed_reasoning: Final = next(item for item in completed.response.output if item.type == "reasoning")
+    reasoning_done_item: Final = reasoning_done.model_dump(mode="json", exclude_none=True)["item"]
+    completed_reasoning_item: Final = next(
+        item
+        for item in completed.model_dump(mode="json", exclude_none=True)["response"]["output"]
+        if item["type"] == "reasoning"
+    )
+
+    assert reasoning_done.item.id == completed_reasoning.id
+    assert reasoning_done.item.status == completed_reasoning.status == "completed"
+    assert reasoning_done_item == completed_reasoning_item
+    assert reasoning_done_item["content"] == [
+        {
+            "type": "reasoning_text",
+            "text": "first reasoning part second reasoning part",
+            "annotations": [],
+        }
+    ]
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.asyncio
+async def test_terminal_reasoning_delta_precedes_done_events(sync_mode: bool, finish_reason: str):
+    iterator: Final = _build_iterator([_reasoning_chunk("last", finish_reason=finish_reason)])
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    reasoning_types: Final = [
+        event.type
+        for event in events
+        if event.type
+        in (
+            ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA,
+            ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DONE,
+            ResponsesAPIStreamEvents.REASONING_SUMMARY_PART_DONE,
+        )
+        or (event.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE and event.item.type == "reasoning")
+    ]
+    assert reasoning_types == [
+        ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DELTA,
+        ResponsesAPIStreamEvents.REASONING_SUMMARY_TEXT_DONE,
+        ResponsesAPIStreamEvents.REASONING_SUMMARY_PART_DONE,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+    ]
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_empty_text_response_emits_message_lifecycle(sync_mode: bool):
+    iterator: Final = _build_iterator([_role_only_chunk(), _chunk("", finish_reason="stop")])
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    assert [event.type for event in events] == [
+        ResponsesAPIStreamEvents.RESPONSE_CREATED,
+        ResponsesAPIStreamEvents.RESPONSE_IN_PROGRESS,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
+        ResponsesAPIStreamEvents.CONTENT_PART_ADDED,
+        ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE,
+        ResponsesAPIStreamEvents.CONTENT_PART_DONE,
+        ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE,
+        ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+    ]
+    added: Final = events[2].model_dump(mode="json", exclude_none=True)
+    done: Final = events[-2].model_dump(mode="json", exclude_none=True)
+    completed: Final = events[-1].model_dump(mode="json", exclude_none=True)
+    assert added["item"]["id"] == done["item"]["id"]
+    assert done["item"] == completed["response"]["output"][0]
+    assert done["item"]["content"] == [{"type": "output_text", "text": "", "annotations": []}]
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_reasoning_length_termination_is_incomplete(sync_mode: bool):
+    iterator: Final = _build_iterator([_reasoning_chunk("unfinished", finish_reason="length")])
+
+    events: Final = await _collect_events(iterator, sync_mode)
+    reasoning_done: Final = next(
+        event
+        for event in events
+        if getattr(event, "type", None) == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+        and getattr(event.item, "type", None) == "reasoning"
+    )
+    incomplete: Final = next(
+        event for event in events if getattr(event, "type", None) == ResponsesAPIStreamEvents.RESPONSE_INCOMPLETE
+    )
+    completed_reasoning: Final = next(item for item in incomplete.response.output if item.type == "reasoning")
+    reasoning_done_item: Final = reasoning_done.model_dump(mode="json", exclude_none=True)["item"]
+    incomplete_reasoning_item: Final = next(
+        item
+        for item in incomplete.model_dump(mode="json", exclude_none=True)["response"]["output"]
+        if item["type"] == "reasoning"
+    )
+
+    assert reasoning_done.item.status == completed_reasoning.status == "incomplete"
+    assert reasoning_done_item == incomplete_reasoning_item
+    assert reasoning_done_item["content"] == [{"type": "reasoning_text", "text": "unfinished", "annotations": []}]
+
+
+def test_streaming_custom_wire_names_restore_original_namespaces():
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    request: Final = {
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "shell",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+                    }
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": "filesystem",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+                    }
+                ],
+            },
+        ]
+    }
+    wire_names: Final = native_responses_custom_tool_name_map(request)
+    wire_calls: Final = tuple((wire_name, identity) for wire_name, identity in wire_names.items())
+    iterator: Final = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=AsyncMock(),
+        request_input="Test input",
+        responses_api_request=request,
+    )
+    tool_calls: Final = [
+        {
+            "index": index,
+            "id": f"call_{index}",
+            "function": {"name": wire_name, "arguments": json.dumps({"content": namespace})},
+        }
+        for index, (wire_name, (_, namespace)) in enumerate(wire_calls)
+    ]
+    iterator._queue_tool_call_delta_events(tool_calls)
+    iterator._queue_final_tool_call_done_events(
+        ModelResponse(
+            id="chatcmpl-custom",
+            created=1,
+            model="test-model",
+            object="chat.completion",
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                }
+            ],
+        )
+    )
+
+    items: Final = [
+        event.item
+        for event in iterator._pending_tool_events
+        if event.type in (ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED, ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE)
+    ]
+
+    assert {(item.call_id, item.name, item.namespace) for item in items} == {
+        (f"call_{index}", name, namespace) for index, (_, (name, namespace)) in enumerate(wire_calls)
+    }
+    assert {item.input for item in items if item.status == "completed"} == {
+        namespace for _, (_, namespace) in wire_calls
+    }
+
+
+def test_streaming_hosted_custom_wire_name_does_not_shadow_an_ordinary_function():
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    request: Final = {
+        "tools": [
+            {"type": "function", "name": "exec", "parameters": {"type": "object"}},
+            {
+                "type": "namespace",
+                "name": "shell",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+                    }
+                ],
+            },
+        ]
+    }
+    custom_wire_name: Final = next(iter(native_responses_custom_tool_name_map(request)))
+    iterator: Final = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=AsyncMock(),
+        request_input="Test input",
+        responses_api_request=request,
+        custom_llm_provider="hosted_vllm",
+    )
+    tool_calls: Final = [
+        {"index": 0, "id": "call_function", "function": {"name": "exec", "arguments": '{"path":"/tmp"}'}},
+        {
+            "index": 1,
+            "id": "call_custom",
+            "function": {"name": custom_wire_name, "arguments": '{"content":"pwd"}'},
+        },
+    ]
+    iterator._queue_tool_call_delta_events(tool_calls)
+    iterator._queue_final_tool_call_done_events(
+        ModelResponse(
+            id="chatcmpl-custom",
+            created=1,
+            model="test-model",
+            object="chat.completion",
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                }
+            ],
+        )
+    )
+
+    completed_items: Final = {
+        event.item.call_id: event.item
+        for event in iterator._pending_tool_events
+        if event.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE
+    }
+
+    assert completed_items["call_function"].type == "function_call"
+    assert completed_items["call_function"].arguments == '{"path":"/tmp"}'
+    assert completed_items["call_custom"].type == "custom_tool_call"
+    assert completed_items["call_custom"].name == "exec"
+    assert completed_items["call_custom"].namespace == "shell"
+    assert completed_items["call_custom"].input == "pwd"
+
+
+def test_streaming_custom_wire_name_rejects_invalid_content_envelope():
+    request: Final = {
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+            }
+        ]
+    }
+    iterator: Final = LiteLLMCompletionStreamingIterator(
+        model="test-model",
+        litellm_custom_stream_wrapper=AsyncMock(),
+        request_input="Test input",
+        responses_api_request=request,
+    )
+    tool_call: Final = {"id": "call_exec", "function": {"name": "exec", "arguments": "invalid"}}
+    iterator._queue_tool_call_delta_events([tool_call])
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        iterator._queue_final_tool_call_done_events(
+            ModelResponse(
+                id="chatcmpl-custom",
+                created=1,
+                model="test-model",
+                object="chat.completion",
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                    }
+                ],
+            )
+        )
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
 async def test_tool_then_reasoning_then_text_gives_message_its_own_output_index(sync_mode: bool):
     iterator: Final = _build_iterator(
         [
@@ -1186,3 +1574,24 @@ def test_custom_tool_stream_uses_custom_input_events():
     ]
     assert iterator._pending_tool_events[-2].input == custom_input
     assert iterator._pending_tool_events[-1].item.input == custom_input
+
+
+@pytest.mark.parametrize("sync_mode", [True, False])
+@pytest.mark.asyncio
+async def test_stream_metadata_matches_request_in_all_response_events(sync_mode: bool):
+    request: Final = {
+        "reasoning": {"effort": "medium"}, "metadata": {"fixture": "correlation"},
+        "max_output_tokens": 128, "parallel_tool_calls": False, "store": False,
+        "previous_response_id": "resp_fixture", "instructions": "Fixture instructions",
+    }
+    iterator: Final = LiteLLMCompletionStreamingIterator(
+        model="fixture", litellm_custom_stream_wrapper=_FakeStreamWrapper([_chunk("answer", finish_reason="stop")]),
+        request_input="Fixture", responses_api_request=request, custom_llm_provider="hosted_vllm",
+    )
+    events: Final = await _collect_events(iterator, sync_mode)
+    responses: Final = [event.model_dump(mode="json")["response"] for event in events
+                       if event.type in RESPONSE_ID_EVENT_TYPES]
+    assert len(responses) == 3
+    for response in responses:
+        for key, value in request.items():
+            assert response[key] == value
