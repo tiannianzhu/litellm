@@ -24,13 +24,26 @@ from litellm.responses.litellm_completion_transformation.custom_tools import (
     native_responses_namespace_tool_name_map,
     normalize_native_responses_custom_tools,
     openai_shaped_tool_call_item_id,
+    restrict_chat_tools_for_allowed_choice,
     unwrap_custom_tool_arguments,
     unwrap_custom_tool_arguments_strict,
 )
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
 )
+from litellm.types.llms.openai import ChatCompletionToolParam
 from litellm.types.responses.main import CustomToolCallOutputItem
+
+_CHAT_TOOL_FIXTURE: Final[tuple[ChatCompletionToolParam, ...]] = (
+    ChatCompletionToolParam(
+        type="function",
+        function={"name": "workspace__exec", "parameters": {"type": "object"}},
+    ),
+    ChatCompletionToolParam(
+        type="function",
+        function={"name": "workspace__read", "parameters": {"type": "object"}},
+    ),
+)
 
 
 class TestCustomToolUtilities:
@@ -211,6 +224,46 @@ class TestCustomToolUtilities:
 
     def test_unwrap_custom_tool_arguments_strict_returns_only_content(self):
         assert unwrap_custom_tool_arguments_strict(json.dumps({"content": "raw patch"})) == "raw patch"
+
+    def test_restrict_chat_tools_for_allowed_choice_filters_normalized_wire_names(self):
+        tools, mode = restrict_chat_tools_for_allowed_choice(
+            _CHAT_TOOL_FIXTURE,
+            {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "workspace__exec"}],
+            },
+        )
+
+        assert mode == "required"
+        assert tools == (_CHAT_TOOL_FIXTURE[0],)
+
+    def test_restrict_chat_tools_for_non_allowed_choice_keeps_tools(self):
+        tools, mode = restrict_chat_tools_for_allowed_choice(_CHAT_TOOL_FIXTURE, "auto")
+
+        assert tools == _CHAT_TOOL_FIXTURE
+        assert mode is None
+
+    @pytest.mark.parametrize(
+        "choice",
+        [
+            {"type": "allowed_tools", "mode": "required", "tools": []},
+            {"type": "allowed_tools", "mode": "none", "tools": [{"type": "function", "name": "workspace__exec"}]},
+            {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "custom", "name": "workspace__exec"}]},
+            {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "missing"}]},
+            {
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": [
+                    {"type": "function", "name": "workspace__exec"},
+                    {"type": "function", "name": "workspace__exec"},
+                ],
+            },
+        ],
+    )
+    def test_restrict_chat_tools_for_allowed_choice_rejects_invalid_entries(self, choice: object):
+        with pytest.raises(ValueError, match="allowed_tools"):
+            restrict_chat_tools_for_allowed_choice(_CHAT_TOOL_FIXTURE, choice)
 
     @pytest.mark.parametrize("input_value", (None, {"patch": "body"}))
     def test_normalize_native_responses_custom_tools_rejects_non_string_history_input(self, input_value):
@@ -743,3 +796,47 @@ class TestTransformationCustomTools:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize(
+    "provider, wire_name, namespace",
+    (
+        ("hosted_vllm", "workspace__exec", "workspace"),
+        ("openai", "exec", None),
+    ),
+)
+def test_custom_namespace_return_mapping_matches_provider_wire_contract(provider, wire_name, namespace) -> None:
+    from litellm.types.utils import ModelResponse
+
+    response: Final = ModelResponse(
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_fixture",
+                            "type": "function",
+                            "function": {"name": wire_name, "arguments": '{"content":"fixture()"}'},
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+    request: Final = {
+        "tools": [{"type": "namespace", "name": "workspace", "tools": [{"type": "custom", "name": "exec"}]}]
+    }
+    result: Final = LiteLLMCompletionResponsesConfig.transform_chat_completion_tools_to_responses_tools(
+        response,
+        responses_api_request=request,
+        custom_llm_provider=provider,
+    )
+    assert len(result) == 1
+    assert result[0].type == "custom_tool_call"
+    assert result[0].name == "exec"
+    assert result[0].namespace == namespace
+    assert result[0].call_id == "call_fixture"
+    assert result[0].input == "fixture()"

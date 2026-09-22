@@ -319,7 +319,7 @@ class TestLiteLLMCompletionResponsesConfig:
         assert reasoning_item.status == "completed"
         assert reasoning_item.role == "assistant"
         assert len(reasoning_item.content) == 1
-        assert reasoning_item.content[0].type == "output_text"
+        assert reasoning_item.content[0].type == "reasoning_text"
         assert "step by step" in reasoning_item.content[0].text
         assert "42" in reasoning_item.content[0].text
 
@@ -3111,9 +3111,10 @@ class TestToolTransformation:
         assert len(result_tools) == 1
         function = result_tools[0]["function"]
         assert function["name"] == "exec"
-        assert function["description"].startswith("Codex shell tools.")
-        assert "Runs a shell command." in function["description"]
-        assert "start: /.+/" in function["description"]
+        description = function["parameters"]["properties"]["content"]["description"]
+        assert description.startswith("Codex shell tools.")
+        assert "Runs a shell command." in description
+        assert "start: /.+/" in description
         assert function["parameters"]["required"] == ["content"]
         assert function["parameters"]["properties"]["content"]["type"] == "string"
 
@@ -4290,6 +4291,9 @@ class TestEnsureOutputItemContentPartAdded:
         iterator._reasoning_output_index = None
         iterator._final_tool_events_queued = False
         iterator._custom_tool_names = set()
+        iterator.custom_llm_provider = None
+        iterator._custom_tool_wire_names = {}
+        iterator._namespace_tool_wire_names = {}
         iterator.responses_api_request = {}
         iterator._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(None)
         iterator._web_search_calls = {}
@@ -5610,7 +5614,7 @@ def test_transform_chat_completion_response_echoes_request_params():
     )
     assert result_unset.temperature is None
     assert result_unset.metadata == {}
-    assert result_unset.parallel_tool_calls is False
+    assert result_unset.parallel_tool_calls is True
     assert result_unset.tools == []
     assert result_unset.text == {}
 
@@ -5622,7 +5626,7 @@ def test_transform_chat_completion_response_echoes_request_params():
         ("instructions", 5, None),
         ("text", "plain", {}),
         ("truncation", "bogus", None),
-        ("parallel_tool_calls", "maybe", False),
+        ("parallel_tool_calls", "maybe", True),
     ],
 )
 def test_transform_drops_request_params_the_response_cannot_echo(
@@ -6478,3 +6482,52 @@ def test_transform_request_reads_service_tier_from_responses_api_request() -> No
     )
 
     assert result["service_tier"] == "priority"
+
+
+@pytest.mark.parametrize("namespaced", [False, True])
+@pytest.mark.parametrize("flag", ["allowed_callers", "defer_loading"])
+def test_hosted_custom_tool_drops_malformed_flags_before_normalizing(
+    monkeypatch: pytest.MonkeyPatch, namespaced: bool, flag: str
+) -> None:
+    monkeypatch.setattr(litellm, "drop_params", False)
+    tool: Final = {"type": "custom", "name": "apply_patch", flag: "invalid"}
+    request: Final = ResponsesAPIOptionalRequestParams(
+        tools=[{"type": "namespace", "name": "workspace", "tools": [tool]}] if namespaced else [tool]
+    )
+    transform: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request
+    with pytest.raises(litellm.BadRequestError, match=flag):
+        transform(model="test-model", input="edit", responses_api_request=request, custom_llm_provider="hosted_vllm")
+
+    result: Final = transform(
+        model="test-model", input="edit", responses_api_request=request, custom_llm_provider="hosted_vllm",
+        drop_params=True,
+    )
+
+    assert len(result["tools"]) == 1
+    assert result["tools"][0]["type"] == "function"
+    assert result["tools"][0]["function"]["parameters"]["required"] == ["content"]
+    assert result["tools"][0].get("allowed_callers") is None
+    assert result["tools"][0].get("defer_loading", False) is False
+
+
+def test_allowed_tools_makes_the_selected_tool_eager_when_search_is_removed() -> None:
+    result: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model="anthropic/claude-sonnet-5-5",
+        input="weather",
+        responses_api_request={
+            "tools": [
+                {"type": "tool_search", "execution": "server"},
+                {"type": "function", "name": "weather", "parameters": {"type": "object"}, "defer_loading": True},
+            ],
+            "tool_choice": {
+                "type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "weather"}],
+            },
+        },
+        custom_llm_provider="anthropic",
+    )
+
+    assert len(result["tools"]) == 1
+    assert result["tools"][0]["type"] == "function"
+    assert result["tools"][0]["function"]["name"] == "weather"
+    assert result["tools"][0].get("defer_loading", False) is False
+    assert result["tool_choice"] == "auto"

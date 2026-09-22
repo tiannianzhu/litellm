@@ -14,13 +14,43 @@ JSON array of thinking blocks on the response side.
 """
 
 import json
+from typing import Final
 
 import pytest
 
+from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
 )
 from litellm.types.utils import Message
+
+
+def test_hosted_bridge_replays_all_reasoning_parts_in_order() -> None:
+    items: Final = [
+        {
+            "type": "reasoning",
+            "content": [
+                {"type": "reasoning_text", "text": "  First\n"},
+                {"type": "reasoning_text", "text": "second  "},
+            ],
+        },
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "\nThird\n"}]},
+        {"type": "function_call", "name": "lookup", "call_id": "call_fixture", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_fixture", "output": "result"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "  Final thought  "}]},
+        {"role": "assistant", "content": "Answer"},
+        {"role": "user", "content": "Continue"},
+    ]
+    messages: Final = _transform_input(items)
+    request: Final = HostedVLLMChatConfig().transform_request(
+        model="fixture", messages=messages, optional_params={}, litellm_params={}, headers={}
+    )
+    assert request["messages"][0]["reasoning_content"] == "  First\nsecond  \n\nThird\n"
+    assert request["messages"][0]["tool_calls"][0]["id"] == "call_fixture"
+    assert request["messages"][1]["tool_call_id"] == "call_fixture"
+    assert request["messages"][2]["reasoning_content"] == "  Final thought  "
+    assert request["messages"][2]["content"] == "Answer"
+    assert request["messages"][3] == {"role": "user", "content": "Continue"}
 
 
 def _transform_item(item):
@@ -178,16 +208,12 @@ class TestEncryptedReasoningRoundTrip:
         item = {
             "type": "reasoning",
             "id": "rs_1",
-            "encrypted_content": json.dumps(
-                [{"type": "thinking", "thinking": "hidden", "signature": "sig-one"}]
-            ),
+            "encrypted_content": json.dumps([{"type": "thinking", "thinking": "hidden", "signature": "sig-one"}]),
         }
         messages = _transform_item(item)
         assert len(messages) == 1
         assert messages[0]["content"] is None
-        assert messages[0]["thinking_blocks"] == [
-            {"type": "thinking", "thinking": "hidden", "signature": "sig-one"}
-        ]
+        assert messages[0]["thinking_blocks"] == [{"type": "thinking", "thinking": "hidden", "signature": "sig-one"}]
 
     def test_unsigned_blocks_dropped(self):
         """Blocks without a signature or redacted payload are not replayed."""
@@ -229,9 +255,7 @@ class TestEncryptedReasoningRoundTrip:
         )
         assert len(messages) == 1
         assert messages[0]["reasoning_content"] == "look it up"
-        assert messages[0]["thinking_blocks"] == [
-            {"type": "thinking", "thinking": "hidden", "signature": "sig-one"}
-        ]
+        assert messages[0]["thinking_blocks"] == [{"type": "thinking", "thinking": "hidden", "signature": "sig-one"}]
         assert len(messages[0]["tool_calls"]) == 1
 
     def test_replayed_blocks_precede_existing_blocks(self):

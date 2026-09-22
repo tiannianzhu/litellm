@@ -36,6 +36,9 @@ _JSON_OBJECT_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
 class HostedVLLMChatConfig(OpenAIGPTConfig):
+    def supports_tool_result_images(self) -> bool:
+        return True
+
     def _convert_custom_tools_to_function_tools(self, tools: list[dict[str, object]]) -> list[dict[str, object]]:
         """
         vLLM chat completions currently accepts only OpenAI function tools.
