@@ -328,6 +328,9 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
             content_item = content_item_typed
         return content_item
 
+    def supports_tool_result_images(self) -> bool:
+        return False
+
     # fmt: off
 
     @overload
@@ -352,7 +355,11 @@ class OpenAIGPTConfig(BaseLLMModelInfo, BaseConfig):
     ) -> list[AllMessageValues] | Coroutine[object, object, list[AllMessageValues]]:
         """OpenAI no longer supports image_url as a string, so we need to convert it to a dict"""
         stripped_messages: Final = drop_tool_reference_parts_from_tool_messages(messages)
-        hoisted_messages: Final = hoist_images_from_tool_messages(stripped_messages)
+        hoisted_messages: Final = (
+            stripped_messages
+            if self.supports_tool_result_images()
+            else hoist_images_from_tool_messages(stripped_messages)
+        )
 
         async def _async_transform():
             for message in hoisted_messages:
