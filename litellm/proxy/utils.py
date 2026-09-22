@@ -3768,6 +3768,15 @@ class ProxyLogging:
                 route=route,
                 original_exception=original_exception,
             )
+        elif (
+            isinstance(logging_obj, Logging)
+            and logging_obj.call_type in ("responses", "aresponses")
+            and isinstance(original_exception, litellm.BadGatewayError)
+            and isinstance(logging_obj.model_call_details.get("combined_usage_object"), Usage)
+        ):
+            await logging_obj.dispatch_failure_handlers(
+                original_exception, traceback_str or "", prefer_async_handlers=True
+            )
 
         request_data.update(
             await offload_token_count(_failure_fields_to_lift)(
@@ -4845,7 +4854,10 @@ class ProxyLogging:
         if not isinstance(logging_obj, Logging):
             return False
         _args: Final[tuple[object, ...] | None] = getattr(logging_obj, "_deferred_stream_complete_args", None)
-        if not isinstance(error, _PROXY_ONLY_LLM_API_ERRORS):
+        responses_bridge_failure: Final = logging_obj.call_type in ("responses", "aresponses") and isinstance(
+            error, litellm.BadGatewayError
+        )
+        if not (isinstance(error, _PROXY_ONLY_LLM_API_ERRORS) or responses_bridge_failure):
             return False
         match _args:
             case (ModelResponse() as assembled, *_):
