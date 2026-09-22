@@ -356,7 +356,7 @@ class TestLiteLLMCompletionResponsesConfig:
         assert reasoning_item.status == "completed"
         assert reasoning_item.role == "assistant"
         assert len(reasoning_item.content) == 1
-        assert reasoning_item.content[0].type == "output_text"
+        assert reasoning_item.content[0].type == "reasoning_text"
         assert "step by step" in reasoning_item.content[0].text
         assert "42" in reasoning_item.content[0].text
 
@@ -2762,9 +2762,10 @@ class TestToolTransformation:
         assert len(result_tools) == 1
         function = result_tools[0]["function"]
         assert function["name"] == "exec"
-        assert function["description"].startswith("Codex shell tools.")
-        assert "Runs a shell command." in function["description"]
-        assert "start: /.+/" in function["description"]
+        description = function["parameters"]["properties"]["content"]["description"]
+        assert description.startswith("Codex shell tools.")
+        assert "Runs a shell command." in description
+        assert "start: /.+/" in description
         assert function["parameters"]["required"] == ["content"]
         assert function["parameters"]["properties"]["content"]["type"] == "string"
 
@@ -3973,6 +3974,9 @@ class TestEnsureOutputItemContentPartAdded:
         iterator._reasoning_output_index = None
         iterator._final_tool_events_queued = False
         iterator._custom_tool_names = set()
+        iterator.custom_llm_provider = None
+        iterator._custom_tool_wire_names = {}
+        iterator._namespace_tool_wire_names = {}
         iterator.responses_api_request = {}
         iterator._namespace_tool_names = LiteLLMCompletionResponsesConfig.namespace_tool_name_map(None)
         iterator._web_search_calls = {}
@@ -5318,7 +5322,7 @@ def test_transform_chat_completion_response_echoes_request_params():
     )
     assert result_unset.temperature is None
     assert result_unset.metadata == {}
-    assert result_unset.parallel_tool_calls is False
+    assert result_unset.parallel_tool_calls is True
     assert result_unset.tools == []
     assert result_unset.text == {}
 
@@ -5330,7 +5334,7 @@ def test_transform_chat_completion_response_echoes_request_params():
         ("instructions", 5, None),
         ("text", "plain", {}),
         ("truncation", "bogus", None),
-        ("parallel_tool_calls", "maybe", False),
+        ("parallel_tool_calls", "maybe", True),
     ],
 )
 def test_transform_drops_request_params_the_response_cannot_echo(

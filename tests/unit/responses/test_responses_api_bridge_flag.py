@@ -8,6 +8,7 @@ calls so routed requests do not hit a custom api_base /v1/responses endpoint.
 
 import json
 from importlib import import_module
+from itertools import chain
 from typing import Final
 from unittest.mock import MagicMock, patch
 
@@ -610,3 +611,329 @@ class TestUseResponsesApiBridgeFlag:
 
         assert exc_info.value.param == "stream_chunk_size"
         send.assert_not_called()
+
+def test_hosted_bridge_preserves_wire_history_custom_identity_and_request_metadata() -> None:
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    tools: Final = [
+        {
+            "type": "namespace",
+            "name": ns,
+            "description": f"Shared instructions for {ns}.",
+            "tools": [{"type": "custom", "name": "exec", "description": "Execute fixture code."}],
+        }
+        for ns in ("alpha", "beta")
+    ] + [{"type": "function", "name": "alpha__exec", "parameters": {"type": "object"}, "strict": True}]
+    wire_name: Final = next(
+        name
+        for name, identity in native_responses_custom_tool_name_map({"tools": tools}).items()
+        if identity == ("exec", "alpha")
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        assert body["messages"][0]["content"].count("Shared instructions for alpha.") == 1
+        assert body["messages"][1]["role"] == "system"
+        assert body["messages"][2]["reasoning_content"] == "  Think\ncarefully  "
+        assert body["messages"][2]["tool_calls"][0]["function"]["name"] == wire_name
+        assert body["messages"][3]["tool_call_id"] == "call_previous"
+        assert body["messages"][3]["content"] == "first\nsecond"
+        assert body["reasoning_effort"] == "medium"
+        assert body["tool_choice"] == "required"
+        assert [tool["function"]["name"] for tool in body["tools"]] == ["beta__exec"]
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "fixture",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "Next thought",
+                            "tool_calls": [
+                                {
+                                    "id": "call_next",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "beta__exec",
+                                        "arguments": json.dumps({"content": "fixture()"}),
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result: Final = litellm.responses(
+            model="hosted_vllm/fixture",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            client=HTTPHandler(client=client),
+            use_chat_completions_api=True,
+            num_retries=0,
+            input=[
+                {"role": "developer", "content": "Preserve developer content."},
+                {
+                    "type": "reasoning",
+                    "content": [
+                        {"type": "reasoning_text", "text": "  Think\n"},
+                        {"type": "reasoning_text", "text": "carefully  "},
+                    ],
+                },
+                {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "namespace": "alpha",
+                    "call_id": "call_previous",
+                    "input": "previous()",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_previous",
+                    "output": [{"type": "input_text", "text": "first\n"}, {"type": "input_text", "text": "second"}],
+                },
+                {"role": "user", "content": "Continue"},
+            ],
+            tools=tools,
+            parallel_tool_calls=True,
+            metadata={"fixture": "correlation"},
+            reasoning={"effort": "medium"},
+            tool_choice={
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "custom", "name": "exec", "namespace": "beta"}],
+            },
+        )
+    assert result.metadata == {"fixture": "correlation"}
+    assert result.model_dump(mode="json", exclude_none=True)["tools"] == tools
+    assert result.reasoning == {"effort": "medium"}
+    assert result.usage.input_tokens == 10
+    assert result.usage.output_tokens == 5
+    assert result.parallel_tool_calls is True
+    assert result.output[0].content[0].type == "reasoning_text"
+    assert result.output[0].content[0].text == "Next thought"
+    assert result.output[1].type == "custom_tool_call"
+    assert result.output[1].name == "exec"
+    assert result.output[1].namespace == "beta"
+    assert result.output[1].call_id == "call_next"
+    assert result.output[1].input == "fixture()"
+
+
+@pytest.mark.parametrize(
+    "item, message",
+    (
+        ({"type": "reasoning", "encrypted_content": "opaque_fixture"}, "encrypted reasoning"),
+        (
+            {
+                "type": "reasoning",
+                "encrypted_content": "opaque_fixture",
+                "content": [{"type": "reasoning_text", "text": "visible"}],
+            },
+            "encrypted reasoning",
+        ),
+        (
+            {
+                "type": "function_call_output",
+                "call_id": "call_fixture",
+                "output": [
+                    {"type": "input_text", "text": "before"},
+                    {"type": "input_image", "image_url": ""},
+                    {"type": "input_text", "text": "after"},
+                ],
+            },
+            "require a nonempty image_url",
+        ),
+        (
+            {
+                "type": "function_call_output",
+                "call_id": "call_fixture",
+                "output": [{"type": "input_text", "text": "keep"}, {"type": "input_file", "file_id": "fixture"}],
+            },
+            "only text or image parts",
+        ),
+        (
+            {"type": "function_call_output", "call_id": "call_fixture", "output": ["untyped part"]},
+            "must be text or image objects",
+        ),
+        ({"type": "function_call_output", "output": "unpaired"}, "nonempty call_id"),
+    ),
+)
+def test_hosted_bridge_rejects_unsupported_history_before_sending(item, message) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        pytest.fail("Unsupported history reached the backend")
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        with pytest.raises(litellm.BadRequestError, match=message) as error:
+            litellm.responses(
+                model="hosted_vllm/fixture",
+                api_base="https://fixture.invalid/v1",
+                api_key="fixture",
+                client=HTTPHandler(client=client),
+                use_chat_completions_api=True,
+                num_retries=0,
+                input=[item, {"role": "user", "content": "Continue"}],
+            )
+    assert error.value.status_code == 400
+
+
+_NONEMPTY_EXEC_GRAMMAR: Final = r"""
+start: pragma_source | plain_source
+pragma_source: PRAGMA_LINE NEWLINE SOURCE
+plain_source: SOURCE
+PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+"""
+
+
+@pytest.mark.parametrize("content", ("", " ", "\n", "not JavaScript; 非空", "// @exec: {}\nfixture()"))
+def test_hosted_bridge_known_exec_grammar_enforces_nonempty_content_before_return(content: str) -> None:
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    tools: Final = [
+        {"type": "namespace", "name": "workspace", "tools": [{
+            "type": "custom", "name": "exec", "description": "Execute input",
+            "format": {"type": "grammar", "syntax": "lark", "definition": _NONEMPTY_EXEC_GRAMMAR},
+        }]},
+        {"type": "function", "name": "workspace__exec", "parameters": {"type": "object"}},
+    ]
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map({"tools": tools})))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        custom: Final = next(tool["function"] for tool in body["tools"] if tool["function"]["name"] == wire_name)
+        assert custom["strict"] is True
+        assert custom["parameters"]["properties"]["content"]["minLength"] == 1
+        assert custom["parameters"]["required"] == ["content"]
+        assert custom["parameters"]["additionalProperties"] is False
+        ordinary: Final = next(tool["function"] for tool in body["tools"]
+                               if tool["function"]["name"] == "workspace__exec")
+        assert ordinary["parameters"] == {"type": "object"}
+        return httpx.Response(200, json={
+            "id": "chatcmpl_fixture", "object": "chat.completion", "created": 1, "model": "fixture",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "tool_calls": [{"id": "call_fixture", "type": "function", "function": {
+                    "name": wire_name, "arguments": json.dumps({"content": content})}}],
+            }}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        request: Final = {
+            "model": "hosted_vllm/fixture", "api_base": "https://fixture.invalid/v1", "api_key": "fixture",
+            "client": HTTPHandler(client=client), "use_chat_completions_api": True, "num_retries": 0,
+            "input": "Call the fixture tool", "tools": tools,
+        }
+        if not content:
+            with pytest.raises(litellm.BadGatewayError, match="content must be nonempty"):
+                litellm.responses(**request)
+            return
+        result: Final = litellm.responses(**request)
+    assert result.output[0].type == "custom_tool_call"
+    assert result.output[0].name == "exec"
+    assert result.output[0].namespace == "workspace"
+    assert result.output[0].call_id == "call_fixture"
+    assert result.output[0].input == content
+
+
+@pytest.mark.parametrize(
+    "name, fmt",
+    (
+        ("exec", None),
+        ("exec", {"type": "text"}),
+        ("exec", {"type": "grammar", "syntax": "lark", "definition": 'start: "ok"'}),
+        ("exec", {"type": "grammar", "syntax": "regex", "definition": ".*"}),
+        ("other", {"type": "grammar", "syntax": "lark", "definition": _NONEMPTY_EXEC_GRAMMAR}),
+    ),
+)
+def test_hosted_bridge_preserves_empty_input_for_other_custom_formats(
+    name: str, fmt: dict[str, str] | None
+) -> None:
+    from litellm.responses.litellm_completion_transformation.custom_tools import native_responses_custom_tool_name_map
+
+    tools: Final = [{"type": "custom", "name": name, **({"format": fmt} if fmt is not None else {})}]
+    wire_name: Final = next(iter(native_responses_custom_tool_name_map({"tools": tools})))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        function: Final = body["tools"][0]["function"]
+        assert function.get("strict") is not True
+        assert "minLength" not in function["parameters"]["properties"]["content"]
+        return httpx.Response(200, json={
+            "id": "chatcmpl_fixture", "object": "chat.completion", "created": 1, "model": "fixture",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "tool_calls": [{"id": "call_fixture", "type": "function", "function": {
+                    "name": wire_name, "arguments": '{"content":""}'}}],
+            }}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result: Final = litellm.responses(
+            model="hosted_vllm/fixture", api_base="https://fixture.invalid/v1", api_key="fixture",
+            client=HTTPHandler(client=client), use_chat_completions_api=True, num_retries=0,
+            input="Call the fixture tool", tools=tools,
+        )
+    assert result.output[0].type == "custom_tool_call"
+    assert result.output[0].name == name
+    assert result.output[0].call_id == "call_fixture"
+    assert result.output[0].input == ""
+
+
+@pytest.mark.parametrize("image_only", (False, True))
+@pytest.mark.parametrize("image_type", ("input_image", "image_url"))
+def test_hosted_bridge_preserves_tool_images_and_parallel_call_ids(image_only: bool, image_type: str) -> None:
+    image_url: Final = "data:image/png;base64,iVBORw0KGgo="
+    image_part: Final = {
+        "type": image_type,
+        "image_url": image_url if image_type == "input_image" else {"url": image_url},
+    }
+    output: Final = [image_part] if image_only else [
+        {"type": "input_text", "text": "before"}, image_part, {"type": "input_text", "text": "after"},
+    ]
+    chat_image: Final = {"type": "image_url", "image_url": {"url": image_url}}
+    expected_content: Final = [chat_image] if image_only else [
+        {"type": "text", "text": "before"}, chat_image, {"type": "text", "text": "after"},
+    ]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        assert [message for message in body["messages"] if message["role"] == "tool"] == [
+            {"role": "tool", "tool_call_id": "call_image", "content": expected_content},
+            {"role": "tool", "tool_call_id": "call_text", "content": "other result"},
+        ]
+        assistant_messages: Final = tuple(message for message in body["messages"] if message["role"] == "assistant")
+        calls: Final = tuple(chain.from_iterable(message.get("tool_calls", []) for message in assistant_messages))
+        assert [call["id"] for call in calls] == ["call_image", "call_text"]
+        return httpx.Response(200, json={
+            "id": "chatcmpl-fixture", "object": "chat.completion", "created": 1, "model": "fixture",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "image received"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result: Final = litellm.responses(
+            model="hosted_vllm/fixture", api_base="https://fixture.invalid/v1", api_key="fixture",
+            client=HTTPHandler(client=client), use_chat_completions_api=True, num_retries=0,
+            input=[
+                {"role": "user", "content": "Inspect the tool image"},
+                {"type": "function_call", "call_id": "call_image", "name": "get_image", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_text", "name": "get_text", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_image", "output": output},
+                {"type": "function_call_output", "call_id": "call_text", "output": "other result"},
+            ],
+        )
+    assert result.output[0].content[0].text == "image received"
