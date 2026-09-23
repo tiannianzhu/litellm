@@ -18,7 +18,14 @@ from litellm.llms.anthropic.pass_through.adapters.streaming_iterator import (
 from litellm.llms.ollama.chat.transformation import (
     OllamaChatCompletionResponseIterator,
 )
-from litellm.types.utils import ModelResponseStream
+from litellm.types.utils import (
+    ChatCompletionDeltaToolCall,
+    Delta,
+    Function,
+    ModelResponseStream,
+    StreamingChoices,
+    Usage,
+)
 
 _OLLAMA_TOOL_CHUNK = {
     "model": "qwen3:8b",
@@ -77,3 +84,66 @@ def test_ollama_mid_stream_tool_call_yields_tool_use_stop_reason_sync():
 async def test_ollama_mid_stream_tool_call_yields_tool_use_stop_reason_async():
     wrapper = AnthropicStreamWrapper(completion_stream=_AsyncStream(_ollama_streamed_chunks()), model="qwen3:8b")
     _assert_tool_use_stop_reason([event async for event in wrapper])
+
+
+def _tool_use_stream(finish_reason: str) -> list[ModelResponseStream]:
+    return [
+        ModelResponseStream(
+            model="fixture-model",
+            choices=[
+                StreamingChoices(
+                    finish_reason=None,
+                    index=0,
+                    delta=Delta(
+                        role="assistant",
+                        tool_calls=[
+                            ChatCompletionDeltaToolCall(
+                                id="call_fixture",
+                                index=0,
+                                type="function",
+                                function=Function(name="read_file", arguments="{}"),
+                            )
+                        ],
+                    ),
+                )
+            ],
+        ),
+        ModelResponseStream(
+            model="fixture-model",
+            choices=[
+                StreamingChoices(
+                    finish_reason=finish_reason,
+                    index=0,
+                    delta=Delta(),
+                )
+            ],
+            usage=Usage(),
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "finish_reason,expected_stop_reason",
+    [("stop", "tool_use"), ("length", "max_tokens")],
+)
+def test_tool_use_stream_stop_reason_sync(finish_reason: str, expected_stop_reason: str) -> None:
+    wrapper = AnthropicStreamWrapper(completion_stream=iter(_tool_use_stream(finish_reason)), model="fixture-model")
+    events = list(wrapper)
+    message_deltas = [event for event in events if event.get("type") == "message_delta"]
+
+    assert message_deltas[-1]["delta"]["stop_reason"] == expected_stop_reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "finish_reason,expected_stop_reason",
+    [("stop", "tool_use"), ("length", "max_tokens")],
+)
+async def test_tool_use_stream_stop_reason_async(finish_reason: str, expected_stop_reason: str) -> None:
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=_AsyncStream(_tool_use_stream(finish_reason)), model="fixture-model"
+    )
+    events = [event async for event in wrapper]
+    message_deltas = [event for event in events if event.get("type") == "message_delta"]
+
+    assert message_deltas[-1]["delta"]["stop_reason"] == expected_stop_reason
