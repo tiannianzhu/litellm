@@ -3752,6 +3752,7 @@ def test_structured_messages_carry_tool_failures_only_when_asked(keep_tool_error
     assert messages is not None
     (tool_message,) = [message for message in messages if message["role"] == "tool"]
     assert tool_message.get("is_error") is (True if keep_tool_errors else None)
+    assert tool_message["content"] == "String not found"
 
 
 def test_request_sent_to_a_model_never_carries_tool_failure_marker() -> None:
