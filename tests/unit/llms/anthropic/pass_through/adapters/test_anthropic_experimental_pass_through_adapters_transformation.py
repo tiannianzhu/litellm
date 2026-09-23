@@ -4620,6 +4620,81 @@ def test_tool_result_without_translatable_content_still_answers_its_tool_use(too
     assert result[0]["role"] == "assistant"
 
 
+@pytest.mark.parametrize(
+    "content,is_error,expected",
+    [
+        ("permission denied", True, "Tool execution failed:\npermission denied"),
+        ("permission denied", False, "permission denied"),
+        (
+            [{"type": "text", "text": "permission denied"}, _base64_image_block()],
+            True,
+            [
+                {"type": "text", "text": "Tool execution failed:"},
+                {"type": "text", "text": "permission denied"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + TOOL_RESULT_IMAGE_B64}},
+            ],
+        ),
+        (
+            [{"type": "text", "text": "permission denied"}, _base64_image_block()],
+            False,
+            [
+                {"type": "text", "text": "permission denied"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + TOOL_RESULT_IMAGE_B64}},
+            ],
+        ),
+    ],
+    ids=["string_error", "string_success", "blocks_error", "blocks_success"],
+)
+def test_tool_result_error_prefix_preserves_content(content, is_error, expected):
+    result = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(
+        messages=[
+            _anthropic_tool_use_turn("toolu_error"),
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_error", "content": content, "is_error": is_error}
+                ],
+            },
+        ]
+    )
+
+    assert result[1] == {"role": "tool", "tool_call_id": "toolu_error", "content": expected}
+
+
+@pytest.mark.parametrize(
+    "finish_reason,expected_stop_reason",
+    [("stop", "tool_use"), ("length", "max_tokens")],
+)
+def test_translate_tool_call_response_preserves_finish_reason(finish_reason, expected_stop_reason):
+    response = ModelResponse(
+        id="chatcmpl-tool-finish",
+        model="fixture-model",
+        choices=[
+            Choices(
+                finish_reason=finish_reason,
+                index=0,
+                message=Message(
+                    role="assistant",
+                    content=None,
+                    tool_calls=[
+                        ChatCompletionAssistantToolCall(
+                            id="call_fixture",
+                            type="function",
+                            function={"name": "read_file", "arguments": "{}"},
+                        )
+                    ],
+                ),
+            )
+        ],
+        usage=Usage(),
+    )
+
+    result = LiteLLMAnthropicMessagesAdapter().translate_openai_response_to_anthropic(response)
+
+    assert result["stop_reason"] == expected_stop_reason
+    assert result["content"] == [{"type": "tool_use", "id": "call_fixture", "name": "read_file", "input": {}}]
+
+
 def _openai_response_with_usage(usage: Usage) -> ModelResponse:
     return ModelResponse(
         id="resp_web_search",

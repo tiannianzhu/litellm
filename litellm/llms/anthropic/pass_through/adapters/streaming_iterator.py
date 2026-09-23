@@ -351,6 +351,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
         self.compaction_block = compaction_block
         self.iterations_usage = iterations_usage
         self._refusal_text: str = ""
+        self._has_tool_use: bool = False
         self.sent_compaction_block: bool = False
         # Per-phase flags so the compaction block's start/delta/stop events
         # are emitted (and the public state machine is advanced) in
@@ -626,6 +627,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
                     response=chunk,
                     current_content_block_index=self.current_content_block_index,
+                    has_tool_use=self._has_tool_use,
                     applied_edits=(self.applied_edits if is_final_chunk and not will_merge_into_held else None),
                 )
                 processed_chunk = self._with_refusal_stop_details(processed_chunk)
@@ -784,9 +786,6 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 self.sent_last_message = True
                 return {"type": "message_stop"}
             raise StopIteration
-        except Exception as e:
-            verbose_logger.error("Anthropic Adapter - %s\n%s", e, traceback.format_exc())
-            raise StopIteration
 
     async def __anext__(self):
         from .transformation import LiteLLMAnthropicMessagesAdapter
@@ -861,6 +860,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 processed_chunk = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_response_to_anthropic(
                     response=chunk,
                     current_content_block_index=self.current_content_block_index,
+                    has_tool_use=self._has_tool_use,
                     applied_edits=(self.applied_edits if is_final_chunk and not will_merge_into_held else None),
                 )
                 processed_chunk = self._with_refusal_stop_details(processed_chunk)
@@ -1194,6 +1194,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
         # Restore original tool name if it was truncated for OpenAI's 64-char limit
         if block_type == "tool_use":
+            self._has_tool_use = True
             # Type narrowing: content_block_start is ToolUseBlock when block_type is "tool_use"
             from typing import cast
 
