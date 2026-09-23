@@ -1458,12 +1458,23 @@ class LiteLLMAnthropicMessagesAdapter:
         fields: Final = as_str_mapping(block) or {}
         is_error: Final = fields.get("is_error")
         tool_call_id: Final = tool_use_id if isinstance(tool_use_id := fields.get("tool_use_id"), str) else ""
-        content: Final = self._tool_result_content(fields.get("content"))
+        content: Final = self._tool_result_content(
+            fields.get("content"), is_error=not self.keep_tool_errors and is_error is True
+        )
         if self.keep_tool_errors and isinstance(is_error, bool):
             return ChatCompletionToolMessage(role="tool", tool_call_id=tool_call_id, content=content, is_error=is_error)
         return ChatCompletionToolMessage(role="tool", tool_call_id=tool_call_id, content=content)
 
-    def _tool_result_content(self, raw_content: object) -> ToolResultContent:
+    def _tool_result_content(self, raw_content: object, *, is_error: bool = False) -> ToolResultContent:
+        body: Final = self._tool_result_body(raw_content)
+        if not is_error:
+            return body
+        marker: Final = "Tool execution failed:"
+        if isinstance(body, str):
+            return f"{marker}\n{body}"
+        return [ChatCompletionTextObject(type="text", text=marker), *body]
+
+    def _tool_result_body(self, raw_content: object) -> ToolResultContent:
         if isinstance(raw_content, str):
             return raw_content
         if not isinstance(raw_content, list):
@@ -1604,9 +1615,11 @@ class LiteLLMAnthropicMessagesAdapter:
 
         return new_content
 
-    def _translate_openai_finish_reason_to_anthropic(self, openai_finish_reason: str) -> AnthropicFinishReason:
+    def _translate_openai_finish_reason_to_anthropic(
+        self, openai_finish_reason: str, *, has_tool_use: bool = False
+    ) -> AnthropicFinishReason:
         if openai_finish_reason == "stop":
-            return "end_turn"
+            return "tool_use" if has_tool_use else "end_turn"
         elif openai_finish_reason == "length":
             return "max_tokens"
         elif openai_finish_reason == "tool_calls":
@@ -1753,7 +1766,10 @@ class LiteLLMAnthropicMessagesAdapter:
         translated_finish_reason: Final = (
             "pause_turn"
             if response.choices and anthropic_stop_reason(response.choices[0].message) == "pause_turn"
-            else self._translate_openai_finish_reason_to_anthropic(openai_finish_reason=openai_finish_reason)
+            else self._translate_openai_finish_reason_to_anthropic(
+                openai_finish_reason=openai_finish_reason,
+                has_tool_use=any(block.get("type") == "tool_use" for block in anthropic_content),
+            )
         )
         anthropic_finish_reason: Final = (
             "compaction"
@@ -1927,11 +1943,14 @@ class LiteLLMAnthropicMessagesAdapter:
         response: ModelResponse,
         current_content_block_index: int,
         applied_edits: list[AppliedEdit] | None = None,
+        has_tool_use: bool = False,
     ) -> ContentBlockDelta | MessageBlockDelta:
         ## base case - final chunk w/ finish reason
         if response.choices[0].finish_reason is not None:
             delta: Final = MessageDelta(
-                stop_reason=self._translate_openai_finish_reason_to_anthropic(response.choices[0].finish_reason),
+                stop_reason=self._translate_openai_finish_reason_to_anthropic(
+                    response.choices[0].finish_reason, has_tool_use=has_tool_use
+                ),
             )
             if getattr(response, "usage", None) is not None:
                 litellm_usage_chunk: Usage | None = response.usage
