@@ -82,6 +82,38 @@ async def _drain_sse(wrapper: AnthropicStreamWrapper) -> List[bytes]:
     return [event async for event in wrapper.async_anthropic_sse_wrapper()]
 
 
+@pytest.mark.parametrize("as_sse", [False, True])
+@pytest.mark.parametrize(
+    "exception",
+    [
+        BedrockError(status_code=500, message="upstream disconnected"),
+        MidStreamFallbackError(
+            message="upstream disconnected",
+            model="fixture-model",
+            llm_provider="bedrock",
+            original_exception=BedrockError(status_code=500, message="upstream disconnected"),
+        ),
+    ],
+)
+def test_sync_stream_preserves_upstream_exception_after_partial_content(exception: Exception, as_sse: bool) -> None:
+    def upstream() -> Iterator[ModelResponseStream]:
+        yield ModelResponseStream(
+            choices=[StreamingChoices(index=0, delta=Delta(content="partial"), finish_reason=None)]
+        )
+        raise exception
+
+    wrapper: Final = AnthropicStreamWrapper(completion_stream=upstream(), model="fixture-model")
+    stream: Final = wrapper.anthropic_sse_wrapper() if as_sse else iter(wrapper)
+    first_events: Final = tuple(next(stream) for _ in range(3))
+    payloads: Final = tuple(_parse_sse(event)[1] if isinstance(event, bytes) else event for event in first_events)
+
+    assert [event["type"] for event in payloads] == ["message_start", "content_block_start", "content_block_delta"]
+    assert payloads[-1]["delta"] == {"type": "text_delta", "text": "partial"}
+    with pytest.raises(type(exception)) as raised:
+        next(stream)
+    assert raised.value is exception
+
+
 @pytest.mark.asyncio
 async def test_mid_stream_bedrock_error_becomes_anthropic_error_event():
     """A ``BedrockError`` raised after partial content must be surfaced as a
