@@ -29,21 +29,17 @@ import unittest.mock
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-async def test_search_short_circuit_marks_only_outer_logging(stream: bool):
+async def test_search_short_circuit_marks_only_outer_logging():
     from datetime import datetime
 
     from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
     from litellm.litellm_core_utils.litellm_logging import Logging
-    from litellm.llms.anthropic.pass_through.messages.fake_stream_iterator import (
-        FakeAnthropicMessagesStreamIterator,
-    )
     from litellm.llms.anthropic.pass_through.messages.handler import anthropic_messages
 
     logging_obj = Logging(
         model="hosted_vllm/test-model",
         messages=[],
-        stream=stream,
+        stream=False,
         call_type="anthropic_messages",
         start_time=datetime.now(),
         litellm_call_id="search-wrapper",
@@ -59,21 +55,118 @@ async def test_search_short_circuit_marks_only_outer_logging(stream: bool):
             model="hosted_vllm/test-model",
             messages=[{"role": "user", "content": "Perform a web search for the query: test"}],
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            stream=stream,
+            stream=False,
             litellm_logging_obj=logging_obj,
         )
 
     assert logging_obj.model_call_details["websearch_short_circuit"] is True
     search.assert_awaited_once()
     assert "websearch_short_circuit" not in search.await_args.kwargs["kwargs"]
-    if stream:
-        assert isinstance(response, FakeAnthropicMessagesStreamIterator)
-        chunks = b"".join([chunk async for chunk in response])
-        assert b"search results" in chunks
-        assert b"event: message_stop" in chunks
-    else:
-        assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
-        assert response["content"][-1]["text"] == "search results"
+    assert response["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    assert response["content"][-1]["text"] == "search results"
+
+
+@pytest.mark.asyncio
+async def test_streamed_search_logs_only_outer_messages_call():
+    from datetime import datetime
+    from itertools import count
+
+    from litellm.integrations.websearch_interception.handler import WebSearchInterceptionLogger
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.llms.anthropic.pass_through.messages.handler import anthropic_messages
+
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    class SuccessObserver(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.responses: asyncio.Queue[object] = asyncio.Queue()
+
+        async def async_log_success_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            self.responses.put_nowait(response_obj)
+
+        async def async_log_stream_event(
+            self, kwargs: dict[str, object], response_obj: object, start_time: datetime, end_time: datetime
+        ) -> None:
+            self.responses.put_nowait(response_obj)
+
+    def sse(delta: dict[str, object], finish_reason: str | None = None) -> bytes:
+        payload: Final = {
+            "id": "chatcmpl-search",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n".encode()
+
+    first_body: Final = (
+        sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {"name": "litellm_web_search", "arguments": '{"query":"test"}'},
+                    }
+                ]
+            }
+        )
+        + sse({}, "tool_calls")
+        + b"data: [DONE]\n\n"
+    )
+    second_body: Final = sse({"content": "Search answer"}) + sse({}, "stop") + b"data: [DONE]\n\n"
+    bodies: Final = (first_body, second_body)
+    rounds: Final = count()
+    requests: Final[asyncio.Queue[httpx.Request]] = asyncio.Queue()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(request)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=bodies[next(rounds)])
+
+    client: Final = AsyncHTTPHandler(transport=httpx.MockTransport(respond))
+    callback: Final = WebSearchInterceptionLogger(enabled_providers=["hosted_vllm"])
+    observer: Final = SuccessObserver()
+    logging_obj: Final = Logging(
+        model="hosted_vllm/test-model",
+        messages=[],
+        stream=True,
+        call_type="anthropic_messages",
+        start_time=datetime.now(),
+        litellm_call_id="search-wrapper",
+        function_id="search-wrapper",
+        dynamic_async_success_callbacks=[observer],
+    )
+    with (
+        patch(
+            "litellm.callbacks", [callback, observer]
+        ),  # test-quality-ok: TQ008 configures the process callback registry
+        patch.object(callback, "_execute_search", AsyncMock(return_value=("search results", None))) as search,
+    ):
+        async with client.client:
+            response: Final = await anthropic_messages(
+                max_tokens=100,
+                model="hosted_vllm/test-model",
+                messages=[{"role": "user", "content": "Perform a web search for the query: test"}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                stream=True,
+                api_base="https://fixture.invalid/v1",
+                api_key="fixture",
+                client=client,
+                litellm_logging_obj=logging_obj,
+            )
+            chunks: Final = b"".join([chunk async for chunk in response])
+        await GLOBAL_LOGGING_WORKER.flush()
+
+    assert requests.qsize() == 2
+    assert search.await_count == 1
+    assert b"Search answer" in chunks
+    assert b"event: message_stop" in chunks
+    assert "websearch_short_circuit" not in logging_obj.model_call_details
+    assert observer.responses.qsize() == 1
 
 
 def test_anthropic_experimental_pass_through_messages_handler():
@@ -1531,6 +1624,7 @@ async def test_provider_messages_api_base_env_is_not_shadowed_by_the_chat_defaul
 
     assert seen_urls == ["https://deepseek.internal.example/anthropic/v1/messages"]
 
+
 @pytest.mark.asyncio
 async def test_anthropic_messages_forwards_safeguards_and_unknown_beta_to_anthropic():
     """Shapes are what Claude Code 2.1.278 sends and api.anthropic.com returns, captured 2026-09-21."""
@@ -1645,7 +1739,9 @@ def _claude_code_auto_mode_request() -> tuple[list[dict[str, object]], list[dict
     return safeguards, safeguard_results
 
 
-def _upstream_answering_with(safeguard_results: list[dict[str, object]], captured: dict[str, object]) -> AsyncHTTPHandler:
+def _upstream_answering_with(
+    safeguard_results: list[dict[str, object]], captured: dict[str, object]
+) -> AsyncHTTPHandler:
     def upstream_records_the_request(request: httpx.Request) -> httpx.Response:
         captured["body"] = json.loads(request.content)
         captured["anthropic-beta"] = request.headers.get("anthropic-beta")
@@ -1671,7 +1767,9 @@ def _upstream_answering_with(safeguard_results: list[dict[str, object]], capture
 
 
 _CLIENT_BETA_HEADERS: Final = (
-    pytest.param({"anthropic-beta": "dangerous-tool-use-2026-09-03,interleaved-thinking-2025-05-14"}, id="client_sends_beta"),
+    pytest.param(
+        {"anthropic-beta": "dangerous-tool-use-2026-09-03,interleaved-thinking-2025-05-14"}, id="client_sends_beta"
+    ),
     pytest.param({"anthropic-beta": "interleaved-thinking-2025-05-14"}, id="client_omits_beta"),
     pytest.param({}, id="client_sends_no_beta_header"),
 )

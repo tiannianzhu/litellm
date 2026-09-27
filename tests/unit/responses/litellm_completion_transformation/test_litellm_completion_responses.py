@@ -4679,22 +4679,23 @@ class TestHostedWebSearchReplay:
             input=history, responses_api_request={}
         )
 
-        assert [item.get("role") for item in messages] == ["user", "assistant", "tool"]
+        assert [item.get("role") for item in messages] == ["user", "assistant", "tool", "tool"]
         assistant: Final = messages[1]
-        assert [call["id"] for call in assistant["tool_calls"]] == ["call_round_trip_weather"]
-        assert [call["function"]["name"] for call in assistant["tool_calls"]] == ["get_weather"]
+        assert [call["id"] for call in assistant["tool_calls"]] == [search.id, "call_round_trip_weather"]
+        assert [call["function"]["name"] for call in assistant["tool_calls"]] == ["litellm_web_search", "get_weather"]
         content: Final = assistant["content"]
         assert isinstance(content, list)
-        text_parts: Final = tuple(block["text"] for block in content if block.get("type") == "text")
-        assert text_parts[0] == "I found a forecast source."
-        replayed_searches: Final = tuple(
-            ResponseFunctionWebSearch.model_validate_json(text[text.index("{"):])
-            for text in text_parts
-            if "web_search_call" in text
+        assert tuple(block["text"] for block in content if block.get("type") == "text") == (
+            "I found a forecast source.",
         )
-        assert replayed_searches == (search,)
-        assert messages[2]["tool_call_id"] == "call_round_trip_weather"
-        assert messages[2]["content"] == "Paris is sunny."
+        assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == {
+            "query": search.action.query,
+            "search_queries": search.action.queries,
+        }
+        assert messages[2]["tool_call_id"] == search.id
+        assert json.loads(messages[2]["content"]) == search.model_dump(exclude_none=True)
+        assert messages[3]["tool_call_id"] == "call_round_trip_weather"
+        assert messages[3]["content"] == "Paris is sunny."
         assert history == original
 
     @pytest.mark.parametrize(
@@ -4723,17 +4724,23 @@ class TestHostedWebSearchReplay:
         input_item: Final = search.model_dump(exclude_none=True)
         original: Final = deepcopy(input_item)
 
-        messages: Final = LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
-            input_item=input_item
+        messages: Final = (
+            LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
+                input_item=input_item
+            )
         )
 
-        assert len(messages) == 1
+        assert len(messages) == 2
         assert messages[0]["role"] == "assistant"
-        assert not messages[0].get("tool_calls")
-        content: Final = messages[0].get("content")
-        assert isinstance(content, str)
-        replayed: Final = ResponseFunctionWebSearch.model_validate_json(content[content.index("{"):])
-        assert replayed == search
+        call: Final = messages[0]["tool_calls"][0]
+        assert call["id"] == search.id
+        assert call["function"]["name"] == "litellm_web_search"
+        arguments: Final = json.loads(call["function"]["arguments"])
+        assert arguments["query"] == (action.query if action.type == "search" else "")
+        assert messages[0].get("content") is None
+        assert messages[1]["role"] == "tool"
+        assert messages[1]["tool_call_id"] == call["id"]
+        assert json.loads(messages[1]["content"]) == search.model_dump(exclude_none=True)
         assert input_item == original
 
     @pytest.mark.parametrize("order", ((0, 1, 2, 3), (1, 0, 3, 2), (1, 3, 0, 2)))
@@ -4791,25 +4798,25 @@ class TestHostedWebSearchReplay:
             input=history, responses_api_request={}
         )
 
-        assert [message.get("role") for message in messages] == ["user", "assistant", "tool", "tool"]
+        assert [message.get("role") for message in messages] == ["user", "assistant", "tool", "tool", "tool", "tool"]
         assistant: Final = messages[1]
-        assert [call["id"] for call in assistant["tool_calls"]] == ["call_weather", "call_time"]
-        assert [call["function"]["name"] for call in assistant["tool_calls"]] == ["get_weather", "get_time"]
-        assert messages[2]["tool_call_id"] == "call_weather"
-        assert messages[2]["content"] == "Paris is sunny."
-        assert messages[3]["tool_call_id"] == "call_time"
-        assert messages[3]["content"] == "12:00"
+        calls: Final = assistant["tool_calls"]
+        expected_ids: Final = tuple(replay_items[index].get("call_id") or replay_items[index]["id"] for index in order)
+        assert tuple(call["id"] for call in calls) == expected_ids
+        assert tuple(call["function"]["name"] for call in calls if call["id"].startswith("ws_")) == (
+            "litellm_web_search",
+            "litellm_web_search",
+        )
+        results: Final = {message["tool_call_id"]: message["content"] for message in messages[2:]}
+        assert results["call_weather"] == "Paris is sunny."
+        assert results["call_time"] == "12:00"
+        assert tuple(json.loads(results[search.id]) for search in searches) == tuple(
+            search.model_dump(exclude_none=True) for search in searches
+        )
         content: Final = assistant["content"]
         assert isinstance(content, list)
         text_parts: Final = tuple(block["text"] for block in content if block.get("type") == "text")
-        assert text_parts[0] == "I will check the forecast."
-        assert text_parts[-1] == "I found two sources."
-        replayed_searches: Final = tuple(
-            ResponseFunctionWebSearch.model_validate_json(text[text.index("{"):])
-            for text in text_parts
-            if "web_search_call" in text
-        )
-        assert replayed_searches == searches
+        assert text_parts == ("I will check the forecast.", "I found two sources.")
         assert history == original
 
         provider_messages: Final = anthropic_messages_pt(
@@ -4819,17 +4826,175 @@ class TestHostedWebSearchReplay:
         assert [message["role"] for message in provider_messages] == ["user", "assistant", "user"]
         assistant_blocks: Final = provider_messages[1]["content"]
         result_blocks: Final = provider_messages[2]["content"]
-        assert [block["id"] for block in assistant_blocks if block.get("type") == "tool_use"] == [
-            "call_weather", "call_time"
-        ]
-        assert [block["tool_use_id"] for block in result_blocks if block.get("type") == "tool_result"] == [
-            "call_weather", "call_time"
-        ]
-        assert [block["content"] for block in result_blocks if block.get("type") == "tool_result"] == [
-            "Paris is sunny.", "12:00"
-        ]
+        assert tuple(block["id"] for block in assistant_blocks if block.get("type") == "tool_use") == expected_ids
+        assert {
+            block["tool_use_id"]: block["content"] for block in result_blocks if block.get("type") == "tool_result"
+        } == results
         assert [block["text"] for block in assistant_blocks if block.get("type") == "text"] == list(text_parts)
         assert history == original
+
+
+@pytest.mark.parametrize("structured", (False, True))
+@pytest.mark.parametrize("with_result", (False, True))
+@pytest.mark.parametrize("custom_exec", (False, True))
+def test_legacy_hosted_search_preserves_body_and_exec_history(
+    structured: bool, with_result: bool, custom_exec: bool
+) -> None:
+    search: Final = {
+        "id": "ws_history_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "history query"},
+        **({"provider_specific_fields": {"search_result": "A saved snippet."}} if with_result else {}),
+    }
+    marker: Final = "Hosted web search: " + json.dumps(search)
+    body: Final = "Before\n" + marker + '\nAfter {"ordinary": "JSON"}'
+    content: Final = [{"type": "output_text", "text": body}] if structured else body
+    exec_call: Final = (
+        {"type": "custom_tool_call", "call_id": "call_exec", "name": "exec", "input": "pwd"}
+        if custom_exec
+        else {"type": "function_call", "call_id": "call_exec", "name": "exec", "arguments": '{"cmd":"pwd"}'}
+    )
+    history: Final = [
+        {"role": "assistant", "content": content},
+        exec_call,
+        {
+            "type": "custom_tool_call_output" if custom_exec else "function_call_output",
+            "call_id": "call_exec",
+            "output": "/fixture",
+        },
+        {"role": "user", "content": "Continue"},
+    ]
+    original: Final = deepcopy(history)
+    messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+        input=history, responses_api_request={}
+    )
+    assert [message["role"] for message in messages] == ["assistant", "tool", "tool", "user"]
+    assistant: Final = messages[0]
+    assert (
+        assistant["content"]
+        if isinstance(assistant["content"], str)
+        else "".join(block["text"] for block in assistant["content"])
+    ) == 'Before\n\nAfter {"ordinary": "JSON"}'
+    assert [(call["id"], call["function"]["name"]) for call in assistant["tool_calls"]] == [
+        (search["id"], "litellm_web_search"),
+        ("call_exec", "exec"),
+    ]
+    assert json.loads(assistant["tool_calls"][0]["function"]["arguments"]) == {"query": "history query"}
+    assert messages[1]["tool_call_id"] == search["id"]
+    assert json.loads(messages[1]["content"]) == search
+    assert json.loads(assistant["tool_calls"][1]["function"]["arguments"]) == (
+        {"content": "pwd"} if custom_exec else {"cmd": "pwd"}
+    )
+    assert messages[2]["tool_call_id"] == "call_exec"
+    assert messages[2]["content"] == "/fixture"
+    assert history == original
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        'Hosted web search: {"type":"web_search_call"}',
+        'Hosted web search: {"id":"ws_bad","type":"web_search_call","status":"completed","action":{"type":"search","query":7}}',
+        'Hosted web search: {"id":"ws_bad","type":"web_search_call","status":"unknown","action":{"type":"search","query":"q"}}',
+        'Hosted web search: {"id":"","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}',
+        'Hosted web search: {"type":"ordinary_json","value":"unchanged"}',
+        'Hosted web search: {"id":',
+        '{"type":"web_search_call","ordinary":"text"}',
+        'Example Hosted web search: {"id":"ws_example","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}',
+        'Hosted web search: {"id":"ws_example","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}} trailing text',
+        '```text\nHosted web search: {"id":"ws_example","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}\n```',
+    ),
+)
+def test_invalid_or_quoted_legacy_search_text_stays_assistant_text(text: str) -> None:
+    messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+        input=[{"role": "assistant", "content": text}], responses_api_request={}
+    )
+    assert len(messages) == 1
+    assert not messages[0].get("tool_calls")
+    assert (
+        messages[0]["content"]
+        if isinstance(messages[0]["content"], str)
+        else "".join(block["text"] for block in messages[0]["content"])
+    ) == text
+
+
+@pytest.mark.asyncio
+async def test_session_chat_history_normalizes_legacy_search_with_existing_exec_call() -> None:
+    search: Final = {
+        "id": "ws_session_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "saved query"},
+        "provider_specific_fields": {"search_result": "Previously saved evidence"},
+    }
+    saved: Final = Message(
+        role="assistant",
+        reasoning_content="Saved reasoning",
+        content="Saved body\nHosted web search: " + json.dumps(search),
+        tool_calls=[
+            ChatCompletionMessageToolCall(
+                id="call_exec", type="function", function=Function(name="exec", arguments='{"cmd":"pwd"}')
+            )
+        ],
+    )
+    original: Final = saved.model_dump()
+    request: Final = {"messages": [saved, {"role": "tool", "tool_call_id": "call_exec", "content": "/fixture"}]}
+    normalized: Final = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+        previous_response_id="", litellm_completion_request=request
+    )
+    messages: Final = normalized["messages"]
+    assert [message["role"] for message in messages] == ["assistant", "tool", "tool"]
+    assert [(call.id, call.function.name) for call in messages[0].tool_calls] == [
+        ("call_exec", "exec"),
+        (search["id"], "litellm_web_search"),
+    ]
+    assert messages[0].content == "Saved body\n"
+    assert messages[0].reasoning_content == "Saved reasoning"
+    assert json.loads(messages[1]["content"]) == search
+    assert messages[2]["tool_call_id"] == "call_exec"
+    assert saved.model_dump() == original
+    repeated: Final = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+        previous_response_id="", litellm_completion_request={"messages": messages}
+    )
+    assert repeated["messages"] == messages
+
+
+@pytest.mark.parametrize("role", ("user", "system"))
+def test_legacy_search_marker_in_other_roles_is_preserved(role: str) -> None:
+    text: Final = 'Hosted web search: {"id":"ws_example","type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}'
+    messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+        input=[{"role": role, "content": text}], responses_api_request={}
+    )
+    assert len(messages) == 1
+    assert messages[0]["content"] == text
+    assert not messages[0].get("tool_calls")
+
+
+def test_structured_search_and_exec_chat_history_preserves_call_result_pairs() -> None:
+    history: Final = [
+        {
+            "role": "assistant",
+            "content": "Saved answer",
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {"name": "litellm_web_search", "arguments": '{"query":"saved query"}'},
+                },
+                {"id": "call_exec", "type": "function", "function": {"name": "exec", "arguments": '{"cmd":"pwd"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_search", "content": "Saved result"},
+        {"role": "tool", "tool_call_id": "call_exec", "content": "/fixture"},
+        {"role": "user", "content": "Continue"},
+    ]
+    original: Final = deepcopy(history)
+    messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
+        input=history, responses_api_request={}
+    )
+    assert messages == history
+    assert history == original
 
 
 BRIDGED_CHAT_COMPLETION_ID = "chatcmpl-dfa2da3a-1586-4ff7-b64e-f59c692a5d11"

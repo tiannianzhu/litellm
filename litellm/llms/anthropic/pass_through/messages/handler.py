@@ -190,6 +190,9 @@ async def _try_websearch_short_circuit(
     Returns the synthetic response if short-circuited, or None to continue
     normal processing.
     """
+    if stream and custom_llm_provider == "hosted_vllm":
+        return None
+
     if not litellm.callbacks:
         return None
 
