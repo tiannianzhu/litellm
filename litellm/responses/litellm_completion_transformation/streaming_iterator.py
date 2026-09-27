@@ -70,6 +70,8 @@ from litellm.types.utils import (
     TextCompletionResponse,
 )
 
+_PROVIDER_FIELDS: Final = TypeAdapter(dict[str, object])
+
 
 def _index_of_output_item_type(items: Sequence[object], item_type: str) -> int | None:
     return next(
@@ -235,6 +237,10 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             )
         )
 
+    async def aclose(self) -> None:
+        self.finished = True
+        await self.litellm_custom_stream_wrapper.aclose()
+
     def _get_or_assign_tool_output_index(self, call_id: str) -> int:
         existing: Final = self._tool_output_index_by_call_id.get(call_id)
         if existing is not None:
@@ -388,6 +394,46 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         )
         self._reasoning_done_emitted = True
         self._reasoning_active = False
+
+    @staticmethod
+    def _with_hosted_search_calls(chunk: ModelResponseStream) -> ModelResponseStream:
+        if not chunk.choices:
+            return chunk
+        delta: Final = chunk.choices[0].delta
+        fields: Final = delta.provider_specific_fields
+        offset: Final = fields.get("websearch_tool_offset") if isinstance(fields, dict) else None
+        if isinstance(offset, int) and offset and delta.tool_calls:
+            shifted_delta: Final = delta.model_copy(
+                update=MappingProxyType(
+                    {
+                        "tool_calls": [
+                            call.model_copy(update=MappingProxyType({"index": (call.index or 0) + offset}))
+                            for call in delta.tool_calls
+                        ]
+                    }
+                )
+            )
+            return chunk.model_copy(
+                update=MappingProxyType(
+                    {"choices": [chunk.choices[0].model_copy(update=MappingProxyType({"delta": shifted_delta}))]}
+                )
+            )
+        if not isinstance(fields, dict) or not fields.get("websearch_tool_calls"):
+            return chunk
+        return ModelResponseStream.model_validate(
+            {
+                **chunk.model_dump(),
+                "choices": [
+                    {
+                        **chunk.choices[0].model_dump(),
+                        "delta": {
+                            **delta.model_dump(),
+                            "tool_calls": fields["websearch_tool_calls"],
+                        },
+                    }
+                ],
+            }
+        )
 
     def _reserve_web_search_indexes(self, provider_fields: object) -> None:
         if not isinstance(provider_fields, dict):
@@ -1286,6 +1332,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         chunk = await self.litellm_custom_stream_wrapper.__anext__()
                     if chunk is not None:
                         chunk = cast(ModelResponseStream, chunk)
+                        chunk = self._with_hosted_search_calls(chunk)
                         for src in (
                             getattr(chunk, "provider_specific_fields", None),
                             getattr(
@@ -1296,10 +1343,12 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         ):
                             if src and isinstance(src, dict):
                                 self._merge_provider_specific_fields(src)
-                                self._reserve_web_search_indexes(src)
+                                self._reserve_web_search_indexes(_PROVIDER_FIELDS.validate_python(src))
                         self._ensure_output_item_for_chunk(chunk)
                         # Proceed to transformation
-                        self.collected_chat_completion_chunks.append(self._snapshot_chunk_for_stream_chunk_builder(chunk))
+                        self.collected_chat_completion_chunks.append(
+                            self._snapshot_chunk_for_stream_chunk_builder(chunk)
+                        )
                         self._queue_chunk_content_events(chunk)
 
                     if self._pending_response_events:
@@ -1341,6 +1390,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         raise StopIteration
                     else:
                         chunk = self.litellm_custom_stream_wrapper.__next__()
+                    chunk = self._with_hosted_search_calls(chunk)
                     for src in (
                         getattr(chunk, "provider_specific_fields", None),
                         getattr(
@@ -1351,7 +1401,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     ):
                         if src and isinstance(src, dict):
                             self._merge_provider_specific_fields(src)
-                            self._reserve_web_search_indexes(src)
+                            self._reserve_web_search_indexes(_PROVIDER_FIELDS.validate_python(src))
                     self._ensure_output_item_for_chunk(chunk)
                     self.collected_chat_completion_chunks.append(self._snapshot_chunk_for_stream_chunk_builder(chunk))
                     self._queue_chunk_content_events(chunk)

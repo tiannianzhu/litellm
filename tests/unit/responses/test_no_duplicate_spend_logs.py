@@ -9,6 +9,7 @@ causing duplicate spend log entries for non-OpenAI providers.
 import asyncio
 import datetime
 import json
+import uuid
 from typing import Final, cast
 
 import httpx
@@ -112,13 +113,16 @@ async def test_aresponses_converted_web_search_stream_logs_completed_payload(
     monkeypatch: pytest.MonkeyPatch, consume_stream: bool, search_used: bool
 ):
     class SuccessPayloadRecorder(CustomLogger):
-        def __init__(self):
+        def __init__(self, tracking_id: str):
             super().__init__()
+            self.tracking_id = tracking_id
             self.payloads: list[dict[str, object] | None] = []
             self.response_objects: list[ResponsesAPIResponse] = []
             self.finished = asyncio.Event()
 
         async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            if kwargs.get("litellm_call_id") != self.tracking_id:
+                return
             self.payloads.append(kwargs.get("standard_logging_object"))
             self.response_objects.append(cast(ResponsesAPIResponse, response_obj))
             if len(self.payloads) == (2 if search_used else 1):
@@ -176,7 +180,8 @@ async def test_aresponses_converted_web_search_stream_logs_completed_payload(
                 ),
             )
 
-    recorder: Final = SuccessPayloadRecorder()
+    request_id: Final = f"responses-web-search-{uuid.uuid4()}"
+    recorder: Final = SuccessPayloadRecorder(request_id)
     pricing: Final = {
         "litellm_provider": "hosted_vllm",
         "input_cost_per_token": 0.01,
@@ -212,6 +217,7 @@ async def test_aresponses_converted_web_search_stream_logs_completed_payload(
             tools=[{"type": "web_search"}],
             litellm_session_id="web-search-session",
             client=client,
+            litellm_call_id=request_id,
         )
         terminal_response: Final = response.completed_response.response
         assert terminal_response.usage.output_tokens_details.reasoning_tokens == 2
@@ -247,36 +253,42 @@ async def test_aresponses_converted_web_search_stream_logs_completed_payload(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("consume_stream", [True, False])
-async def test_router_responses_custom_tool_bridge_logs_before_stream_consumption(
+async def test_router_responses_custom_tool_bridge_logs_on_stream_completion(
     monkeypatch: pytest.MonkeyPatch, consume_stream: bool
 ):
     class SuccessPayloadRecorder(CustomLogger):
-        def __init__(self):
+        def __init__(self, tracking_id: str):
             super().__init__()
+            self.tracking_id = tracking_id
             self.payloads: list[dict[str, object] | None] = []
             self.response_objects: list[ModelResponse] = []
             self.finished = asyncio.Event()
 
         async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+            if kwargs.get("litellm_call_id") != self.tracking_id:
+                return
             self.payloads.append(kwargs.get("standard_logging_object"))
             self.response_objects.append(cast(ModelResponse, response_obj))
             self.finished.set()
 
-    response_body: Final = {
-        "id": "chatcmpl-custom-tool-bridge",
-        "object": "chat.completion",
-        "created": 1,
-        "model": "test-model",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": "complete answer"},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
-    }
-    recorder: Final = SuccessPayloadRecorder()
+    def chat_chunk(choices: list[dict[str, object]], usage: dict[str, int] | None = None) -> str:
+        payload: Final = {
+            "id": "chatcmpl-custom-tool-bridge",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": choices,
+        }
+        return f"data: {json.dumps({**payload, **({'usage': usage} if usage is not None else {})})}\n\n"
+
+    stream_body: Final = (
+        chat_chunk([{"index": 0, "delta": {"role": "assistant", "content": "complete answer"}, "finish_reason": None}])
+        + chat_chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}])
+        + chat_chunk([], usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5})
+        + "data: [DONE]\n\n"
+    )
+    request_id: Final = f"router-custom-tool-bridge-{uuid.uuid4()}"
+    recorder: Final = SuccessPayloadRecorder(request_id)
     pricing: Final = {
         "litellm_provider": "hosted_vllm",
         "input_cost_per_token": 0.01,
@@ -300,11 +312,12 @@ async def test_router_responses_custom_tool_bridge_logs_before_stream_consumptio
         model="test-model-group",
         input="hello",
         stream=True,
+        stream_options={"include_usage": True},
         tools=[
             {"type": "web_search"},
             {"type": "custom", "name": "apply_patch", "format": {"type": "text"}},
         ],
-        litellm_call_id="router-custom-tool-bridge",
+        litellm_call_id=request_id,
     )
     request_data["litellm_logging_obj"] = logging_obj
     request_data["use_chat_completions_api"] = True
@@ -327,7 +340,12 @@ async def test_router_responses_custom_tool_bridge_logs_before_stream_consumptio
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, json=response_body, request=request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=stream_body,
+            request=request,
+        )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as upstream:
         client: Final = AsyncHTTPHandler()
@@ -336,13 +354,15 @@ async def test_router_responses_custom_tool_bridge_logs_before_stream_consumptio
         router.model_list[0]["litellm_params"]["client"] = client
 
         response = await router.aresponses(**request_data)
-
-        await asyncio.wait_for(recorder.finished.wait(), timeout=5)
+        assert not recorder.finished.is_set()
         if consume_stream:
             stream_events: Final = [event async for event in response]
             terminal_response: Final = getattr(stream_events[-1], "response", None)
             assert isinstance(terminal_response, ResponsesAPIResponse)
             assert terminal_response.output[0].content[0].text == "complete answer"
+            await asyncio.wait_for(recorder.finished.wait(), timeout=5)
+        else:
+            await response.aclose()
 
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
@@ -350,7 +370,10 @@ async def test_router_responses_custom_tool_bridge_logs_before_stream_consumptio
 
     assert len(requests) == 1
     assert requests[0].url.path.endswith("/chat/completions")
-    assert json.loads(requests[0].content)["stream"] is False
+    assert json.loads(requests[0].content)["stream"] is True
+    if not consume_stream:
+        assert recorder.payloads == []
+        return
     assert len(recorder.payloads) == 1
     payload: Final = recorder.payloads[0]
     assert payload is not None

@@ -6,7 +6,10 @@ tool calls returned by /v1/responses, executes the search server-side, and
 builds a Responses-format follow-up request.
 """
 
+import asyncio
+import itertools
 import json
+from collections.abc import AsyncIterator, Mapping
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,12 +21,72 @@ import litellm
 from litellm.integrations.websearch_interception.handler import (
     WebSearchInterceptionLogger,
 )
+from litellm.llms.base_llm.search.transformation import SearchResponse
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.types.integrations.custom_logger import (
     RESPONSES_AGENTIC_SURFACE,
 )
+from litellm.types.integrations.websearch_interception import RichWebSearchInput
 from litellm.types.llms.openai import ResponsesAPIResponse
 from litellm.types.utils import CallTypes, LlmProviders
+
+
+def _bridge_sse(delta: dict[str, object], finish_reason: str | None = None) -> bytes:
+    payload: Final = {
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _bridge_usage(prompt_tokens: int, completion_tokens: int) -> bytes:
+    payload: Final = {
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+class _BridgeGatedStream(httpx.AsyncByteStream):
+    def __init__(self, first: bytes, rest: bytes, release: asyncio.Event) -> None:
+        self.first = first
+        self.rest = rest
+        self.release = release
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.first
+        await self.release.wait()
+        yield self.rest
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class _BridgeSearchLogger(WebSearchInterceptionLogger):
+    def __init__(self) -> None:
+        super().__init__(enabled_providers=[LlmProviders.HOSTED_VLLM])
+        self.queries: asyncio.Queue[str] = asyncio.Queue()
+
+    async def _execute_search(
+        self,
+        query: str,
+        kwargs: Mapping[str, object] | None = None,
+        rich: RichWebSearchInput | None = None,
+    ) -> tuple[str, SearchResponse | None]:
+        self.queries.put_nowait(query)
+        return f"Result for {query}", None
 
 
 def _responses_output_with_web_search(call_id: str = "fc_1", query: str = "latest ai news"):
@@ -325,7 +388,7 @@ async def test_deployment_hook_responses_converts_stream_to_non_stream():
 
 
 @pytest.mark.asyncio
-async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_stream(
+async def test_hosted_vllm_responses_web_search_preserves_custom_tool_stream(
     monkeypatch: pytest.MonkeyPatch,
 ):
     tool_input: Final = "const result = await tools.exec_command({ cmd: 'true' });"
@@ -362,7 +425,25 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/chat/completions"
         sent.append(json.loads(request.content))
-        return httpx.Response(200, json=response_body)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=(
+                _bridge_sse(
+                    {
+                        "tool_calls": [
+                            {
+                                **response_body["choices"][0]["message"]["tool_calls"][0],
+                                "index": 0,
+                            }
+                        ]
+                    }
+                )
+                + _bridge_sse({}, "tool_calls")
+                + _bridge_usage(2, 3)
+                + b"data: [DONE]\n\n"
+            ),
+        )
 
     handler: Final = AsyncHTTPHandler()
     await handler.client.aclose()
@@ -394,7 +475,7 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
 
     assert len(sent) == 1
     upstream: Final = sent[0]
-    assert upstream["stream"] is False
+    assert upstream["stream"] is True
     assert [tool["function"]["name"] for tool in upstream["tools"]] == ["exec", "litellm_web_search"]
     event_types: Final = [
         getattr(getattr(event, "type", None), "value", getattr(event, "type", None)) for event in events
@@ -422,3 +503,379 @@ async def test_hosted_vllm_responses_web_search_interceptor_rewraps_custom_tool_
     assert completed.output[0].call_id == "call_fixture_exec"
     assert completed.output[0].input == tool_input
     assert completed.usage.total_tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_hosted_vllm_responses_bridge_yields_text_before_upstream_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release: Final = asyncio.Event()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _BridgeSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_BridgeGatedStream(
+                _bridge_sse({"content": "early"}),
+                _bridge_sse({"content": " text"}) + _bridge_sse({}, "stop") + _bridge_usage(2, 3) + b"data: [DONE]\n\n",
+                release,
+            ),
+        )
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.aresponses(
+            model="hosted_vllm/test-model",
+            input="Say early text",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            use_chat_completions_api=True,
+            tools=[{"type": "web_search"}],
+            client=handler,
+        )
+
+        async def first_text_delta() -> str:
+            async for event in stream:
+                if getattr(event.type, "value", event.type) == "response.output_text.delta":
+                    return event.delta
+            raise AssertionError("The response ended without a text delta")
+
+        try:
+            first: Final = await asyncio.wait_for(first_text_delta(), timeout=2)
+            assert first == "early"
+            assert not release.is_set()
+        finally:
+            release.set()
+        remaining: Final = [event async for event in stream]
+    finally:
+        release.set()
+        await handler.client.aclose()
+
+    request: Final = await asyncio.wait_for(requests.get(), timeout=2)
+    assert request["stream"] is True
+    assert requests.empty()
+    assert logger.queries.empty()
+    text_deltas: Final = [
+        event.delta for event in remaining if getattr(event.type, "value", event.type) == "response.output_text.delta"
+    ]
+    assert "".join((first, *text_deltas)) == "early text"
+    completed: Final = [
+        event.response for event in remaining if getattr(event.type, "value", event.type) == "response.completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0].usage.total_tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_hosted_vllm_responses_bridge_close_closes_upstream_before_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release: Final = asyncio.Event()
+    raw_stream: Final = _BridgeGatedStream(
+        _bridge_sse({"content": "partial"}),
+        _bridge_sse({}, "stop") + b"data: [DONE]\n\n",
+        release,
+    )
+    logger: Final = _BridgeSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=raw_stream)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.aresponses(
+            model="hosted_vllm/test-model",
+            input="Stop after partial",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            use_chat_completions_api=True,
+            tools=[{"type": "web_search"}],
+            client=handler,
+        )
+
+        async def first_text_delta() -> str:
+            async for event in stream:
+                if getattr(event.type, "value", event.type) == "response.output_text.delta":
+                    return event.delta
+            raise AssertionError("The response ended without a text delta")
+
+        assert await asyncio.wait_for(first_text_delta(), timeout=2) == "partial"
+        await asyncio.wait_for(stream.aclose(), timeout=2)
+        assert raw_stream.closed.is_set()
+        assert not release.is_set()
+    finally:
+        release.set()
+        await handler.client.aclose()
+
+    assert logger.queries.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rounds", (1, 2))
+@pytest.mark.parametrize("client_tool", (False, True))
+async def test_hosted_vllm_responses_bridge_emits_completed_searches_across_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+    rounds: int,
+    client_tool: bool,
+) -> None:
+    call_number: Final = itertools.count()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _BridgeSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    final_reply: Final = (
+        _bridge_sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_client",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+                    }
+                ]
+            }
+        )
+        + _bridge_sse({}, "tool_calls")
+        if client_tool
+        else _bridge_sse({"content": "final answer"}) + _bridge_sse({}, "stop")
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        index: Final = next(call_number)
+        body: Final = (
+            (
+                _bridge_sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_fixture",
+                                "type": "function",
+                                "function": {
+                                    "name": "litellm_web_search",
+                                    "arguments": json.dumps({"query": f"query {index}"}),
+                                },
+                            }
+                        ]
+                    }
+                )
+                + _bridge_sse({}, "tool_calls")
+                if index < rounds
+                else final_reply
+            )
+            + _bridge_usage(2, 3)
+            + b"data: [DONE]\n\n"
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.aresponses(
+            model="hosted_vllm/test-model",
+            input="Search before answering",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            use_chat_completions_api=True,
+            tools=[
+                {"type": "web_search"},
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object"}},
+            ],
+            client=handler,
+        )
+        events: Final = [event async for event in stream]
+    finally:
+        await handler.client.aclose()
+
+    sent: Final = tuple(requests.get_nowait() for _ in range(requests.qsize()))
+    assert len(sent) == rounds + 1
+    assert all(request["stream"] is True for request in sent)
+    assert tuple(logger.queries.get_nowait() for _ in range(logger.queries.qsize())) == tuple(
+        f"query {index}" for index in range(rounds)
+    )
+    event_types: Final = [getattr(event.type, "value", event.type) for event in events]
+    assert event_types.count("response.completed") == 1
+    completed: Final = next(
+        event.response for event in events if getattr(event.type, "value", event.type) == "response.completed"
+    )
+    web_search_calls: Final = [item for item in completed.output if item.type == "web_search_call"]
+    assert len(web_search_calls) == rounds
+    assert len({item.id for item in web_search_calls}) == rounds
+    assert [item.action.query for item in web_search_calls] == [f"query {index}" for index in range(rounds)]
+    done_searches: Final = [
+        event.item
+        for event in events
+        if getattr(event.type, "value", event.type) == "response.output_item.done"
+        and event.item.type == "web_search_call"
+    ]
+    assert [item.id for item in done_searches] == [item.id for item in web_search_calls]
+    assert [item.action["query"] for item in done_searches] == [item.action.query for item in web_search_calls]
+    client_calls: Final = [item for item in completed.output if item.type == "function_call"]
+    assert [(item.call_id, item.name, item.arguments) for item in client_calls] == (
+        [("call_client", "get_weather", '{"city":"Paris"}')] if client_tool else []
+    )
+    assert completed.usage.total_tokens == 5 * (rounds + 1)
+    assert (
+        "".join(
+            event.delta for event in events if getattr(event.type, "value", event.type) == "response.output_text.delta"
+        )
+        == ("" if client_tool else "final answer")
+    )
+
+
+@pytest.mark.asyncio
+async def test_hosted_vllm_responses_replay_completed_search_and_client_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_number: Final = itertools.count()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _BridgeSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        index: Final = next(request_number)
+        if index == 0:
+            body: Final = (
+                _bridge_sse(
+                    {
+                        "content": "I will search, then run the client tool.",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_search",
+                                "type": "function",
+                                "function": {
+                                    "name": "litellm_web_search",
+                                    "arguments": json.dumps({"query": "latest ai news"}),
+                                },
+                            },
+                            {
+                                "index": 1,
+                                "id": "call_exec",
+                                "type": "function",
+                                "function": {"name": "exec", "arguments": '{"command":"pwd"}'},
+                            },
+                        ],
+                    }
+                )
+                + _bridge_sse({}, "tool_calls")
+                + _bridge_usage(2, 3)
+                + b"data: [DONE]\n\n"
+            )
+        else:
+            body = (
+                _bridge_sse({"content": "The search and client tool are complete."})
+                + _bridge_sse({}, "stop")
+                + _bridge_usage(3, 2)
+                + b"data: [DONE]\n\n"
+            )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    tools: Final = [
+        {"type": "web_search"},
+        {
+            "type": "function",
+            "name": "exec",
+            "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        },
+    ]
+    try:
+        first_stream: Final = await litellm.aresponses(
+            model="hosted_vllm/test-model",
+            input="Search and run the client tool.",
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            use_chat_completions_api=True,
+            tools=tools,
+            client=handler,
+        )
+        first_events: Final = [event async for event in first_stream]
+        first_completed: Final = next(
+            event.response
+            for event in first_events
+            if getattr(event.type, "value", event.type) == "response.completed"
+        )
+        first_search: Final = next(item for item in first_completed.output if item.type == "web_search_call")
+        first_exec: Final = next(
+            item
+            for item in first_completed.output
+            if item.type == "function_call" and item.name == "exec"
+        )
+
+        second_stream: Final = await litellm.aresponses(
+            model="hosted_vllm/test-model",
+            input=[
+                *(item.model_dump(exclude_none=True) for item in first_completed.output),
+                {
+                    "type": "function_call_output",
+                    "call_id": first_exec.call_id,
+                    "output": "exec succeeded",
+                },
+                {"role": "user", "content": "Summarize the results."},
+            ],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            stream=True,
+            use_chat_completions_api=True,
+            tools=tools,
+            client=handler,
+        )
+        second_events: Final = [event async for event in second_stream]
+    finally:
+        await handler.client.aclose()
+
+    sent: Final = tuple(requests.get_nowait() for _ in range(requests.qsize()))
+    assert len(sent) == 2
+    assert tuple(logger.queries.get_nowait() for _ in range(logger.queries.qsize())) == ("latest ai news",)
+
+    replayed_messages: Final = sent[1]["messages"]
+    assert isinstance(replayed_messages, list)
+    assistant_messages: Final = [message for message in replayed_messages if message.get("role") == "assistant"]
+    replayed_calls: Final = [call for message in assistant_messages for call in message.get("tool_calls", [])]
+    search_call: Final = next(call for call in replayed_calls if call["function"]["name"] == "litellm_web_search")
+    exec_call: Final = next(call for call in replayed_calls if call["function"]["name"] == "exec")
+    assert json.loads(search_call["function"]["arguments"]) == {"query": "latest ai news"}
+    assert search_call["id"] == first_search.id
+    assert exec_call["id"] == first_exec.call_id
+    assert all("Hosted web search:" not in str(message.get("content")) for message in assistant_messages)
+    assert any("I will search, then run the client tool." in str(message.get("content")) for message in assistant_messages)
+
+    request_tools: Final = sent[1]["tools"]
+    assert isinstance(request_tools, list)
+    replayed_search_tool: Final = next(
+        tool["function"] for tool in request_tools if tool["function"]["name"] == "litellm_web_search"
+    )
+    assert replayed_search_tool["parameters"]["properties"]["query"]["type"] == "string"
+    assert "query" in replayed_search_tool["parameters"]["required"]
+
+    tool_results: Final = [message for message in replayed_messages if message.get("role") == "tool"]
+    result_by_call_id: Final = {message.get("tool_call_id"): message.get("content") for message in tool_results}
+    assert first_search.id in result_by_call_id
+    assert "Result for latest ai news" in str(result_by_call_id[first_search.id])
+    assert result_by_call_id[first_exec.call_id] == "exec succeeded"
+    assert any(
+        message.get("role") == "user" and message.get("content") == "Summarize the results."
+        for message in replayed_messages
+    )
+    assert any(
+        getattr(event.type, "value", event.type) == "response.completed" for event in second_events
+    )
