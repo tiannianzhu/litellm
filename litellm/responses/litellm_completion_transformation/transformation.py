@@ -325,6 +325,12 @@ _MessageT = TypeVar("_MessageT")
 _MediaT: Final = TypeVar("_MediaT")
 _InputItemT: Final = TypeVar("_InputItemT")
 _CACHED_CONTENT_ADAPTER: Final = TypeAdapter(ChatCompletionCachedContent)
+_ASSISTANT_MESSAGE_ADAPTER: Final = TypeAdapter(ChatCompletionAssistantMessage)
+_TOOL_MESSAGE_ADAPTER: Final = TypeAdapter(ChatCompletionToolMessage)
+_LEGACY_SEARCH_FRAGMENT: Final = re.compile(
+    r"(?m)^```[^\n]*\n[\s\S]*?^```[^\n]*(?:\n|$)|^~~~[^\n]*\n[\s\S]*?^~~~[^\n]*(?:\n|$)"
+    r"|^Hosted web search: (?P<search>\{[^\r\n]*\})(?=\r?$)"
+)
 _DICT_ITEMS_LIST_ADAPTER: Final = TypeAdapter(list[dict[object, object]])
 _TEXT_ADAPTER: Final = TypeAdapter(str)
 _RESPONSES_API_TOOL_CHOICE_ADAPTER: Final = TypeAdapter(ToolChoice)
@@ -623,6 +629,15 @@ def _is_unrun_hosted_search(input_item: Mapping[str, object]) -> bool:
     return input_item.get("type") == "web_search_call" and input_item.get("status") == "in_progress"
 
 
+def _is_proxy_search(input_item: Mapping[str, object]) -> bool:
+    fields: Final = as_str_mapping(input_item.get("provider_specific_fields"))
+    return (
+        input_item.get("type") == "web_search_call"
+        and fields is not None
+        and isinstance(fields.get("search_result"), str)
+    )
+
+
 def _without_encrypted_content(input_item: Mapping[str, object]) -> Mapping[str, object]:
     return {key: value for key, value in input_item.items() if key != "encrypted_content"}
 
@@ -848,7 +863,9 @@ def _validated_cache_control(value: object) -> ChatCompletionCachedContent | Non
 def _without_keys(item: object, keys: frozenset[str]) -> object:
     if not isinstance(item, dict):
         return item
-    return {key: value for key, value in _STR_KEY_DICT_ADAPTER.validate_python(item).items() if key not in keys}
+    fields: Final = _STR_KEY_DICT_ADAPTER.validate_python(item)
+    dropped: Final = keys.difference(("provider_specific_fields",)) if _is_proxy_search(fields) else keys
+    return {key: value for key, value in fields.items() if key not in dropped}
 
 
 def _without_item_keys(input: str | ResponseInputParam, keys: frozenset[str]) -> str | ResponseInputParam:
@@ -1528,6 +1545,7 @@ class LiteLLMCompletionResponsesConfig:
         native_compaction: Final = _replays_compaction_block(
             bridge_input, context_management
         ) and provider_takes_compaction_blocks(model, custom_llm_provider)
+        native_search_context: Final = provider_builds_anthropic_request(model, custom_llm_provider)
         caller_items: Final = dumped_input if caller_input is None else caller_input
         normalized_items: Final = (
             {id(source): target for source, target in zip(parts_of(dumped_input), parts_of(bridge_input), strict=True)}
@@ -1552,6 +1570,7 @@ class LiteLLMCompletionResponsesConfig:
             replay_tool_search=holds_tool_search_items(bridge_input)
             and request_runs_tool_search(request_tools or (), model, custom_llm_provider),
             caller_input=numbered_input,
+            native_search_context=native_search_context,
         )
         malformed_field_error: Final = (
             _first_invalid_input_type(
@@ -1562,13 +1581,14 @@ class LiteLLMCompletionResponsesConfig:
                         LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message,
                         replay_reasoning=True,
                         native_compaction=native_compaction,
+                        native_search_context=native_search_context,
                     ),
                 )
             )
             if names_non_string_fields
             and isinstance(numbered_input, list)
             and any(map(_carries_non_string_field, bridged_messages))
-            and provider_builds_anthropic_request(model, custom_llm_provider)
+            and native_search_context
             else None
         )
         if malformed_field_error is not None:
@@ -1644,6 +1664,7 @@ class LiteLLMCompletionResponsesConfig:
         only_since_compaction: bool = False,
         replay_tool_search: bool = False,
         caller_input: str | ResponseInputParam | None = None,
+        native_search_context: bool = False,
     ) -> list[
         AllMessageValues
         | GenericChatCompletionMessage
@@ -1712,6 +1733,7 @@ class LiteLLMCompletionResponsesConfig:
             self_named_namespace_members=LiteLLMCompletionResponsesConfig.self_named_namespace_members(
                 LiteLLMCompletionResponsesConfig.request_tools(responses_api_request)
             ),
+            native_search_context=native_search_context,
         )
         try:
             converted: Final = (
@@ -1782,12 +1804,14 @@ class LiteLLMCompletionResponsesConfig:
             drops_unsupported_params(request_kwargs.get("drop_params")),
             routed_model_info(request_kwargs.get("model_info")),
         )
+        native_search_context: Final = bool(model) and provider_builds_anthropic_request(model, provider)
         lookup: Final = session_lookup or partial(
             ResponsesSessionHandler.get_chat_completion_message_history_for_previous_response_id,
             item_cache_control=keeps_item_marks,
             client_response_ids=previous_response_client_ids,
             tool_call_provider_fields=not embeds_thought_signature_in_tool_call_id(request_kwargs),
             stored_turns=stored_turns,
+            native_search_context=native_search_context,
         )
         chat_completion_session: Final = (
             await lookup(previous_response_id)
@@ -1839,7 +1863,11 @@ class LiteLLMCompletionResponsesConfig:
             if input_replaces_history
             else _messages[instructions_end:]
         )
-        combined_messages = [*leading_system_messages, *session_messages, *new_messages]
+        combined_messages = list(
+            LiteLLMCompletionResponsesConfig._normalize_legacy_search_messages(
+                [*leading_system_messages, *session_messages, *new_messages], native_search_context
+            )
+        )
 
         # Fix: Ensure tool_results have corresponding tool_calls in previous assistant message
         # Pass tools parameter to help reconstruct tool_calls if not in cache
@@ -1884,10 +1912,11 @@ class LiteLLMCompletionResponsesConfig:
 
     @staticmethod
     def _transform_response_input_param_to_chat_completion_message(
-        input: str | ResponseInputParam,
+        input: str | Sequence[Mapping[str, object]],
         replay_reasoning: bool = False,
         native_compaction: bool = False,
         self_named_namespace_members: frozenset[str] = frozenset(),
+        native_search_context: bool = False,
     ) -> list[
         AllMessageValues | GenericChatCompletionMessage | ChatCompletionMessageToolCall | ChatCompletionResponseMessage
     ]:
@@ -1906,15 +1935,18 @@ class LiteLLMCompletionResponsesConfig:
 
         if isinstance(input, str):
             messages.append(ChatCompletionUserMessage(role="user", content=input))
-        elif isinstance(input, list):
+        elif isinstance(input, Sequence):
             existing_tool_call_ids: Final[set[str]] = set()
-            for _input in _without_paused_turn_thinking(input):
+            for _input in LiteLLMCompletionResponsesConfig._search_replay_input_items(
+                _without_paused_turn_thinking(input), native_search_context
+            ):
                 chat_completion_messages = (
                     LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
                         input_item=_input,
                         replay_reasoning=replay_reasoning,
                         native_compaction=native_compaction,
                         self_named_namespace_members=self_named_namespace_members,
+                        native_search_context=native_search_context,
                     )
                 )
 
@@ -2014,6 +2046,226 @@ class LiteLLMCompletionResponsesConfig:
         if not replay_reasoning:
             return messages
         return LiteLLMCompletionResponsesConfig._merge_reasoning_only_assistant_messages(messages)
+
+    @staticmethod
+    def _legacy_search_fragment(match: re.Match[str]) -> ResponseFunctionWebSearch | None:
+        payload: Final = match.group("search")
+        if payload is None:
+            return None
+        try:
+            search: Final = ResponseFunctionWebSearch.model_validate_json(payload, strict=True)
+        except ValidationError:
+            return None
+        return search if search.id else None
+
+    @staticmethod
+    def _legacy_search_content(content: object) -> tuple[object, tuple[Mapping[str, object], ...]]:
+        if isinstance(content, str):
+            fragments: Final = tuple(
+                (match, search)
+                for match in _LEGACY_SEARCH_FRAGMENT.finditer(content)
+                if (search := LiteLLMCompletionResponsesConfig._legacy_search_fragment(match)) is not None
+            )
+            cleaned: Final = "".join(
+                content[start:end]
+                for start, end in zip(
+                    (0, *(match.end() for match, _ in fragments)),
+                    (*(match.start() for match, _ in fragments), len(content)),
+                )
+            )
+            return cleaned, tuple(search.model_dump(exclude_none=True) for _, search in fragments)
+        if not isinstance(content, list):
+            return content, ()
+        blocks: Final = tuple(
+            LiteLLMCompletionResponsesConfig._legacy_search_block(block)
+            for block in _OBJECT_LIST_ADAPTER.validate_python(content)
+        )
+        return (
+            _OBJECT_LIST_ADAPTER.validate_python(tuple(block for block, _ in blocks if block is not None)),
+            tuple(chain.from_iterable(items for _, items in blocks)),
+        )
+
+    @staticmethod
+    def _legacy_search_block(block: object) -> tuple[object, tuple[Mapping[str, object], ...]]:
+        if not isinstance(block, Mapping):
+            return block, ()
+        fields: Final = _STR_KEY_DICT_ADAPTER.validate_python(block)
+        if fields.get("type") not in ("text", "output_text"):
+            return fields, ()
+        text: Final = fields.get("text")
+        cleaned, searches = LiteLLMCompletionResponsesConfig._legacy_search_content(text)
+        return (
+            _STR_KEY_DICT_ADAPTER.validate_python(MappingProxyType({**fields, "text": cleaned}))
+            if cleaned or not searches
+            else None
+        ), searches
+
+    @staticmethod
+    def _legacy_search_input_items(input_item: Mapping[str, object]) -> Iterator[Mapping[str, object]]:
+        if input_item.get("role") != "assistant":
+            yield input_item
+            return
+        cleaned, searches = LiteLLMCompletionResponsesConfig._legacy_search_content(input_item.get("content"))
+        if not searches:
+            yield input_item
+            return
+        if cleaned or input_item.get("tool_calls"):
+            yield MappingProxyType({**input_item, "content": cleaned or None})
+        for search in searches:
+            yield from LiteLLMCompletionResponsesConfig._hosted_search_input_items(search)
+
+    @staticmethod
+    def _is_assistant_replay_item(input_item: Mapping[str, object]) -> bool:
+        return input_item.get("role") == "assistant" or input_item.get("type") in (
+            "web_search_call",
+            "function_call",
+            "custom_tool_call",
+            "reasoning",
+        )
+
+    @staticmethod
+    def _hosted_search_input_items(
+        input_item: Mapping[str, object], native_search_context: bool = False
+    ) -> tuple[Mapping[str, object], ...]:
+        if input_item.get("type") != "web_search_call" or (native_search_context and not _is_proxy_search(input_item)):
+            return (input_item,)
+        if "action" not in input_item:
+            return (input_item,)
+        from litellm.integrations.websearch_interception.transformation import WebSearchTransformation
+
+        assistant, results = WebSearchTransformation.hosted_search_to_chat_history(input_item)
+        call: Final = _STR_KEY_DICT_ADAPTER.validate_python(next(iter(assistant.get("tool_calls") or ())))
+        function: Final = _STR_KEY_DICT_ADAPTER.validate_python(call["function"])
+        return (
+            MappingProxyType({"type": "function_call", "call_id": call["id"], **function}),
+            MappingProxyType(
+                {"type": "function_call_output", "call_id": results[0]["tool_call_id"], "output": results[0]["content"]}
+            ),
+        )
+
+    @staticmethod
+    def _web_search_input_to_messages(
+        input_item: Mapping[str, object], native_search_context: bool
+    ) -> list[AllMessageValues | GenericChatCompletionMessage | ChatCompletionResponseMessage]:
+        from litellm.integrations.websearch_interception.transformation import WebSearchTransformation
+
+        try:
+            assistant, results = WebSearchTransformation.hosted_search_to_chat_history(input_item)
+        except ValidationError as exc:
+            errors: Final = exc.errors(include_url=False, include_input=False)
+            if len(errors) != 1 or errors[0]["type"] != "missing" or errors[0]["loc"] != ("action",):
+                raise
+            replay: Final = ResponseFunctionWebSearch.model_construct(None, **input_item)
+            return [
+                GenericChatCompletionMessage(
+                    role="assistant",
+                    content="Hosted web search: " + replay.model_dump_json(exclude_none=True),
+                )
+            ]
+        if native_search_context and not _is_proxy_search(input_item):
+            search: Final = ResponseFunctionWebSearch.model_validate(input_item, strict=True)
+            hosted_search_text: Final = "Hosted web search: " + search.model_dump_json(exclude_none=True)
+            pending_server_tool_call: Final = _pending_claude_server_tool_call(search)
+            if pending_server_tool_call is None:
+                return [GenericChatCompletionMessage(role="assistant", content=hosted_search_text)]
+            return [
+                ChatCompletionResponseMessage(
+                    role="assistant",
+                    content=hosted_search_text,
+                    provider_specific_fields={"server_tool_calls": [pending_server_tool_call]},
+                )
+            ]
+        return [assistant, *results]
+
+    @staticmethod
+    def _search_replay_group(
+        group: Iterable[Mapping[str, object]], is_assistant: bool, native_search_context: bool
+    ) -> Iterator[Mapping[str, object]]:
+        if not is_assistant:
+            yield from group
+            return
+        expanded: Final = chain.from_iterable(
+            LiteLLMCompletionResponsesConfig._legacy_search_input_items(input_item) for input_item in group
+        )
+        items: Final = tuple(
+            chain.from_iterable(
+                LiteLLMCompletionResponsesConfig._hosted_search_input_items(input_item, native_search_context)
+                for input_item in expanded
+            )
+        )
+        yield from (item for item in items if item.get("type") != "function_call_output")
+        yield from (item for item in items if item.get("type") == "function_call_output")
+
+    @staticmethod
+    def _search_replay_input_items(
+        input_items: Sequence[Mapping[str, object]], native_search_context: bool = False
+    ) -> Iterator[Mapping[str, object]]:
+        for is_assistant, group in groupby(input_items, key=LiteLLMCompletionResponsesConfig._is_assistant_replay_item):
+            yield from LiteLLMCompletionResponsesConfig._search_replay_group(group, is_assistant, native_search_context)
+
+    @staticmethod
+    def _normalize_legacy_search_messages(
+        messages: Sequence[
+            AllMessageValues
+            | GenericChatCompletionMessage
+            | ChatCompletionMessageToolCall
+            | ChatCompletionResponseMessage
+            | Message
+        ],
+        native_search_context: bool = False,
+    ) -> Iterator[
+        AllMessageValues
+        | GenericChatCompletionMessage
+        | ChatCompletionMessageToolCall
+        | ChatCompletionResponseMessage
+        | Message
+    ]:
+        for message in messages:
+            yield from (
+                (message,)
+                if native_search_context
+                else LiteLLMCompletionResponsesConfig.normalize_legacy_search_message(message)
+            )
+
+    @staticmethod
+    def normalize_legacy_search_message(
+        message: AllMessageValues
+        | GenericChatCompletionMessage
+        | ChatCompletionMessageToolCall
+        | ChatCompletionResponseMessage
+        | Message,
+    ) -> Iterator[
+        AllMessageValues
+        | GenericChatCompletionMessage
+        | ChatCompletionMessageToolCall
+        | ChatCompletionResponseMessage
+        | Message
+    ]:
+        fields: Final = _STR_KEY_DICT_ADAPTER.validate_python(
+            message.model_dump(exclude_none=True) if isinstance(message, Message) else message
+        )
+        if (
+            fields.get("role") != "assistant"
+            or not LiteLLMCompletionResponsesConfig._legacy_search_content(fields.get("content"))[1]
+        ):
+            yield message
+            return
+        assistant, *results = (
+            LiteLLMCompletionResponsesConfig._transform_response_input_param_to_chat_completion_message(
+                input=(fields,), replay_reasoning=True
+            )
+        )
+        defaults: Final = _STR_KEY_DICT_ADAPTER.validate_python(Message(role="assistant", content=None).model_dump())
+        yield Message.model_validate(
+            MappingProxyType(
+                {
+                    **defaults,
+                    **fields,
+                    **_STR_KEY_DICT_ADAPTER.validate_python(assistant),
+                }
+            )
+        )
+        yield from results
 
     @staticmethod
     def _reasoning_only_assistant_message(
@@ -2171,8 +2423,7 @@ class LiteLLMCompletionResponsesConfig:
         ],
         hosted_search: bool = False,
     ) -> ChatCompletionAssistantMessage | None:
-        """Keep replayed search context on the assistant turn so client tool results
-        still immediately follow the assistant that requested them."""
+        """Keep assistant text with its tool calls before the corresponding results."""
         if not messages or len(chat_completion_messages) != 1:
             return None
         if not isinstance(messages[-1], dict):
@@ -2628,6 +2879,7 @@ class LiteLLMCompletionResponsesConfig:
         replay_reasoning: bool = False,
         native_compaction: bool = False,
         self_named_namespace_members: frozenset[str] = frozenset(),
+        native_search_context: bool = False,
     ) -> list[AllMessageValues | GenericChatCompletionMessage | ChatCompletionResponseMessage]:
         """
         Transform a Responses API input item into a Chat Completion message
@@ -2645,30 +2897,7 @@ class LiteLLMCompletionResponsesConfig:
         - ItemReference
         """
         if input_item.get("type") == "web_search_call":
-            try:
-                search: Final = ResponseFunctionWebSearch.model_validate(input_item)
-            except ValidationError as exc:
-                errors: Final = exc.errors(include_url=False, include_input=False)
-                if len(errors) != 1 or errors[0]["type"] != "missing" or errors[0]["loc"] != ("action",):
-                    raise
-                replay: Final = ResponseFunctionWebSearch.model_construct(None, **input_item)
-                return [
-                    GenericChatCompletionMessage(
-                        role="assistant",
-                        content="Hosted web search: " + replay.model_dump_json(exclude_none=True),
-                    )
-                ]
-            hosted_search_text: Final = "Hosted web search: " + search.model_dump_json(exclude_none=True)
-            pending_server_tool_call: Final = _pending_claude_server_tool_call(search)
-            if pending_server_tool_call is None:
-                return [GenericChatCompletionMessage(role="assistant", content=hosted_search_text)]
-            return [
-                ChatCompletionResponseMessage(
-                    role="assistant",
-                    content=hosted_search_text,
-                    provider_specific_fields={"server_tool_calls": [pending_server_tool_call]},
-                )
-            ]
+            return LiteLLMCompletionResponsesConfig._web_search_input_to_messages(input_item, native_search_context)
         if LiteLLMCompletionResponsesConfig._is_input_item_tool_call_output(input_item):
             # handle executed tool call results
             return (
@@ -2735,6 +2964,21 @@ class LiteLLMCompletionResponsesConfig:
             ]
         else:
             content: Final[object] = input_item.get("content")
+            if input_item.get("role") == "tool" and input_item.get("tool_call_id"):
+                return [_TOOL_MESSAGE_ADAPTER.validate_python(input_item)]
+            if input_item.get("role") == "assistant" and input_item.get("tool_calls"):
+                return [
+                    _ASSISTANT_MESSAGE_ADAPTER.validate_python(
+                        {
+                            **input_item,
+                            "content": LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+                                content
+                            )
+                            if content is not None
+                            else None,
+                        }
+                    )
+                ]
             # Handle None content: Responses API allows None content, but GenericChatCompletionMessage requires content
             # Since guardrails skip None content anyway, we return empty list to exclude it from structured messages
             if content is None:

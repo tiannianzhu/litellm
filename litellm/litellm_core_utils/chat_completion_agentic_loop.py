@@ -118,7 +118,7 @@ def _coerce_int(value: object, default: int) -> int:
     return int(value) if isinstance(value, (int, str)) else default
 
 
-def _agentic_loop_settings(kwargs: Mapping[str, object]) -> tuple[int, int, tuple[str, ...]]:
+def agentic_loop_settings(kwargs: Mapping[str, object]) -> tuple[int, int, tuple[str, ...]]:
     depth: Final = _coerce_int(kwargs.get("_agentic_loop_depth"), 0)
     configured: Final = validated_max_agentic_loops(
         kwargs.get("max_agentic_loops"), field="litellm_params.max_agentic_loops"
@@ -136,7 +136,7 @@ def _fingerprint_tools(tool_calls: object) -> str:
         return str(tool_calls)
 
 
-def _check_agentic_loop_safety(
+def check_agentic_loop_safety(
     tool_calls: object,
     fingerprints: Sequence[str],
     depth: int,
@@ -305,7 +305,7 @@ def _fingerprint_of_a_turn_to_run(
     if holds_a_call_the_choice_excludes(_called_tool_names(response), request_kwargs, callbacks):
         return None
     try:
-        return _check_agentic_loop_safety(
+        return check_agentic_loop_safety(
             tool_calls=tool_calls,
             fingerprints=fingerprints,
             depth=depth,
@@ -319,7 +319,7 @@ def _fingerprint_of_a_turn_to_run(
         return None
 
 
-def _with_agentic_loop_metadata(kwargs_for_followup: Mapping[str, object]) -> Mapping[str, object]:
+def with_agentic_loop_metadata(kwargs_for_followup: Mapping[str, object]) -> Mapping[str, object]:
     metadata: Final = kwargs_for_followup.get("litellm_metadata")
     return MappingProxyType(
         {
@@ -340,7 +340,7 @@ def _with_agentic_loop_metadata(kwargs_for_followup: Mapping[str, object]) -> Ma
     )
 
 
-def _filter_followup_kwargs(source: dict[str, object]) -> dict[str, object]:
+def filter_followup_kwargs(source: Mapping[str, object]) -> Mapping[str, object]:
     return {
         k: v
         for k, v in source.items()
@@ -383,10 +383,10 @@ async def _execute_chat_completion_agentic_plan(
     if "tool_choice" not in patch.optional_params:
         optional_params_for_followup.pop("tool_choice", None)
 
-    kwargs_for_followup: Final = _with_agentic_loop_metadata(
+    kwargs_for_followup: Final = with_agentic_loop_metadata(
         build_agentic_followup_kwargs(
-            request_kwargs=_filter_followup_kwargs(kwargs),
-            patch_kwargs=_filter_followup_kwargs(patch.kwargs),
+            request_kwargs=filter_followup_kwargs(kwargs),
+            patch_kwargs=filter_followup_kwargs(patch.kwargs),
             request_params=frozenset((*optional_params_for_followup, "model", "messages")),
             depth=depth,
             max_loops=max_loops,
@@ -456,7 +456,7 @@ async def maybe_run_chat_completion_agentic_loop(
 ) -> ModelResponse | CustomStreamWrapper | None:
     callbacks: Final = _custom_loggers(logging_obj)
     request_kwargs: Final = with_caller_tool_choice(kwargs, optional_params)
-    depth, max_loops, fingerprints = _agentic_loop_settings(request_kwargs)
+    depth, max_loops, fingerprints = agentic_loop_settings(request_kwargs)
     tools: Final = _request_tools(optional_params)
 
     completed_at: Final = time.time()
@@ -577,7 +577,7 @@ async def maybe_run_chat_completion_agentic_loop(
         model=model,
         custom_llm_provider=custom_llm_provider,
         logging_obj=logging_obj,
-        record_completed_round=kwargs.get("_websearch_interception_converted_stream") is True,
+        record_completed_round=request_kwargs.get("_websearch_interception_converted_stream") is True,
     )
 
 
@@ -594,7 +594,7 @@ async def run_chat_completion_agentic_hooks(
 ) -> object | None:
     completed_at: Final = time.time()
     callbacks: Final = _custom_loggers(logging_obj)
-    depth, max_loops, fingerprints = _agentic_loop_settings(kwargs)
+    depth, max_loops, fingerprints = agentic_loop_settings(kwargs)
     tools: Final = _request_tools(optional_params)
     hook_kwargs: Final = {**kwargs, "custom_llm_provider": custom_llm_provider}
 

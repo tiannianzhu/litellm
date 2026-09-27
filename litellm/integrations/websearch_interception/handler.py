@@ -500,7 +500,13 @@ class WebSearchInterceptionLogger(CustomLogger):
             return None
 
         if call_type in (CallTypes.responses, CallTypes.aresponses):
-            return self._convert_responses_tools(kwargs=kwargs, tools=tools)
+            return self._convert_responses_tools(
+                kwargs=kwargs,
+                tools=tools,
+                streaming_bridge=custom_llm_provider == "hosted_vllm"
+                and call_type == CallTypes.aresponses
+                and kwargs.get("use_chat_completions_api") is True,
+            )
 
         is_search_tool: Final = (
             is_chat_completion_request_web_search_tool if call_type == CallTypes.acompletion else is_web_search_tool
@@ -543,14 +549,14 @@ class WebSearchInterceptionLogger(CustomLogger):
             **_tool_choice_naming_litellm_web_search(kwargs, lambda tool: is_search_tool(dict(tool))),
         }
 
-        if kwargs.get("stream"):
+        if kwargs.get("stream") and (custom_llm_provider != "hosted_vllm" or call_type == CallTypes.completion):
             verbose_logger.debug("WebSearchInterception: deployment hook converting stream=True to stream=False")
             return as_converted_stream(converted_kwargs, WEBSEARCH_INTERCEPTION_PREFIX)
 
         return converted_kwargs
 
     def _convert_responses_tools(
-        self, kwargs: Mapping[str, object], tools: Sequence[dict[str, object]]
+        self, kwargs: Mapping[str, object], tools: Sequence[dict[str, object]], streaming_bridge: bool = False
     ) -> dict[str, object] | None:
         """Convert Responses API web search tools to the LiteLLM standard function tool."""
         if not any(is_web_search_tool_responses(tool) for tool in tools):
@@ -568,7 +574,7 @@ class WebSearchInterceptionLogger(CustomLogger):
             **_tool_choice_naming_litellm_web_search(kwargs, is_web_search_tool_responses),
         }
 
-        if kwargs.get("stream"):
+        if kwargs.get("stream") and not streaming_bridge:
             verbose_logger.debug("WebSearchInterception: deployment hook converting stream=True to stream=False")
             return as_converted_stream(converted_kwargs, WEBSEARCH_INTERCEPTION_PREFIX)
 
@@ -725,7 +731,7 @@ class WebSearchInterceptionLogger(CustomLogger):
             kwargs["tool_choice"] = self._sync_forced_tool_choice(kwargs.get("tool_choice"), converted_tools)
 
         # Also convert here for direct callers that bypass the deployment hook.
-        if kwargs.get("stream"):
+        if kwargs.get("stream") and custom_llm_provider != "hosted_vllm":
             verbose_logger.debug("WebSearchInterception: Converting stream=True to stream=False")
             kwargs["stream"] = False
             kwargs[WEBSEARCH_CONVERTED_STREAM_KEY] = True
@@ -1104,7 +1110,7 @@ class WebSearchInterceptionLogger(CustomLogger):
         return tuple(
             block
             for tool_call, outcome in zip(tool_calls, search_outcomes, strict=True)
-            for block in WebSearchInterceptionLogger._native_result_pair(
+            for block in WebSearchInterceptionLogger.native_result_pair(
                 query=WebSearchInterceptionLogger._tool_call_query(tool_call),
                 outcome=outcome,
             )
@@ -1119,7 +1125,7 @@ class WebSearchInterceptionLogger(CustomLogger):
         return query if isinstance(query, str) else ""
 
     @staticmethod
-    def _native_result_pair(
+    def native_result_pair(
         query: str,
         outcome: SearchOutcome,
     ) -> tuple[Mapping[str, object], Mapping[str, object]]:

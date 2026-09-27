@@ -1446,11 +1446,16 @@ def _stream_builder_response_cost(
         return next((cost for cost in reported if cost is not None), None)
     if logging_obj is not None:
         return None
-    provider_hint: Final = response._hidden_params.get(  # pyright: ignore[reportPrivateUsage]  # no public accessor
-        "custom_llm_provider"
-    )
+    hidden: Final = get_hidden_params(response) or {}
+    stamped_bill: Final = finite_cost(hidden.get("response_cost")) if UPSTREAM_USAGE_COST in hidden else None
+    if stamped_bill is not None:
+        return stamped_bill
+    provider_hint: Final = hidden.get("custom_llm_provider")
     try:
-        return litellm.completion_cost(completion_response=response, custom_llm_provider=provider_hint)
+        return litellm.completion_cost(
+            completion_response=response,
+            custom_llm_provider=provider_hint if isinstance(provider_hint, str) else None,
+        )
     except Exception:
         return _stream_builder_model_map_cost(response)
 
@@ -1490,9 +1495,13 @@ def _set_stream_builder_response_cost(
 def _carry_upstream_usage_cost(response: ModelResponse, chunks: Sequence[object]) -> None:
     chunk_hidden_params: Final = (get_hidden_params(chunk) for chunk in reversed(chunks))
     stamped: Final = (hidden for hidden in chunk_hidden_params if hidden is not None and UPSTREAM_USAGE_COST in hidden)
-    for hidden in stamped:
-        set_hidden_param(response, UPSTREAM_USAGE_COST, hidden[UPSTREAM_USAGE_COST])
+    hidden: Final = next(stamped, None)
+    if hidden is None:
         return
+    set_hidden_param(response, UPSTREAM_USAGE_COST, hidden[UPSTREAM_USAGE_COST])
+    bill: Final = finite_cost(hidden.get("response_cost"))
+    if bill is not None:
+        set_hidden_param(response, "response_cost", bill)
 
 
 def _stamp_streaming_usage_cost(usage: Usage, response: ModelResponse, logging_obj: Optional["Logging"]) -> None:
