@@ -99,6 +99,7 @@ from litellm.types.utils import (
 )
 
 _REQUEST_FIELDS: Final = TypeAdapter(Mapping[str, object])
+_PROVIDER_FIELDS: Final = TypeAdapter(dict[str, object])
 
 
 def _index_of_output_item_type(items: Sequence[object], item_type: str) -> int | None:
@@ -303,6 +304,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         self.litellm_custom_stream_wrapper.close()
 
     async def aclose(self) -> None:
+        self.finished = True
         await self.litellm_custom_stream_wrapper.aclose()
 
     def _tool_search_execution(self, call_id: str, fn_name: str) -> ToolSearchExecution | None:
@@ -539,6 +541,46 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             return False
         return not any(
             _stream_chunk_has_finish_reason(chunk_payload) for chunk_payload in self.collected_chat_completion_chunks
+        )
+
+    @staticmethod
+    def _with_hosted_search_calls(chunk: ModelResponseStream) -> ModelResponseStream:
+        if not chunk.choices:
+            return chunk
+        delta: Final = chunk.choices[0].delta
+        fields: Final = delta.provider_specific_fields
+        offset: Final = fields.get("websearch_tool_offset") if isinstance(fields, dict) else None
+        if isinstance(offset, int) and offset and delta.tool_calls:
+            shifted_delta: Final = delta.model_copy(
+                update=MappingProxyType(
+                    {
+                        "tool_calls": [
+                            call.model_copy(update=MappingProxyType({"index": (call.index or 0) + offset}))
+                            for call in delta.tool_calls
+                        ]
+                    }
+                )
+            )
+            return chunk.model_copy(
+                update=MappingProxyType(
+                    {"choices": [chunk.choices[0].model_copy(update=MappingProxyType({"delta": shifted_delta}))]}
+                )
+            )
+        if not isinstance(fields, dict) or not fields.get("websearch_tool_calls"):
+            return chunk
+        return ModelResponseStream.model_validate(
+            {
+                **chunk.model_dump(),
+                "choices": [
+                    {
+                        **chunk.choices[0].model_dump(),
+                        "delta": {
+                            **delta.model_dump(),
+                            "tool_calls": fields["websearch_tool_calls"],
+                        },
+                    }
+                ],
+            }
         )
 
     def _reserve_web_search_indexes(self, provider_fields: object) -> None:
@@ -905,7 +947,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
     def _received_and_client_chunks(
         self, chunk: ModelResponseStream
     ) -> tuple[ModelResponseStream, ModelResponseStream]:
-        received: Final = self._ordered_chunk(chunk)
+        received: Final = self._with_hosted_search_calls(self._ordered_chunk(chunk))
         return received, received if self._compaction_summary is None else self._compaction_summary.take(received)
 
     def _with_encoded_response_id(self, response: ResponsesAPIResponse) -> ResponsesAPIResponse:
@@ -1619,7 +1661,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         ):
                             if src and isinstance(src, dict):
                                 self._merge_provider_specific_fields(src)
-                                self._reserve_web_search_indexes(src)
+                                self._reserve_web_search_indexes(_PROVIDER_FIELDS.validate_python(src))
                                 self._queue_arrived_tool_search_outputs()
                         self._queue_web_search_calls_opening_the_output(chunk)
                         self._ensure_output_item_for_chunk(chunk)
@@ -1683,7 +1725,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     ):
                         if src and isinstance(src, dict):
                             self._merge_provider_specific_fields(src)
-                            self._reserve_web_search_indexes(src)
+                            self._reserve_web_search_indexes(_PROVIDER_FIELDS.validate_python(src))
                             self._queue_arrived_tool_search_outputs()
                     self._queue_web_search_calls_opening_the_output(chunk)
                     self._ensure_output_item_for_chunk(chunk)

@@ -706,6 +706,7 @@ class ResponsesSessionHandler:
         keep_tool_references: bool = False,
         *,
         member_name: Callable[[str, str], str] = chat_member_name,
+        native_search_context: bool = False,
     ) -> ChatCompletionSession:
         """
         Return the chat completion message history for a previous response id
@@ -752,6 +753,7 @@ class ResponsesSessionHandler:
             empty_user_turn_text,
             keep_tool_references,
             member_name=member_name,
+            native_search_context=native_search_context,
         )
         history_before_replay: Final = ResponsesSessionHandler._history_of_turns(
             all_spend_logs[: start.index],
@@ -762,6 +764,7 @@ class ResponsesSessionHandler:
             empty_user_turn_text,
             keep_tool_references,
             member_name=member_name,
+            native_search_context=native_search_context,
         )
         chat_completion_message_history: Final = (
             list(with_stored_calls_the_input_answers(replayed_history, history_before_replay))
@@ -884,6 +887,7 @@ class ResponsesSessionHandler:
         keep_tool_references: bool = False,
         *,
         member_name: Callable[[str, str], str],
+        native_search_context: bool,
     ) -> list["SessionMessage"]:
         return reduce(
             lambda history, turn: ResponsesSessionHandler.extend_chat_completion_message_with_spend_log_payload(
@@ -896,6 +900,7 @@ class ResponsesSessionHandler:
                 tool_names=turn[2],
                 keep_tool_references=keep_tool_references,
                 member_name=member_name,
+                native_search_context=native_search_context,
             ),
             zip(spend_logs, proxy_server_requests, sent_tool_names, strict=True),
             [],
@@ -919,6 +924,7 @@ class ResponsesSessionHandler:
         *,
         tool_names: SentToolNames = _NO_TOOL_NAMES,
         member_name: Callable[[str, str], str] = chat_member_name,
+        native_search_context: bool = False,
     ):
         """
         Extend the chat completion message history with the spend log payload
@@ -955,7 +961,8 @@ class ResponsesSessionHandler:
             declared_tool_names,
             item_cache_control,
             tool_call_provider_fields,
-            member_name,
+            member_name=member_name,
+            native_search_context=native_search_context,
         )
         if response_input_param is not None:
             stored_input: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_input_to_messages(
@@ -969,6 +976,7 @@ class ResponsesSessionHandler:
                 tool_names=tool_names,
                 keep_tool_references=keep_tool_references,
                 member_name=member_name,
+                native_search_context=native_search_context,
             )
             input_before_blank_tail: Final = without_blank_user_tail(stored_input)
             inference_continues_the_blank_tail: Final = empty_user_turn_text == "" and len(
@@ -998,7 +1006,9 @@ class ResponsesSessionHandler:
         declared_tool_names: frozenset[str],
         item_cache_control: bool,
         tool_call_provider_fields: bool,
+        *,
         member_name: Callable[[str, str], str],
+        native_search_context: bool,
     ) -> Sequence[
         AllMessageValues
         | GenericChatCompletionMessage
@@ -1021,6 +1031,7 @@ class ResponsesSessionHandler:
                 replay_tool_search=True,
                 tool_names=tool_names,
                 member_name=member_name,
+                native_search_context=native_search_context,
             )
         if not isinstance(stored_response, dict) or not stored_response:
             return ()
@@ -1033,7 +1044,14 @@ class ResponsesSessionHandler:
         )
         for message in chat_completion_messages:
             _normalize_redacted_tool_call_arguments(message)
-        return chat_completion_messages
+        if not native_search_context:
+            return chat_completion_messages
+        return tuple(
+            chain.from_iterable(
+                LiteLLMCompletionResponsesConfig.normalize_legacy_search_message(message)
+                for message in chat_completion_messages
+            )
+        )
 
     @staticmethod
     async def get_proxy_server_request_from_spend_log(

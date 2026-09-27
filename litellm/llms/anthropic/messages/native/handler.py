@@ -509,6 +509,9 @@ async def _try_websearch_short_circuit(
     Returns the synthetic response if short-circuited, or None to continue
     normal processing.
     """
+    if stream and custom_llm_provider == "hosted_vllm":
+        return None
+
     if not litellm.callbacks:
         return None
 
@@ -808,6 +811,7 @@ def anthropic_messages_handler(
     # Store original model name before get_llm_provider strips the provider prefix
     # This is needed by agentic hooks (e.g., websearch_interception) to make follow-up requests
     original_model: Final = model
+    request_options: Final = cast(dict[str, object], kwargs)  # cast-ok: keyword arguments have string keys
 
     litellm_params: Final = GenericLiteLLMParams(
         **kwargs,
@@ -825,18 +829,17 @@ def anthropic_messages_handler(
     # Store agentic loop params in logging object for agentic hooks
     # This provides original request context needed for follow-up calls
     if litellm_logging_obj is not None:
-        litellm_logging_obj.model_call_details["agentic_loop_params"] = {
-            "model": original_model,
-            "custom_llm_provider": custom_llm_provider,
-        }
+        litellm_logging_obj.model_call_details.update(
+            agentic_loop_params={"model": original_model, "custom_llm_provider": custom_llm_provider},
+            **(
+                {"websearch_interception_converted_stream": True}
+                if request_options.get("_websearch_interception_converted_stream", False)
+                else {}
+            ),
+        )
         litellm_logging_obj.model_call_details.setdefault("litellm_params", {})[CallTypes.aanthropic_messages.value] = (
             is_async
         )
-
-        # Check if stream was converted for WebSearch interception
-        # This is set in the async wrapper above when stream=True is converted to stream=False
-        if kwargs.get("_websearch_interception_converted_stream", False):
-            litellm_logging_obj.model_call_details["websearch_interception_converted_stream"] = True
 
     if litellm_params.mock_response and isinstance(litellm_params.mock_response, str):
         return mock_response(
@@ -859,7 +862,7 @@ def anthropic_messages_handler(
     # Expand litellm_proxy MCP references through the MCP gateway before dispatch, so every
     # downstream path (native passthrough and both bridges) gets real tools rather than a
     # reference the provider cannot resolve. Popped from kwargs so it never reaches the provider.
-    skip_mcp_handler: Final = kwargs.pop("_skip_mcp_handler", False)
+    skip_mcp_handler: Final = request_options.pop("_skip_mcp_handler", False)
     if not skip_mcp_handler and tools and may_name_litellm_mcp_gateway(tools):  # pyright: ignore[reportUnknownArgumentType]  # untyped tools list
         from litellm.llms.anthropic.messages.native.mcp_handler import (
             anthropic_messages_with_mcp,
@@ -892,7 +895,7 @@ def anthropic_messages_handler(
     anthropic_messages_provider_config: Final = (
         None
         if not is_async and custom_llm_provider == LlmProviders.HOSTED_VLLM.value
-        else _native_messages_config(model, custom_llm_provider, kwargs.get("model_info"), api_base)
+        else _native_messages_config(model, custom_llm_provider, request_options.get("model_info"), api_base)
     )
     thread: Final[object] = kwargs.get("thread")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]  # **kwargs of the handler is untyped
     if thread is not None and (

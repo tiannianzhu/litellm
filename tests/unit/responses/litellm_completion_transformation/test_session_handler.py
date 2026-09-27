@@ -2815,3 +2815,72 @@ async def test_a_stored_turn_with_no_answer_replays_no_empty_user_turn() -> None
         ("user", "And 3+3?"),
         ("assistant", "Six."),
     ]
+
+
+@pytest.mark.asyncio
+async def test_previous_response_keeps_native_search_context_and_proxy_search_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_id: Final = "chatcmpl-search-history"
+    native_search: Final = {
+        "id": "ws_native_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "native query"},
+    }
+    proxy_search: Final = {
+        "id": "ws_proxy_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "proxy query"},
+        "provider_specific_fields": {"search_result": "Saved proxy evidence"},
+    }
+    legacy_search: Final = {
+        "id": "ws_legacy_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "provider_specific_fields": {"search_result": "Saved legacy evidence"},
+    }
+    stored: Final = _StoredSpendLogs(
+        (
+            {
+                "request_id": response_id,
+                "session_id": "session-search-history",
+                "proxy_server_request": {"input": "Find evidence"},
+                "response": {
+                    "object": "response",
+                    "output": [
+                        {"role": "assistant", "content": "Found evidence", "type": "message"},
+                        native_search,
+                        proxy_search,
+                        legacy_search,
+                    ],
+                },
+            },
+        )
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=stored))
+
+    restored: Final = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+        previous_response_id=response_id,
+        litellm_completion_request={
+            "model": "anthropic/claude-sonnet-5-5",
+            "custom_llm_provider": "anthropic",
+            "messages": [{"role": "user", "content": "Continue"}],
+        },
+        instructions=None,
+    )
+
+    messages: Final = restored["messages"]
+    assert isinstance(messages, list)
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert [call["id"] for call in messages[1]["tool_calls"]] == [proxy_search["id"]]
+    assert "Hosted web search:" in str(messages[1]["content"])
+    assert native_search["id"] in str(messages[1]["content"])
+    assert legacy_search in tuple(
+        json.loads(part["text"].removeprefix("Hosted web search: "))
+        for part in messages[1]["content"]
+        if part["text"].startswith("Hosted web search: ")
+    )
+    assert messages[2]["tool_call_id"] == proxy_search["id"]
+    assert json.loads(messages[2]["content"]) == proxy_search

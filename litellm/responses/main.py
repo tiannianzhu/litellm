@@ -409,7 +409,9 @@ async def aresponses_api_with_mcp(
             initial_request_kwargs,
             previous_response_client_ids(previous_response_id, initial_request_kwargs),
         )
-        if not provider_stores_the_conversation(model, custom_llm_provider, initial_request_kwargs)
+        if not provider_stores_the_conversation(
+            model, custom_llm_provider, {**initial_request_kwargs, "previous_response_id": previous_response_id}
+        )
         else MappingProxyType(dict[str, object]())
     )
     request_kwargs: Final = {**initial_request_kwargs, **bridge_session}
