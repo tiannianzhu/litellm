@@ -202,6 +202,7 @@ class ResponsesSessionHandler:
         client_response_ids: tuple[str, ...] = (),
         tool_call_provider_fields: bool = False,
         stored_turns: StoredTurns | None = None,
+        native_search_context: bool = False,
     ) -> ChatCompletionSession:
         """
         Return the chat completion message history for a previous response id
@@ -243,12 +244,14 @@ class ResponsesSessionHandler:
             ],
             item_cache_control,
             tool_call_provider_fields,
+            native_search_context,
         )
         history_before_replay: Final = ResponsesSessionHandler._history_of_turns(
             all_spend_logs[: start.index],
             proxy_server_requests[: start.index],
             item_cache_control,
             tool_call_provider_fields,
+            native_search_context,
         )
         chat_completion_message_history: Final = (
             list(with_stored_calls_the_input_answers(replayed_history, history_before_replay))
@@ -311,6 +314,7 @@ class ResponsesSessionHandler:
         proxy_server_requests: Sequence[Mapping[str, object] | None],
         item_cache_control: bool,
         tool_call_provider_fields: bool,
+        native_search_context: bool,
     ) -> list["SessionMessage"]:
         return list(
             chain.from_iterable(
@@ -320,6 +324,7 @@ class ResponsesSessionHandler:
                     chat_completion_message_history=[],
                     item_cache_control=item_cache_control,
                     tool_call_provider_fields=tool_call_provider_fields,
+                    native_search_context=native_search_context,
                 )
                 for spend_log, proxy_server_request in zip(spend_logs, proxy_server_requests, strict=True)
             )
@@ -338,6 +343,7 @@ class ResponsesSessionHandler:
         ],
         item_cache_control: bool = False,
         tool_call_provider_fields: bool = False,
+        native_search_context: bool = False,
     ):
         """
         Extend the chat completion message history with the spend log payload
@@ -372,6 +378,7 @@ class ResponsesSessionHandler:
                     item_cache_control=item_cache_control,
                     tool_call_provider_fields=tool_call_provider_fields,
                     only_since_compaction=True,
+                    native_search_context=native_search_context,
                 )
             )
 
@@ -388,6 +395,7 @@ class ResponsesSessionHandler:
                     item_cache_control=item_cache_control,
                     tool_call_provider_fields=tool_call_provider_fields,
                     only_since_compaction=True,
+                    native_search_context=native_search_context,
                 )
             )
         elif isinstance(_response_output, dict) and _response_output and _response_output != {}:
@@ -396,7 +404,11 @@ class ResponsesSessionHandler:
             for choice in model_response.choices:
                 if hasattr(choice, "message"):
                     _normalize_redacted_tool_call_arguments(choice.message)
-                    chat_completion_message_history.append(choice.message)
+                    chat_completion_message_history.extend(
+                        LiteLLMCompletionResponsesConfig.normalize_legacy_search_message(choice.message)
+                        if native_search_context
+                        else (choice.message,)
+                    )
         return chat_completion_message_history
 
     @staticmethod

@@ -36,7 +36,7 @@ def test_response_api_handler_merges_metadata_and_service_tier_without_error():
             id="id", created=0, model="test", object="chat.completion", choices=[]
         )
         handler.response_api_handler(
-            model="test",
+            model="openai/test",
             input="hi",
             responses_api_request={},
             metadata={"trace": "abc"},

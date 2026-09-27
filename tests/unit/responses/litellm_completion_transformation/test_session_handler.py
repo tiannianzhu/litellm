@@ -21,7 +21,10 @@ from litellm.responses.litellm_completion_transformation.session_handler import 
     ResponsesSessionHandler,
     _normalize_redacted_tool_call_arguments,
 )
-from litellm.responses.litellm_completion_transformation.transformation import ChatCompletionSession
+from litellm.responses.litellm_completion_transformation.transformation import (
+    ChatCompletionSession,
+    LiteLLMCompletionResponsesConfig,
+)
 from litellm.responses.mcp.litellm_proxy_mcp_handler import LiteLLM_Proxy_MCP_Handler
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import ResponsesAPIResponse
@@ -1313,3 +1316,60 @@ async def test_previous_response_replays_a_thought_signature_kept_out_of_the_id_
     model_parts: Final = list(chain.from_iterable(turn["parts"] for turn in model_turns))
     assert len(model_parts) == 1
     assert (model_parts[0]["thoughtSignature"] == LONG_SIGNATURE) is short_ids
+
+
+@pytest.mark.asyncio
+async def test_previous_response_keeps_native_search_context_and_proxy_search_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_id: Final = "chatcmpl-search-history"
+    native_search: Final = {
+        "id": "ws_native_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "native query"},
+    }
+    proxy_search: Final = {
+        "id": "ws_proxy_search",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "proxy query"},
+        "provider_specific_fields": {"search_result": "Saved proxy evidence"},
+    }
+    stored: Final = _StoredSpendLogs(
+        (
+            {
+                "request_id": response_id,
+                "session_id": "session-search-history",
+                "proxy_server_request": {"input": "Find evidence"},
+                "response": {
+                    "object": "response",
+                    "output": [
+                        {"role": "assistant", "content": "Found evidence", "type": "message"},
+                        native_search,
+                        proxy_search,
+                    ],
+                },
+            },
+        )
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", SimpleNamespace(db=stored))
+
+    restored: Final = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+        previous_response_id=response_id,
+        litellm_completion_request={
+            "model": "anthropic/claude-sonnet-5-5",
+            "custom_llm_provider": "anthropic",
+            "messages": [{"role": "user", "content": "Continue"}],
+        },
+        instructions=None,
+    )
+
+    messages: Final = restored["messages"]
+    assert isinstance(messages, list)
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert [call["id"] for call in messages[1]["tool_calls"]] == [proxy_search["id"]]
+    assert "Hosted web search:" in str(messages[1]["content"])
+    assert native_search["id"] in str(messages[1]["content"])
+    assert messages[2]["tool_call_id"] == proxy_search["id"]
+    assert json.loads(messages[2]["content"]) == proxy_search
