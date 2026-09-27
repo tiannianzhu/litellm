@@ -5,15 +5,639 @@ Tests the end-to-end flow of websearch_interception callback with
 litellm.acompletion() for transparent server-side web search execution.
 """
 
+import asyncio
+import itertools
+import json
+import os
+from collections.abc import AsyncIterator, Mapping
+from datetime import datetime
+from typing import Final
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
+from openai.lib.streaming.chat import ChatCompletionStreamState
+from openai.types.chat import ChatCompletionChunk
+from pydantic import ValidationError
 
 import litellm
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.websearch_interception.handler import (
     WebSearchInterceptionLogger,
 )
+from litellm.llms.base_llm.search.transformation import SearchResponse
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
+from litellm.types.integrations.websearch_interception import RichWebSearchInput
 from litellm.types.utils import LlmProviders, ModelResponse
+
+
+def _chat_sse(delta: dict[str, object], finish_reason: str | None = None, wire_id: str = "chatcmpl-fixture") -> bytes:
+    payload: Final = {
+        "id": wire_id,
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _usage_sse(prompt_tokens: int, completion_tokens: int, wire_id: str = "chatcmpl-fixture") -> bytes:
+    payload: Final = {
+        "id": wire_id,
+        "object": "chat.completion.chunk",
+        "created": 1,
+        "model": "test-model",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+class _GatedSSEStream(httpx.AsyncByteStream):
+    def __init__(self, first: bytes, rest: bytes, release: asyncio.Event) -> None:
+        self.first = first
+        self.rest = rest
+        self.release = release
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.first
+        await self.release.wait()
+        yield self.rest
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class _RecordingWebSearchLogger(WebSearchInterceptionLogger):
+    def __init__(self, failure: bool = False, max_agentic_loops: int | None = None) -> None:
+        super().__init__(enabled_providers=[LlmProviders.HOSTED_VLLM], max_agentic_loops=max_agentic_loops)
+        self.queries: asyncio.Queue[str] = asyncio.Queue()
+        self.failure = failure
+
+    async def _execute_search(
+        self,
+        query: str,
+        kwargs: Mapping[str, object] | None = None,
+        rich: RichWebSearchInput | None = None,
+    ) -> tuple[str, SearchResponse | None]:
+        self.queries.put_nowait(query)
+        if self.failure:
+            raise RuntimeError("fixture unavailable")
+        return "fixture result", None
+
+
+class _RoundObserver(CustomLogger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rounds: asyncio.Queue[tuple[str, int, object, object, object]] = asyncio.Queue()
+
+    async def async_log_success_event(
+        self,
+        kwargs: dict[str, object],
+        response_obj: object,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> None:
+        if isinstance(response_obj, ModelResponse) and response_obj.usage is not None:
+            litellm_params: Final = kwargs.get("litellm_params")
+            self.rounds.put_nowait(
+                (
+                    response_obj.id,
+                    response_obj.usage.total_tokens,
+                    litellm_params.get("metadata") if isinstance(litellm_params, Mapping) else None,
+                    litellm_params.get("litellm_metadata") if isinstance(litellm_params, Mapping) else None,
+                    kwargs.get("user"),
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_declared_web_search_stream_yields_text_before_backend_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release: Final = asyncio.Event()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_GatedSSEStream(
+                _chat_sse({"content": "Hello"}),
+                _chat_sse({"content": " world"}) + _chat_sse({}, "stop") + _usage_sse(3, 2) + b"data: [DONE]\n\n",
+                release,
+            ),
+        )
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Say hello"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            stream_options={"include_usage": True},
+            client=handler,
+        )
+        try:
+            first: Final = await asyncio.wait_for(anext(stream), timeout=2)
+            assert first.choices[0].delta.content == "Hello"
+            assert not release.is_set()
+        finally:
+            release.set()
+        remaining: Final = [chunk async for chunk in stream]
+    finally:
+        release.set()
+        await handler.client.aclose()
+
+    request: Final = await asyncio.wait_for(requests.get(), timeout=2)
+    assert request["stream"] is True
+    assert requests.empty()
+    assert logger.queries.empty()
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in (first, *remaining)))
+    assert "".join(choice.delta.content or "" for choice in choices) == "Hello world"
+    assert [choice.finish_reason for choice in choices if choice.finish_reason] == ["stop"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_result"),
+    ((False, "fixture result"), (True, "Search failed: fixture unavailable")),
+)
+@pytest.mark.parametrize("history_kind", ("text", "content_parts", "tool_calls"))
+async def test_split_web_search_stream_executes_search_and_streams_followup(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: bool,
+    expected_result: str,
+    history_kind: str,
+) -> None:
+    call_number: Final = itertools.count()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger(failure=failure)
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    first_body: Final = (
+        _chat_sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_fixture",
+                        "type": "function",
+                        "function": {"name": "litellm_web_search", "arguments": '{"query":"fixture'},
+                    }
+                ]
+            }
+        )
+        + _chat_sse({"tool_calls": [{"index": 0, "function": {"arguments": ' query"}'}}]})
+        + _chat_sse({}, "tool_calls")
+        + _usage_sse(2, 3)
+        + b"data: [DONE]\n\n"
+    )
+    second_body: Final = (
+        _chat_sse({"content": "The answer"}) + _chat_sse({}, "stop") + _usage_sse(4, 5) + b"data: [DONE]\n\n"
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        body: Final = first_body if next(call_number) == 0 else second_body
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    history: Final = (
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_prior",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_prior", "content": "Prior result"},
+        ]
+        if history_kind == "tool_calls"
+        else []
+    )
+    messages: Final = [
+        *history,
+        {
+            "role": "user",
+            "content": (
+                [{"type": "text", "text": "Find fixture"}, {"type": "text", "text": " query"}]
+                if history_kind == "content_parts"
+                else "Find fixture query"
+            ),
+        },
+    ]
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=messages,
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            stream_options={"include_usage": True},
+            client=handler,
+        )
+        chunks: Final = [chunk async for chunk in stream]
+    finally:
+        await handler.client.aclose()
+
+    first_request: Final = await asyncio.wait_for(requests.get(), timeout=2)
+    second_request: Final = await asyncio.wait_for(requests.get(), timeout=2)
+    assert requests.empty()
+    assert first_request["stream"] is True
+    assert second_request["stream"] is True
+    assert second_request["messages"][:-2] == first_request["messages"]
+    assert second_request["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "call_fixture",
+        "content": expected_result,
+    }
+    assert await asyncio.wait_for(logger.queries.get(), timeout=2) == "fixture query"
+    assert logger.queries.empty()
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in chunks))
+    assert "".join(choice.delta.content or "" for choice in choices) == "The answer"
+    assert all(not choice.delta.tool_calls for choice in choices)
+    search_markers: Final = tuple(
+        field["web_search_calls"]
+        for choice in choices
+        if (field := choice.delta.provider_specific_fields) and "web_search_calls" in field
+    )
+    assert len(search_markers) == 1
+    assert search_markers[0][0]["action"]["query"] == "fixture query"
+    assert [choice.finish_reason for choice in choices if choice.finish_reason] == ["stop"]
+    usage: Final = [value for chunk in chunks if (value := getattr(chunk, "usage", None)) is not None]
+    assert len(usage) == 1
+    assert (usage[0].prompt_tokens, usage[0].completion_tokens, usage[0].total_tokens) == (6, 8, 14)
+
+
+@pytest.mark.asyncio
+async def test_web_search_stream_close_closes_upstream_without_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    release: Final = asyncio.Event()
+    raw_stream: Final = _GatedSSEStream(
+        _chat_sse({"content": "partial"}),
+        _chat_sse({}, "stop") + b"data: [DONE]\n\n",
+        release,
+    )
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=raw_stream)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Stop after partial"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            client=handler,
+        )
+        first: Final = await asyncio.wait_for(anext(stream), timeout=2)
+        assert first.choices[0].delta.content == "partial"
+        await asyncio.wait_for(stream.aclose(), timeout=2)
+    finally:
+        release.set()
+        await handler.client.aclose()
+
+    assert raw_stream.closed.is_set()
+    assert requests.qsize() == 1
+    assert logger.queries.empty()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_web_search_arguments_are_not_executed(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    body: Final = (
+        _chat_sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_fixture",
+                        "type": "function",
+                        "function": {"name": "litellm_web_search", "arguments": '{"query":"unfinished'},
+                    }
+                ]
+            }
+        )
+        + _chat_sse({}, "length")
+        + b"data: [DONE]\n\n"
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Find something"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            client=handler,
+        )
+        chunks: Final = [chunk async for chunk in stream]
+    finally:
+        await handler.client.aclose()
+
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in chunks))
+    assert [choice.finish_reason for choice in choices if choice.finish_reason] == ["length"]
+    assert logger.queries.empty()
+    assert requests.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_malformed_web_search_arguments_fail_without_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    body: Final = (
+        _chat_sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_fixture",
+                        "type": "function",
+                        "function": {"name": "litellm_web_search", "arguments": '{"query":'},
+                    }
+                ]
+            }
+        )
+        + _chat_sse({}, "tool_calls")
+        + b"data: [DONE]\n\n"
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Find something"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            client=handler,
+        )
+        with pytest.raises(ValidationError):
+            _ = [chunk async for chunk in stream]
+    finally:
+        await handler.client.aclose()
+
+    assert logger.queries.empty()
+    assert requests.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_mixed_web_search_and_client_tool_stream_keeps_client_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger()
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+    body: Final = (
+        _chat_sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_search",
+                        "type": "function",
+                        "function": {"name": "litellm_web_search", "arguments": '{"query":"fixture query"}'},
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_client",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    },
+                ]
+            }
+        )
+        + _chat_sse({}, "tool_calls")
+        + b"data: [DONE]\n\n"
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Search and check weather"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[
+                {"type": "function", "function": {"name": "litellm_web_search"}},
+                {"type": "function", "function": {"name": "get_weather"}},
+            ],
+            stream=True,
+            client=handler,
+        )
+        chunks: Final = [chunk async for chunk in stream]
+    finally:
+        await handler.client.aclose()
+
+    choices: Final = tuple(itertools.chain.from_iterable(chunk.choices for chunk in chunks))
+    visible_calls: Final = tuple(itertools.chain.from_iterable(choice.delta.tool_calls or () for choice in choices))
+    assert [(call.id, call.function.name) for call in visible_calls] == [("call_client", "get_weather")]
+    sdk_state: Final = ChatCompletionStreamState()
+    for chunk in chunks:
+        sdk_state.handle_chunk(ChatCompletionChunk.model_validate(chunk.model_dump(exclude_none=True)))
+    sdk_calls: Final = sdk_state.get_final_completion().choices[0].message.tool_calls
+    assert sdk_calls is not None
+    assert [(call.id, call.function.name, call.function.arguments) for call in sdk_calls] == [
+        ("call_client", "get_weather", "{}")
+    ]
+    search_markers: Final = tuple(
+        field["web_search_calls"]
+        for choice in choices
+        if (field := choice.delta.provider_specific_fields) and "web_search_calls" in field
+    )
+    assert len(search_markers) == 1
+    assert search_markers[0][0]["status"] == "completed"
+    assert [choice.finish_reason for choice in choices if choice.finish_reason] == ["tool_calls"]
+    assert await asyncio.wait_for(logger.queries.get(), timeout=2) == "fixture query"
+    assert logger.queries.empty()
+    assert requests.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_web_search_stream_logs_each_backend_round_with_own_usage_and_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_number: Final = itertools.count()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger()
+    observer: Final = _RoundObserver()
+    monkeypatch.setattr(litellm, "callbacks", [logger, observer])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        first: Final = next(call_number) == 0
+        wire_id: Final = "wire_search" if first else "wire_answer"
+        body: Final = (
+            (
+                _chat_sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_search",
+                                "type": "function",
+                                "function": {"name": "litellm_web_search", "arguments": '{"query":"fixture query"}'},
+                            }
+                        ]
+                    },
+                    wire_id=wire_id,
+                )
+                + _chat_sse({}, "tool_calls", wire_id=wire_id)
+                if first
+                else _chat_sse({"content": "answer"}, wire_id=wire_id) + _chat_sse({}, "stop", wire_id=wire_id)
+            )
+            + _usage_sse(2, 3, wire_id=wire_id)
+            + b"data: [DONE]\n\n"
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Find fixture query"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            stream_options={"include_usage": True},
+            user="user_fixture",
+            metadata={"session_id": "session_fixture"},
+            client=handler,
+        )
+        chunks: Final = [chunk async for chunk in stream]
+        observed: Final = (
+            await asyncio.wait_for(observer.rounds.get(), timeout=3),
+            await asyncio.wait_for(observer.rounds.get(), timeout=3),
+        )
+    finally:
+        await handler.client.aclose()
+
+    assert [(round_id, tokens) for round_id, tokens, *_ in observed] == [
+        ("wire_search", 5),
+        ("wire_answer", 5),
+    ]
+    assert observer.rounds.empty()
+    assert all(
+        (isinstance(metadata, Mapping) and metadata.get("session_id") == "session_fixture")
+        or (isinstance(litellm_metadata, Mapping) and litellm_metadata.get("session_id") == "session_fixture")
+        for _, _, metadata, litellm_metadata, _ in observed
+    )
+    assert all(user == "user_fixture" for _, _, _, _, user in observed)
+    sent: Final = (requests.get_nowait(), requests.get_nowait())
+    assert requests.empty()
+    assert sent[1]["messages"][-1]["content"] == "fixture result"
+    assert [value.total_tokens for chunk in chunks if (value := getattr(chunk, "usage", None)) is not None] == [10]
+
+
+@pytest.mark.asyncio
+async def test_web_search_stream_respects_callback_loop_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    call_number: Final = itertools.count()
+    requests: Final[asyncio.Queue[dict[str, object]]] = asyncio.Queue()
+    logger: Final = _RecordingWebSearchLogger(max_agentic_loops=1)
+    monkeypatch.setattr(litellm, "callbacks", [logger])
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.put_nowait(json.loads(request.content))
+        index: Final = next(call_number)
+        body: Final = (
+            _chat_sse(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": "litellm_web_search",
+                                "arguments": json.dumps({"query": f"query {index}"}),
+                            },
+                        }
+                    ]
+                }
+            )
+            + _chat_sse({}, "tool_calls")
+            + b"data: [DONE]\n\n"
+        )
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+    handler: Final = AsyncHTTPHandler()
+    await handler.client.aclose()
+    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        stream: Final = await litellm.acompletion(
+            model="hosted_vllm/test-model",
+            messages=[{"role": "user", "content": "Keep searching"}],
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture",
+            tools=[{"type": "function", "function": {"name": "litellm_web_search"}}],
+            stream=True,
+            client=handler,
+        )
+        with pytest.raises(ValueError, match="Exceeded max_agentic_loops=1"):
+            _ = [chunk async for chunk in stream]
+    finally:
+        await handler.client.aclose()
+
+    assert requests.qsize() == 2
+    assert logger.queries.get_nowait() == "query 0"
+    assert logger.queries.empty()
 
 
 @pytest.fixture

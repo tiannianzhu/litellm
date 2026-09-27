@@ -1,6 +1,7 @@
 # What is this?
 ## Translates OpenAI call to Anthropic `/v1/messages` format
 import copy
+import inspect
 import json
 from collections import deque
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
@@ -10,11 +11,13 @@ from typing import (
     Final,
     Literal,
     Protocol,
+    TypeAlias,
     cast,
     get_args,
 )
 
-from typing_extensions import assert_never
+from pydantic import TypeAdapter
+from typing_extensions import ReadOnly, TypedDict, assert_never
 
 from litellm._logging import verbose_logger
 from litellm._uuid import uuid
@@ -40,6 +43,45 @@ if TYPE_CHECKING:
 
 
 _STREAMING_DELTA_TYPES: Final = frozenset(get_args(StreamingContentBlockDeltaType))
+_WEB_SEARCH_RESULT_BLOCK_ADAPTER: Final = TypeAdapter(dict[str, object])
+
+
+class _EmptyJsonObject(TypedDict):
+    pass
+
+
+class _ServerToolUseBlock(TypedDict):
+    type: ReadOnly[Literal["server_tool_use"]]
+    id: ReadOnly[object]
+    name: ReadOnly[object]
+    input: ReadOnly[Mapping[str, object]]
+
+
+class _WebSearchContentBlockStart(TypedDict):
+    type: ReadOnly[Literal["content_block_start"]]
+    index: ReadOnly[int]
+    content_block: ReadOnly[Mapping[str, object]]
+
+
+class _WebSearchInputJsonDelta(TypedDict):
+    type: ReadOnly[Literal["input_json_delta"]]
+    partial_json: ReadOnly[str]
+
+
+class _WebSearchContentBlockDelta(TypedDict):
+    type: ReadOnly[Literal["content_block_delta"]]
+    index: ReadOnly[int]
+    delta: ReadOnly[_WebSearchInputJsonDelta]
+
+
+class _WebSearchContentBlockStop(TypedDict):
+    type: ReadOnly[Literal["content_block_stop"]]
+    index: ReadOnly[int]
+
+
+_WebSearchNativeBlockEvent: TypeAlias = (
+    _WebSearchContentBlockStart | _WebSearchContentBlockDelta | _WebSearchContentBlockStop
+)
 
 
 class _UsageDeltaWithIterations(UsageDelta, total=False):
@@ -291,6 +333,69 @@ class _CombinedChunkSplitter:
         )
         return self._buffer.popleft()
 
+    def close(self) -> None:
+        stream: Final = self._sync_iter or self._stream
+        close: Final = getattr(stream, "close", None)
+        if callable(close):
+            close()
+
+    async def aclose(self) -> None:
+        stream: Final = self._async_iter or self._stream
+        aclose: Final = getattr(stream, "aclose", None)
+        if callable(aclose):
+            result: Final = aclose()
+            if inspect.isawaitable(result):
+                await result
+
+
+def _websearch_native_block_events(
+    block: Mapping[str, object], index: int
+) -> tuple[_WebSearchNativeBlockEvent, ...] | None:
+    block_type: Final = block.get("type")
+    if block_type == "server_tool_use":
+        tool_input: Final = block.get("input")
+        empty_input: Final[_EmptyJsonObject] = {}
+        serialized_input: Final = json.dumps(tool_input if isinstance(tool_input, Mapping) else empty_input)
+        server_tool_use: Final[_ServerToolUseBlock] = {
+            "type": "server_tool_use",
+            "id": block.get("id"),
+            "name": block.get("name", "web_search"),
+            "input": empty_input,
+        }
+        server_start_event: Final[_WebSearchContentBlockStart] = {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": server_tool_use,
+        }
+        delta_payload: Final[_WebSearchInputJsonDelta] = {
+            "type": "input_json_delta",
+            "partial_json": serialized_input,
+        }
+        delta_event: Final[_WebSearchContentBlockDelta] = {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": delta_payload,
+        }
+        server_stop_event: Final[_WebSearchContentBlockStop] = {"type": "content_block_stop", "index": index}
+        return (
+            server_start_event,
+            delta_event,
+            server_stop_event,
+        )
+    if block_type == "web_search_tool_result":
+        result_block: Final = _WEB_SEARCH_RESULT_BLOCK_ADAPTER.validate_python(block)
+        result_start_event: Final[_WebSearchContentBlockStart] = {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": result_block,
+        }
+        result_stop_event: Final[_WebSearchContentBlockStop] = {"type": "content_block_stop", "index": index}
+        return (
+            result_start_event,
+            result_stop_event,
+        )
+    return None
+
 
 class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
     """
@@ -377,6 +482,18 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             "list[AllMessageValues] | None", getattr(self.completion_stream, "messages", None)
         )
 
+    def close(self) -> None:
+        close: Final = getattr(self.completion_stream, "close", None)
+        if callable(close):
+            close()
+
+    async def aclose(self) -> None:
+        aclose: Final = getattr(self.completion_stream, "aclose", None)
+        if callable(aclose):
+            result: Final = aclose()
+            if inspect.isawaitable(result):
+                await result
+
     def _merge_usage_into_held_stop_reason_chunk(self, chunk: Any) -> MessageBlockDelta:
         """Merge usage data from ``chunk`` into the held ``message_delta`` chunk.
 
@@ -421,6 +538,37 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             self.holding_stop_reason_chunk = None
             return True
         return False
+
+    def _emit_websearch_native_blocks(self, chunk: "ModelResponseStream") -> bool:
+        choices: Final = _optional_attr_sequence(chunk, "choices")
+        if not choices:
+            return False
+        delta: Final = _optional_attr(choices[0], "delta")
+        provider_fields: Final = _optional_attr(delta, "provider_specific_fields")
+        blocks: Final = provider_fields.get("websearch_native_blocks") if isinstance(provider_fields, Mapping) else None
+        if not isinstance(blocks, Sequence) or isinstance(blocks, (str, bytes)) or not blocks:
+            return False
+
+        if self.sent_content_block_start and not self.sent_content_block_finish:
+            stop_event: Final[_WebSearchContentBlockStop] = {
+                "type": "content_block_stop",
+                "index": self.current_content_block_index,
+            }
+            self.chunk_queue.append(stop_event)
+            self._increment_content_block_index()
+
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            if events := _websearch_native_block_events(block, self.current_content_block_index):
+                self.chunk_queue.extend(events)
+                self._increment_content_block_index()
+
+        self.current_content_block_type = "text"
+        self.current_content_block_start = self.TextBlock(type="text", text="")
+        self.sent_content_block_start = False
+        self.sent_content_block_finish = False
+        return bool(self.chunk_queue)
 
     def _ensure_context_management_attached(self, message_delta_chunk: MessageBlockDelta) -> MessageBlockDelta:
         """Attach ``context_management`` to a ``message_delta`` chunk if
@@ -581,6 +729,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             for chunk in self.completion_stream:
                 if chunk == "None" or chunk is None:
                     raise Exception
+
+                if self._emit_websearch_native_blocks(chunk):
+                    return self.chunk_queue.popleft()
 
                 if not getattr(chunk, "choices", None):
                     if self._handle_choiceless_chunk(chunk):
@@ -814,6 +965,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             async for chunk in self.completion_stream:
                 if chunk == "None" or chunk is None:
                     raise Exception
+
+                if self._emit_websearch_native_blocks(chunk):
+                    return self.chunk_queue.popleft()
 
                 if not getattr(chunk, "choices", None):
                     if self._handle_choiceless_chunk(chunk):

@@ -108,6 +108,58 @@ def _text_deltas(events: List[dict]) -> List[str]:
     ]
 
 
+def _websearch_marker() -> dict:
+    return {
+        "websearch_native_blocks": [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_search",
+                "name": "web_search",
+                "input": {"query": "weather"},
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_search",
+                "content": [{"type": "web_search_result", "url": "https://example.test"}],
+            },
+        ],
+    }
+
+
+def _websearch_marker_chunk() -> MagicMock:
+    return _make_chunk(Delta(content=None, provider_specific_fields=_websearch_marker()))
+
+
+def _assert_websearch_events(events: List[dict]) -> None:
+    search_start = next(
+        event
+        for event in events
+        if event.get("type") == "content_block_start"
+        and event.get("content_block", {}).get("type") == "server_tool_use"
+    )
+    search_index = search_start["index"]
+    assert search_start["content_block"]["input"] == {}
+    assert {
+        event["delta"]["partial_json"]
+        for event in events
+        if event.get("type") == "content_block_delta"
+        and event.get("index") == search_index
+        and event.get("delta", {}).get("type") == "input_json_delta"
+    } == {'{"query": "weather"}'}
+    assert any(
+        event.get("type") == "content_block_start"
+        and event.get("content_block", {}).get("type") == "web_search_tool_result"
+        for event in events
+    )
+    assert not any(
+        event.get("type") == "content_block_start"
+        and event.get("content_block", {}).get("type") == "tool_use"
+        for event in events
+    )
+    block_starts = [event for event in events if event.get("type") == "content_block_start"]
+    assert [event["index"] for event in block_starts] == list(range(len(block_starts)))
+
+
 def test_streaming_chat_refusal_emits_refusal_text_and_stop_details():
     chunks = [
         _make_chunk(Delta(content=None, refusal="I cannot fulfill this request.")),
@@ -219,6 +271,56 @@ async def test_streaming_chat_combined_refusal_and_finish_reason_is_preserved_as
     message_delta = next(event for event in events if event["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "refusal"
     assert message_delta["delta"]["stop_details"]["explanation"] == "I cannot fulfill this request."
+
+
+def test_websearch_native_marker_streams_native_blocks_between_text_chunks():
+    chunks = [
+        _make_chunk(Delta(content="Before")),
+        _websearch_marker_chunk(),
+        _make_chunk(Delta(content="After")),
+        _make_chunk(Delta(content=None), finish_reason="stop"),
+    ]
+    events = _drain_sync(AnthropicStreamWrapper(completion_stream=iter(chunks), model="openai-model"))
+
+    _assert_websearch_events(events)
+    assert _text_deltas(events) == ["Before", "After"]
+    assert events[-1]["type"] == "message_stop"
+    message_delta = next(event for event in events if event["type"] == "message_delta")
+    assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+@pytest.mark.asyncio
+async def test_websearch_native_marker_streams_native_blocks_async():
+    chunks = [
+        _make_chunk(Delta(content="Before")),
+        _websearch_marker_chunk(),
+        _make_chunk(Delta(content="After")),
+        _make_chunk(Delta(content=None), finish_reason="stop"),
+    ]
+    events = await _drain_async(AnthropicStreamWrapper(completion_stream=_AsyncStream(chunks), model="openai-model"))
+
+    _assert_websearch_events(events)
+    assert _text_deltas(events) == ["Before", "After"]
+    assert events[-1]["type"] == "message_stop"
+
+
+@pytest.mark.asyncio
+async def test_aclose_reaches_the_underlying_stream():
+    closed: list[bool] = []
+
+    async def stream():
+        try:
+            yield _make_chunk(Delta(content="Hello"))
+            yield _make_chunk(Delta(content=None), finish_reason="stop")
+        finally:
+            closed.append(True)
+
+    wrapper = AnthropicStreamWrapper(completion_stream=stream(), model="openai-model")
+    await wrapper.__anext__()
+    await wrapper.__anext__()
+    await wrapper.aclose()
+
+    assert closed == [True]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

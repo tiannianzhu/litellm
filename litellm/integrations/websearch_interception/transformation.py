@@ -5,10 +5,13 @@ Transforms between Anthropic/OpenAI tool_use format and LiteLLM search format.
 """
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from typing import Any, Final
 
-from typing_extensions import assert_never
+from openai.types.responses import ResponseFunctionWebSearch
+from pydantic import TypeAdapter
+from typing_extensions import NotRequired, ReadOnly, TypedDict, assert_never
 
 from litellm._logging import verbose_logger
 from litellm.constants import LITELLM_WEB_SEARCH_TOOL_NAME
@@ -20,6 +23,23 @@ from litellm.types.integrations.websearch_interception import (
     SearchSucceeded,
     WebSearchToolResultErrorCode,
 )
+from litellm.types.llms.openai import ChatCompletionAssistantMessage, ChatCompletionToolMessage
+
+_SEARCH_MAPPING: Final = TypeAdapter(dict[str, object])
+_SEARCH_MAPPINGS: Final = TypeAdapter(list[dict[str, object]])
+
+_CHAT_SEARCH_HISTORY: Final = TypeAdapter(tuple[ChatCompletionAssistantMessage, tuple[ChatCompletionToolMessage, ...]])
+
+
+class _ReplaySearchInput(TypedDict):
+    query: ReadOnly[str]
+    search_queries: NotRequired[ReadOnly[Sequence[str]]]
+
+
+class _ReplaySearchCall(TypedDict):
+    id: ReadOnly[str]
+    name: ReadOnly[str]
+    input: ReadOnly[_ReplaySearchInput]
 
 
 class WebSearchTransformation:
@@ -31,6 +51,25 @@ class WebSearchTransformation:
     - OpenAI tool_calls format → LiteLLM search requests
     - LiteLLM SearchResponse → Anthropic/OpenAI tool_result format
     """
+
+    @staticmethod
+    def hosted_search_to_chat_history(
+        input_item: Mapping[str, object],
+    ) -> tuple[ChatCompletionAssistantMessage, tuple[ChatCompletionToolMessage, ...]]:
+        search: Final = ResponseFunctionWebSearch.model_validate(input_item, strict=True)
+        action: Final = search.action
+        arguments: Final[_ReplaySearchInput] = (
+            _ReplaySearchInput(query=action.query, search_queries=action.queries)
+            if action.type == "search" and action.queries
+            else _ReplaySearchInput(query=action.query if action.type == "search" else "")
+        )
+        call: Final[_ReplaySearchCall] = {"id": search.id, "name": LITELLM_WEB_SEARCH_TOOL_NAME, "input": arguments}
+        return _CHAT_SEARCH_HISTORY.validate_python(
+            WebSearchTransformation._transform_response_openai(
+                tool_calls=(call,),
+                search_results=(search.model_dump_json(exclude_none=True),),
+            )
+        )
 
     @staticmethod
     def transform_request(
@@ -373,37 +412,54 @@ class WebSearchTransformation:
 
     @staticmethod
     def _transform_response_openai(
-        tool_calls: list[dict],
+        tool_calls: Sequence[Mapping[str, object]],
         search_results: Sequence[str],
-    ) -> tuple[dict, list[dict]]:
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
         """Transform to OpenAI format (assistant with tool_calls, separate tool messages)"""
-        # Build assistant message with tool_calls
-        assistant_message: Final = {
-            "role": "assistant",
-            "tool_calls": [
+        assistant_message: Final = _SEARCH_MAPPING.validate_python(
+            MappingProxyType(
                 {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": (json.dumps(tc["input"]) if isinstance(tc["input"], dict) else str(tc["input"])),
-                    },
+                    "role": "assistant",
+                    "tool_calls": _SEARCH_MAPPINGS.validate_python(
+                        tuple(WebSearchTransformation._openai_search_call(tc) for tc in tool_calls)
+                    ),
                 }
-                for tc in tool_calls
-            ],
-        }
-
-        # Build separate tool messages (one per tool call)
-        tool_messages: Final = [
-            {
-                "role": "tool",
-                "tool_call_id": tool_calls[i]["id"],
-                "content": search_results[i],
-            }
-            for i in range(len(tool_calls))
-        ]
-
+            )
+        )
+        tool_messages: Final = _SEARCH_MAPPINGS.validate_python(
+            tuple(
+                MappingProxyType(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_calls[i]["id"],
+                        "content": search_results[i],
+                    }
+                )
+                for i in range(len(tool_calls))
+            )
+        )
         return assistant_message, tool_messages
+
+    @staticmethod
+    def _openai_search_call(tool_call: Mapping[str, object]) -> Mapping[str, object]:
+        arguments: Final = tool_call["input"]
+        function: Final = _SEARCH_MAPPING.validate_python(
+            MappingProxyType(
+                {
+                    "name": tool_call["name"],
+                    "arguments": json.dumps(arguments) if isinstance(arguments, dict) else str(arguments),
+                }
+            )
+        )
+        return _SEARCH_MAPPING.validate_python(
+            MappingProxyType(
+                {
+                    "id": tool_call["id"],
+                    "type": "function",
+                    "function": function,
+                }
+            )
+        )
 
     @staticmethod
     def build_web_search_tool_result_block(

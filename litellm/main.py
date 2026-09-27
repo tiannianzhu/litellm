@@ -641,6 +641,20 @@ async def acompletion(
             api_base=kwargs.get("api_base") or base_url,
         )
 
+    if stream:
+        from litellm.integrations.websearch_interception.streaming import streaming_search_callback
+
+        search_request: Final = TypeAdapter(dict[str, object]).validate_python(completion_kwargs)
+        search_provider: Final = TypeAdapter[str | None](str | None).validate_python(custom_llm_provider)
+        if streaming_search_callback(search_request, search_provider) is not None:
+            if n not in (None, 1):
+                raise litellm.BadRequestError(
+                    message="Streaming web search supports one completion choice per request",
+                    model=model,
+                    llm_provider=custom_llm_provider or "hosted_vllm",
+                )
+            completion_kwargs["stream_options"] = {**(stream_options or {}), "include_usage": True}
+
     fallbacks = fallbacks or litellm.model_fallbacks
     if fallbacks is not None:
         response = await async_completion_with_fallbacks(**completion_kwargs, kwargs={"fallbacks": fallbacks, **kwargs})
@@ -725,6 +739,17 @@ async def acompletion(
             if looped is not None:
                 response = looped
         if isinstance(response, CustomStreamWrapper):
+            from litellm.integrations.websearch_interception.streaming import wrap_websearch_stream
+
+            stream_request: Final = TypeAdapter(dict[str, object]).validate_python(
+                {k: v for k, v in {**completion_kwargs, **kwargs}.items() if v is not None}
+            )
+            stream_provider: Final = TypeAdapter[str | None](str | None).validate_python(custom_llm_provider)
+            response = wrap_websearch_stream(
+                response,
+                stream_request,
+                stream_provider,
+            )
             response.set_logging_event_loop(
                 loop=loop
             )  # sets the logging event loop if the user does sync streaming (e.g. on proxy for sagemaker calls)
