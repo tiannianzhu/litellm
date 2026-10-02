@@ -227,7 +227,8 @@ async def test_upstream_aborts_then_an_outage_fail_each_call_once_and_the_native
             for item in burst:
                 if item.call.marker in aborted:
                     assert item.status == (500 if item.call.stream else 503), item.text
-                    assert "Response payload is not completed" in item.text and "answer marker-" not in item.text
+                    assert "Could not reach the model service." in item.text, item.text
+                    assert "answer marker-" not in item.text, item.text
                 else:
                     _assert_answered_with_its_own_marker(item)
             _assert_native_requests_for(wire.drain(), calls)
@@ -235,7 +236,7 @@ async def test_upstream_aborts_then_an_outage_fail_each_call_once_and_the_native
         assert len(refused) == 4
         for item in refused:
             assert item.status == 503, item.text
-            assert "Cannot connect to host" in item.text, item.text
+            assert "Could not reach the model service." in item.text, item.text
         assert await asyncio.to_thread(
             eventually, lambda: _unhealthy_count(gateway, model), lambda count: count == 1, 30
         )

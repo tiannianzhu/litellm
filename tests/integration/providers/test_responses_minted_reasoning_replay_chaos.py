@@ -258,7 +258,7 @@ async def test_vendor_outage_fails_each_replay_cleanly_and_the_recovered_vendor_
         failed: Final = await _burst(str(gateway.client.base_url), gateway.key, models, while_down)
         assert len(failed) == 15
         for item in failed:
-            assert item.status == 500 and "Cannot connect to host" in item.text, (item.status, item.text)
+            assert item.status == 500 and "Could not reach the model service." in item.text, (item.status, item.text)
             assert "answer marker" not in item.text, item.text
             assert item.call_id, item
         assert _health_counts(gateway, models.responses) == (0, 1)

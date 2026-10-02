@@ -1,18 +1,240 @@
 import json
 from types import SimpleNamespace
+from typing import Final, Literal
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
+from litellm.llms.anthropic.common_utils import AnthropicError
+from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.proxy._types import ProxyErrorTypes, ProxyException
 from litellm.proxy.common_utils.openai_error_payload import (
     ResponsesContextErrorFormatter,
+    client_error_message,
     error_status_code,
     litellm_call_id_headers,
     openai_error_param,
     openai_error_type,
     with_litellm_call_id,
 )
+
+
+def test_message_unwrap_removes_only_litellm_wrappers_and_appended_router_diagnostics():
+    import litellm
+    from litellm.router_utils.common_utils import format_fallback_outcome_message
+
+    original: Final = "This model always has reasoning enabled and cannot be disabled."
+    exception: Final = litellm.UnsupportedParamsError(
+        message=original + format_fallback_outcome_message("fixture-group", ("fixture-fallback",), "fixture failure"),
+        max_retries=3, num_retries=2, litellm_debug_info="fixture diagnostic",
+    )
+    assert client_error_message(exception) == original
+    assert client_error_message("CustomerError: retain this prefix and JSON {\"x\": 1}") == (
+        "CustomerError: retain this prefix and JSON {\"x\": 1}"
+    )
+    assert "fixture-group" in exception.message
+    assert client_error_message("Invalid configuration:\nmodel=fixture\nChoose a supported value.") == (
+        "Invalid configuration:\nmodel=fixture\nChoose a supported value."
+    )
+
+
+def _raise_mapped_connect_failure() -> None:
+    import litellm
+
+    try:
+        raise httpx.ConnectError(
+            "Cannot connect to host internal.example:8000 ssl:<ssl.SSLContext object at 0x7f81b8e31400> "
+            "[Connect call failed ('internal.example', 8000)]"
+        )
+    except httpx.ConnectError:
+        raise litellm.InternalServerError(
+            message=(
+                "InternalServerError: Hosted_vllmException - Cannot connect to host internal.example:8000 "
+                "ssl:<ssl.SSLContext object at 0x7f81b8e31400> [Connect call failed ('internal.example', 8000)]"
+            ),
+            model="fixture-model",
+            llm_provider="hosted_vllm",
+        )
+
+
+def test_a_connection_failure_answers_with_a_stable_message():
+    import litellm
+
+    with pytest.raises(litellm.InternalServerError) as caught:
+        _raise_mapped_connect_failure()
+    assert client_error_message(caught.value) == "Could not reach the model service."
+
+
+def test_a_timeout_answers_with_a_stable_message():
+    import litellm
+
+    with pytest.raises(litellm.Timeout) as caught:
+        raise litellm.Timeout(
+            message="Timeout Error: Hosted_vllmException - timed out waiting for internal.example:8000",
+            model="fixture-model",
+            llm_provider="hosted_vllm",
+        ) from httpx.ReadTimeout("timed out waiting for internal.example:8000")
+    assert client_error_message(caught.value) == "The model service timed out."
+
+
+def test_wrapper_labels_are_stripped_from_plain_text_provider_errors():
+    assert client_error_message("RateLimitError: OpenAIException - slow down") == "slow down"
+    assert client_error_message("AzureException RateLimitError - slow down") == "slow down"
+    assert client_error_message("Timeout Error: Hosted_vllmException - upstream busy") == "upstream busy"
+
+
+def test_a_non_transport_cause_keeps_the_provider_message():
+    import litellm
+
+    with pytest.raises(litellm.InternalServerError) as caught:
+        raise litellm.InternalServerError(
+            message="InternalServerError: Hosted_vllmException - quota exhausted for this key",
+            model="fixture-model",
+            llm_provider="hosted_vllm",
+        ) from ValueError("fixture bug")
+    assert client_error_message(caught.value) == "quota exhausted for this key"
+
+
+@pytest.mark.parametrize(
+    "message_source,status_code", (("body", 400), ("response", 400), ("message", 400), ("body", 500))
+)
+def test_a_provider_rejection_after_a_connection_failure_keeps_its_message(
+    message_source: Literal["body", "response", "message"],
+    status_code: int,
+) -> None:
+    import litellm
+
+    explanation: Final = "The request parameter is outside its allowed range."
+    response: Final = (
+        httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://fixture.invalid/inference"),
+            json={"error": {"message": explanation}},
+        )
+        if message_source == "response"
+        else None
+    )
+    error_class: Final = litellm.BadRequestError if status_code == 400 else litellm.InternalServerError
+    try:
+        raise httpx.ConnectError("previous attempt failed to connect")
+    except httpx.ConnectError:
+        with pytest.raises(error_class) as caught:
+            raise error_class(
+                message=explanation if message_source == "message" else "secondary diagnostic",
+                model="fixture-model",
+                llm_provider="hosted_vllm",
+                response=response,
+                body={"message": explanation} if message_source == "body" else None,
+            )
+    assert client_error_message(caught.value) == explanation
+
+
+@pytest.mark.parametrize("failure", ("http_status", "provider_status", "synthesized_status"))
+def test_a_real_provider_status_keeps_its_message_after_a_previous_timeout(
+    failure: Literal["http_status", "provider_status", "synthesized_status"],
+) -> None:
+    import litellm
+
+    explanation: Final = "The model service has no capacity available."
+    request: Final = httpx.Request("POST", "https://fixture.invalid/inference")
+    http_error: Final = httpx.HTTPStatusError(
+        explanation, request=request, response=httpx.Response(500, request=request, text=explanation)
+    )
+    provider_error: Final = (
+        http_error
+        if failure == "http_status"
+        else BaseLLMException(500, explanation, status_code_is_synthesized=failure == "synthesized_status")
+    )
+    try:
+        raise httpx.ReadTimeout("previous attempt timed out")
+    except httpx.ReadTimeout:
+        try:
+            if failure == "provider_status":
+                raise provider_error from http_error
+            raise provider_error
+        except (httpx.HTTPStatusError, BaseLLMException):
+            with pytest.raises(litellm.InternalServerError) as caught:
+                raise litellm.InternalServerError(
+                    message=f"Hosted_vllmException - {explanation}",
+                    model="fixture-model",
+                    llm_provider="hosted_vllm",
+                )
+    expected: Final = "The model service timed out." if failure == "synthesized_status" else explanation
+    assert client_error_message(caught.value) == expected
+
+
+@pytest.mark.parametrize(
+    "transport_error,expected",
+    (
+        (httpx.ConnectError("Cannot connect to host internal.example:8000"), "Could not reach the model service."),
+        (httpx.ReadTimeout("internal.example:8000 timed out"), "The model service timed out."),
+    ),
+)
+def test_a_native_provider_wrapper_still_sanitizes_transport_failures(
+    transport_error: httpx.TransportError, expected: str
+) -> None:
+    import litellm
+
+    try:
+        raise transport_error
+    except httpx.TransportError as original:
+        try:
+            raise AnthropicError(status_code=500, message=str(original))
+        except AnthropicError as wrapped:
+            with pytest.raises(litellm.InternalServerError) as caught:
+                raise litellm.InternalServerError(
+                    message=wrapped.message, model="fixture-model", llm_provider="anthropic"
+                )
+    assert client_error_message(caught.value) == expected
+
+
+@pytest.mark.parametrize("cause", (None, ValueError("current non-transport failure")))
+def test_an_explicit_cause_or_suppressed_context_ignores_a_previous_timeout(cause: Exception | None) -> None:
+    import litellm
+
+    explanation: Final = "quota exhausted for this key"
+    try:
+        raise httpx.ReadTimeout("previous attempt timed out")
+    except httpx.ReadTimeout:
+        with pytest.raises(litellm.InternalServerError) as caught:
+            raise litellm.InternalServerError(
+                message=f"Hosted_vllmException - {explanation}",
+                model="fixture-model",
+                llm_provider="hosted_vllm",
+            ) from cause
+    assert client_error_message(caught.value) == explanation
+
+
+def test_a_current_connection_failure_is_not_replaced_by_a_previous_timeout() -> None:
+    try:
+        raise httpx.ReadTimeout("previous attempt timed out")
+    except httpx.ReadTimeout:
+        with pytest.raises(httpx.ConnectError) as caught:
+            raise httpx.ConnectError("current attempt failed to connect")
+    assert client_error_message(caught.value) == "Could not reach the model service."
+
+
+@pytest.mark.timeout(10)
+def test_a_deep_retry_chain_with_shared_links_resolves_without_exploding():
+    import litellm
+
+    exc: Exception = httpx.ConnectError("root transport failure")
+    for _ in range(28):
+        try:
+            raise exc
+        except Exception as caught:
+            try:
+                raise RuntimeError("wrap") from caught
+            except RuntimeError as wrapped:
+                exc = wrapped
+    with pytest.raises(litellm.InternalServerError) as raised:
+        raise litellm.InternalServerError(
+            message="InternalServerError: Hosted_vllmException - Cannot connect to host internal.example:8000",
+            model="fixture-model",
+            llm_provider="hosted_vllm",
+        ) from exc
+    assert client_error_message(raised.value) == "Could not reach the model service."
 
 
 def test_responses_context_error_preserves_terminal_response_and_usage_through_router_wrapper():

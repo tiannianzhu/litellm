@@ -2,6 +2,7 @@ import asyncio
 import copy
 import datetime
 import json
+from collections.abc import Mapping
 from types import MappingProxyType, SimpleNamespace
 from typing import AsyncGenerator, Callable, Final, Iterator, Literal, Optional, Sequence
 from urllib.parse import unquote_plus
@@ -66,6 +67,255 @@ from litellm.proxy._types import UserAPIKeyAuth as ProxyUserAPIKeyAuth
 from litellm.proxy.utils import ProxyLogging
 from litellm.router import Router
 from litellm.router_utils.add_retry_fallback_headers import prepare_response_for_header_attachment
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+async def test_normal_inference_responses_preserve_content_and_response_headers(path: str) -> None:
+    from fastapi import FastAPI
+
+    frames: Final = ("event: message\ndata: {\"content\": \"literal litellm.BadRequestError: text\"}\n\n", "data: [DONE]\n\n")
+    headers: Final = {
+        "x-litellm-response-cost": "1.2e-06",
+        "retry-after": "Sat, 03 Oct 2026 09:00:00 GMT",
+        "x-ratelimit-reset-tokens": "2h5m3.5s",
+        "x-litellm-call-id": "call-fixture",
+        "x-fixture-header": "unchanged",
+    }
+    app: Final = FastAPI()
+
+    async def endpoint(request: Request) -> Response:
+        async def source() -> AsyncGenerator[str, None]:
+            for frame in frames:
+                yield frame
+
+        return await create_response(source(), "text/event-stream", headers, request=request)
+
+    app.add_api_route(path, endpoint, methods=["POST"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+        response: Final = await client.post(path)
+    assert response.status_code == 200
+    assert response.text == "".join(frames)
+    for key, value in headers.items():
+        assert response.headers[key] == value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+@pytest.mark.parametrize("failure_kind", ("output_limit", "context", "auth", "unsupported", "upstream_auth"))
+@pytest.mark.parametrize("started", (False, True))
+async def test_inference_stream_error_preserves_original_message_through_serialization(
+    monkeypatch: pytest.MonkeyPatch, path: str, failure_kind: str, started: bool
+) -> None:
+    from fastapi import FastAPI
+
+    from litellm.caching.caching import DualCache
+    from litellm.proxy import proxy_server
+    from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
+
+    requested: Final = 19
+    limit: Final = 13
+    error: Final = (
+        litellm.BadRequestError(
+            message=f"max_tokens={requested} exceeds the configured output token limit of {limit}",
+            model="fixture",
+            llm_provider="",
+        )
+        if failure_kind == "output_limit"
+        else litellm.ContextWindowExceededError(
+            message="Input exceeds this model context window.", model="fixture", llm_provider="fixture"
+        )
+        if failure_kind == "context"
+        else litellm.UnsupportedParamsError(message="This model always has reasoning enabled and cannot be disabled.")
+        if failure_kind == "unsupported"
+        else httpx.HTTPStatusError(
+            "gateway HTTP status line", request=httpx.Request("POST", "https://fixture.invalid/v1"),
+            response=httpx.Response(401, json={"error": {"message": "This credential has expired."}}),
+        )
+        if failure_kind == "upstream_auth"
+        else HTTPException(status_code=401, detail={"error": {"message": "This credential has expired."}})
+    )
+
+    class FailureObserver(CustomLogger):
+        def __init__(self) -> None:
+            self.failures: tuple[Exception, ...] = ()
+
+        async def async_post_call_failure_hook(
+            self,
+            request_data: Mapping[str, object],
+            original_exception: Exception,
+            user_api_key_dict: ProxyUserAPIKeyAuth,
+            traceback_str: Optional[str] = None,
+        ) -> None:
+            self.failures = (*self.failures, original_exception)
+
+    observer: Final = FailureObserver()
+    monkeypatch.setattr(litellm, "callbacks", [observer])
+    logging_obj: Final = ProxyLogging(user_api_key_cache=DualCache())
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", logging_obj)
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(litellm, "sse_keepalive_ping_interval_seconds", 0)
+    app: Final = FastAPI()
+
+    async def endpoint(request: Request) -> Response:
+        async def upstream() -> AsyncGenerator[bytes, None]:
+            if started:
+                yield b": ping\n\n"
+            raise error
+
+        data: Final = {"model": "fixture", "litellm_call_id": "call-fixture"}
+        auth: Final = ProxyUserAPIKeyAuth(api_key="sk-fixture")
+        generator: Final = (
+            ProxyBaseLLMRequestProcessing.async_sse_data_generator(upstream(), auth, data, logging_obj, request)
+            if path.endswith("messages")
+            else proxy_server.async_data_generator(
+                upstream(),
+                auth,
+                data,
+                request,
+                responses_stream_errors=path.endswith("responses"),
+                responses_error=ResponsesContextErrorFormatter("fixture") if path.endswith("responses") else None,
+            )
+        )
+        return await create_response(
+            generator, "text/event-stream", {"x-litellm-call-id": "call-fixture"}, request=request
+        )
+
+    app.add_api_route(path, endpoint, methods=["POST"])
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+        response: Final = await client.post(path)
+
+    assert response.status_code == (200 if started else 401 if failure_kind in ("auth", "upstream_auth") else 400)
+    assert response.headers["x-litellm-call-id"] == "call-fixture"
+    payload: Final = (
+        next(
+            json.loads(line.removeprefix("data: "))
+            for line in reversed(response.text.splitlines())
+            if line.startswith("data: {")
+        )
+        if started
+        else response.json()
+    )
+    detail: Final = payload["response"]["error"] if started and path.endswith("responses") else payload["error"]
+    if started and path.endswith("responses"):
+        assert payload["type"] == "response.failed"
+    if failure_kind == "output_limit":
+        assert f"max_tokens={requested}" in detail["message"]
+        assert f"limit of {limit}" in detail["message"]
+    elif failure_kind == "context":
+        assert detail["message"] == "Input exceeds this model context window."
+        if not path.endswith("messages"):
+            assert detail["code"] == "context_length_exceeded"
+    elif failure_kind == "unsupported":
+        assert detail["message"] == "This model always has reasoning enabled and cannot be disabled."
+    else:
+        assert detail["message"] == "This credential has expired."
+    if path.endswith("messages"):
+        assert detail["type"] == ("authentication_error" if failure_kind in ("auth", "upstream_auth") else "invalid_request_error")
+        if started:
+            assert "event: error\n" in response.text
+    assert "litellm." not in detail["message"]
+    assert observer.failures == (error,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ("/v1/chat/completions", "/v1/responses", "/v1/messages"))
+@pytest.mark.parametrize("phase", ("exception", "prefetch", "json"))
+@pytest.mark.parametrize("context_error", (False, True))
+async def test_inference_error_exits_after_keepalive_preserve_message_and_protocol(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, path: str, phase: str, context_error: bool
+) -> None:
+    from fastapi import FastAPI
+    from starlette.types import Message, Receive, Scope, Send
+
+    from litellm._logging import verbose_proxy_logger
+    from litellm.caching.caching import DualCache
+    from litellm.proxy import proxy_server
+    from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
+
+    requested: Final = 23
+    limit: Final = 17
+    error: Final = (
+        litellm.ContextWindowExceededError(
+            message="Input exceeds this model context window.", model="fixture", llm_provider="fixture"
+        )
+        if context_error
+        else litellm.BadRequestError(
+            message=f"max_tokens={requested} exceeds the configured output token limit of {limit}",
+            model="fixture",
+            llm_provider="",
+        )
+    )
+    opened: Final = asyncio.Event()
+    auth: Final = ProxyUserAPIKeyAuth(api_key="sk-fixture")
+    logging_obj: Final = ProxyLogging(user_api_key_cache=DualCache())
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(verbose_proxy_logger, "propagate", True)
+    app: Final = FastAPI()
+
+    async def endpoint(request: Request) -> Response:
+        async def produce() -> Response:
+            await opened.wait()
+            if phase == "exception":
+                raise error
+            if phase == "prefetch":
+
+                async def upstream() -> AsyncGenerator[str, None]:
+                    raise error
+                    yield ""
+
+                return await create_response(upstream(), "text/event-stream", {}, request=request)
+            processor: Final = ProxyBaseLLMRequestProcessing(
+                data={"model": "fixture", "proxy_server_request": {"url": str(request.url), "method": "POST"}}
+            )
+            try:
+                await processor._handle_llm_api_exception(error, auth, logging_obj)
+            except ProxyException as exc:
+                return await proxy_server.openai_exception_handler(request, exc)
+            return Response()
+
+        return await open_sse_before_first_byte(
+            produce(),
+            0.001,
+            request=request,
+            responses_error=ResponsesContextErrorFormatter("fixture") if path.endswith("responses") else None,
+        )
+
+    app.add_api_route(path, endpoint, methods=["POST"])
+
+    async def gate(scope: Scope, receive: Receive, send: Send) -> None:
+        async def observe(message: Message) -> None:
+            await send(message)
+            if message.get("body") == b": ping\n\n":
+                opened.set()
+
+        await app(scope, receive, observe)
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(gate), base_url="http://fixture") as client:
+        response: Final = await client.post(path)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    payload: Final = next(
+        json.loads(line.removeprefix("data: "))
+        for line in reversed(response.text.splitlines())
+        if line.startswith("data: {")
+    )
+    detail: Final = payload["response"]["error"] if "response" in payload else payload.get("error", payload)
+    if context_error:
+        assert detail["message"] == "Input exceeds this model context window."
+        if not path.endswith("messages"):
+            assert detail["code"] == "context_length_exceeded"
+    else:
+        assert f"max_tokens={requested}" in detail["message"]
+        assert f"limit of {limit}" in detail["message"]
+        if path.endswith("responses"):
+            assert detail["code"] == "invalid_request_error"
+    if path.endswith("messages"):
+        assert "event: error\n" in response.text
+        assert payload["type"] == "error" and detail["type"] == "invalid_request_error"
+    assert "litellm." not in detail["message"]
+    assert any(str(error) in record.getMessage() for record in caplog.records)
 
 
 def test_attach_guardrail_information_copies_recorded_entries_onto_model_response():
@@ -8968,6 +9218,7 @@ async def test_base_process_llm_request_pings_while_the_upstream_call_is_still_r
 def _request_disconnecting_after(delay_seconds):
     """A Request whose ASGI channel delivers one http.disconnect, then goes quiet."""
     request = MagicMock(spec=Request)
+    request.scope = {"type": "http", "method": "POST", "path": "/fixture-stream", "headers": []}
     delivered = {"done": False}
 
     async def receive():
@@ -9114,7 +9365,9 @@ async def test_a_failing_audit_hook_never_costs_the_client_its_error_frame():
 
 
 @pytest.mark.asyncio
-async def test_base_process_llm_request_audits_a_failure_that_lands_after_its_keepalive():
+async def test_base_process_llm_request_audits_a_failure_that_lands_after_its_keepalive(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+):
     """The helper honouring on_late_failure is not enough: this pins that the shared
     funnel actually passes one, which is where the route's own except would have
     fired before the response was opened early."""
@@ -9128,12 +9381,15 @@ async def test_base_process_llm_request_audits_a_failure_that_lands_after_its_ke
     # back a MagicMock, which the code correctly reads as a sanitized replacement.
     proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
     user_api_key_dict = MagicMock(spec=UserAPIKeyAuth)
-    processor = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4o", "stream": True})
+    from litellm._logging import verbose_proxy_logger
+
+    monkeypatch.setattr(verbose_proxy_logger, "propagate", True)
+    processor = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4o", "stream": True, "litellm_call_id": "call-fixture"})
 
     with patch.object(litellm, "sse_keepalive_ping_interval_seconds", 0.05):
         with patch.object(ProxyBaseLLMRequestProcessing, "_process_llm_request", slow_failure):
             response = await processor.base_process_llm_request(
-                request=MagicMock(spec=Request),
+                request=Request({"type": "http", "method": "POST", "path": "/fixture-stream", "headers": []}),
                 fastapi_response=Response(),
                 user_api_key_dict=user_api_key_dict,
                 route_type="acompletion",
@@ -9148,6 +9404,10 @@ async def test_base_process_llm_request_audits_a_failure_that_lands_after_its_ke
     assert call["user_api_key_dict"] is user_api_key_dict
     assert call["request_data"] is processor.data
     assert getattr(call["original_exception"], "detail", None) == "upstream exploded"
+    assert any(
+        getattr(record, "litellm_call_id", None) == "call-fixture" and "upstream exploded" in record.getMessage()
+        for record in caplog.records
+    )
 
     assert collected[0] == TTFT_PING
     assert collected[-1] == b"data: [DONE]\n\n"
