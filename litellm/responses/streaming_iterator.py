@@ -3222,6 +3222,7 @@ class ManagedResponsesWebSocketHandler:
         first_message: str | None = None,
         quota_callbacks: Sequence[ProjectQuotaCallback] | None = None,
         turn_admission: ResponsesWsTurnAdmission | None = None,
+        request_defaults: ResponsesWebSocketRequestDefaults | None = None,
         frame_guard: ResponsesWsFrameGuard | None = None,
         guardrail_callbacks: Sequence[PresidioGuardrailCallback] | None = None,
         **kwargs: object,
@@ -3246,6 +3247,7 @@ class ManagedResponsesWebSocketHandler:
         self.first_message = first_message
         self.quota_callbacks: tuple[ProjectQuotaCallback, ...] = tuple(quota_callbacks) if quota_callbacks else ()
         self.turn_admission: ResponsesWsTurnAdmission | None = turn_admission
+        self.request_defaults = request_defaults
         self._failure: Exception | None = None
         # Carry through safe pass-through kwargs (e.g. extra_headers)
         self.extra_kwargs: dict[str, object] = {k: v for k, v in kwargs.items() if k not in _MANAGED_WS_SKIP_KWARGS}
@@ -3698,7 +3700,10 @@ class ManagedResponsesWebSocketHandler:
         if guarded.pii_tokens:
             self._pii_tokens = {**self._pii_tokens, **guarded.pii_tokens}
 
-        call_kwargs: Final = self._build_base_call_kwargs(_load_json_object(guarded.frame))
+        frame_kwargs: Final = self._build_base_call_kwargs(_load_json_object(guarded.frame))
+        call_kwargs: Final = (
+            self.request_defaults.merged_into(frame_kwargs) if self.request_defaults is not None else frame_kwargs
+        )
         call_kwargs["stream"] = True
 
         # A frame that repeats the connection's public alias (model_group) must
@@ -3723,7 +3728,11 @@ class ManagedResponsesWebSocketHandler:
                 call_kwargs.get("litellm_metadata"), guarded.guardrail_information
             )
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
-        call_kwargs.update(self.extra_kwargs)
+        call_kwargs.update(
+            {key: value for key, value in self.extra_kwargs.items() if key not in _RESPONSE_CREATE_PARAMS}
+            if self.request_defaults is not None
+            else self.extra_kwargs
+        )
         turn_litellm_metadata: Final = call_kwargs.get("litellm_metadata")
         call_kwargs["litellm_metadata"] = {
             **(turn_litellm_metadata if _is_json_object(turn_litellm_metadata) else {}),

@@ -43,7 +43,7 @@ from collections.abc import (
     Sequence,
 )
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache, partial
 from itertools import chain
@@ -271,6 +271,7 @@ from litellm.router_strategy.auto_router.auto_router_model_naming import (
 from litellm.router_strategy.base_routing_strategy import BaseRoutingStrategy
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
 from litellm.router_strategy.complexity_router.context_compaction import (
+    Surface,
     arm_compaction,
     compact_to_fit,
     compaction_pending,
@@ -544,6 +545,7 @@ if TYPE_CHECKING:
     from litellm.exceptions import MidStreamFallbackError
     from litellm.responses.streaming_iterator import (
         BaseResponsesAPIStreamingIterator,
+        ResponsesWsFrameGuard,
     )
     from litellm.router_api import UntypedDict
     from litellm.router_strategy.adaptive_router.adaptive_router import (
@@ -1268,6 +1270,79 @@ class FallbackAwareStreamWrapper(CustomStreamWrapper):
                 "response_cost": None,
             }
         self.fallback_headers_adopted = True
+
+
+_TOKEN_LIMIT_MAPPING_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+
+
+def _output_limit_error(caps: tuple[tuple[str, object], ...], limit: int) -> str | None:
+    for field, value in caps:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"{field} must be a positive integer"
+        if value > limit:
+            return f"{field}={value} exceeds the configured output token limit of {limit}"
+    if len(frozenset(value for _, value in caps)) > 1:
+        return "Conflicting output token limits: " + ", ".join(f"{field}={value}" for field, value in caps)
+    return None
+
+
+def _deployment_output_token_params(
+    deployment: Mapping[str, object], request: Mapping[str, object], surface: Surface | None
+) -> Mapping[str, object]:
+    if surface is None:
+        return MappingProxyType({})
+    info: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment.get("model_info") or {})
+    limit: Final = coerce_token_limit(info.get("max_output_tokens"))
+    if limit is None:
+        return MappingProxyType({})
+    params: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment.get("litellm_params") or {})
+    extra: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(request.get("extra_body") or {})
+    client_caps: Final = tuple(
+        (key, value) for key, value in request.items() if key in OUTPUT_TOKEN_CEILING_PARAMS and value is not None
+    ) + tuple(
+        (f"extra_body.{key}", value)
+        for key, value in extra.items()
+        if key in OUTPUT_TOKEN_CEILING_PARAMS and value is not None
+    )
+    field: Final = (
+        "max_output_tokens"
+        if surface == "responses"
+        else "max_completion_tokens"
+        if surface == "chat" and request.get("max_completion_tokens") is not None
+        else "max_tokens"
+    )
+    default: Final = next(
+        (
+            params[key]
+            for key in (field, "max_tokens", "max_completion_tokens", "max_output_tokens")
+            if params.get(key) is not None
+        ),
+        limit,
+    )
+    selected_caps: Final = client_caps or ((field, default),)
+    error: Final = _output_limit_error(selected_caps, limit)
+    if error is not None:
+        raise litellm_exceptions.BadRequestError(
+            message=error, model=str(deployment.get("model_name", "")), llm_provider=""
+        )
+    merged_extra: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(
+        request.get("extra_body", params.get("extra_body")) or {}
+    )
+    return MappingProxyType(
+        {
+            **{key: None for key in OUTPUT_TOKEN_CEILING_PARAMS},
+            field: selected_caps[0][1],
+            **(
+                {
+                    "extra_body": {
+                        key: value for key, value in merged_extra.items() if key not in OUTPUT_TOKEN_CEILING_PARAMS
+                    }
+                }
+                if merged_extra
+                else {}
+            ),
+        }
+    )
 
 
 def as_output_cap(value: object) -> int | None:
@@ -3572,6 +3647,11 @@ class PythonCore(DeprecatedRouterMembers):
                     "caching": self._core_cache_responses,
                     "client": model_client,
                     **kwargs,
+                    **_deployment_output_token_params(
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                        "chat",
+                    ),
                 }
             )
             response: Final = self._host.invoke("completion")(**input_kwargs)
@@ -5037,6 +5117,11 @@ class PythonCore(DeprecatedRouterMembers):
                     "caching": self._core_cache_responses,
                     "client": model_client,
                     **kwargs,
+                    **_deployment_output_token_params(
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                        "chat",
+                    ),
                 }
             )
 
@@ -6857,9 +6942,22 @@ class PythonCore(DeprecatedRouterMembers):
                 "model": model_name,
                 **_with_router_resolved_session_model(kwargs.get("session"), model_name),
                 **(
-                    {"turn_admission": partial(self.async_admit_deployment_turn, model, deployment, kwargs)}
+                    {
+                        "turn_admission": partial(self.async_admit_deployment_turn, model, deployment, kwargs),
+                        "responses_ws_frame_guard": self._responses_ws_output_guard(
+                            _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                            kwargs.get("responses_ws_frame_guard"),
+                        ),
+                    }
                     if generic_function_name == "_aresponses_websocket"
                     else {}
+                ),
+                **_deployment_output_token_params(
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                    "responses"
+                    if generic_function_name == "_aresponses_websocket"
+                    else surface_for_call(generic_function_name),
                 ),
             }
             # Only set custom_llm_provider if it's not None
@@ -7638,6 +7736,11 @@ class PythonCore(DeprecatedRouterMembers):
                     "custom_llm_provider": custom_llm_provider,
                     "caching": self._core_cache_responses,
                     **kwargs,
+                    **_deployment_output_token_params(
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                        surface_for_call(handler_name) or surface_for_call("a" + handler_name),
+                    ),
                 }
             )
 
@@ -10690,6 +10793,38 @@ class PythonCore(DeprecatedRouterMembers):
         )
         current: Final = self._core_get_deployment(model_id) if isinstance(model_id, str) else None
         return deployment if current is None else current.model_dump(exclude_none=True)
+
+    def _responses_ws_output_guard(
+        self, deployment: Mapping[str, object], frame_guard: object
+    ) -> "ResponsesWsFrameGuard":
+        from litellm.responses.streaming_iterator import GuardedResponsesWsFrame, ResponsesWsFrameGuard
+
+        original: Final = TypeAdapter(ResponsesWsFrameGuard | None).validate_python(frame_guard)
+
+        async def guard(message: str) -> GuardedResponsesWsFrame:
+            guarded: Final = await original(message) if original is not None else GuardedResponsesWsFrame(frame=message)
+            frame: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_json(guarded.frame)
+            nested: Final = frame.get("response")
+            body: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(nested) if isinstance(nested, Mapping) else frame
+            try:
+                limits: Final = _deployment_output_token_params(
+                    self._deployment_as_configured_now(deployment), body, "responses"
+                )
+            except litellm_exceptions.BadRequestError as error:
+                if guarded.bill_refusal is not None:
+                    guarded.bill_refusal(error)
+                raise
+            if not limits:
+                return guarded
+            bounded: Final = {
+                key: value
+                for key, value in {**body, **limits}.items()
+                if key not in OUTPUT_TOKEN_CEILING_PARAMS or value is not None
+            }
+            rewritten: Final = {**frame, "response": bounded} if isinstance(nested, Mapping) else bounded
+            return replace(guarded, frame=json.dumps(rewritten))
+
+        return guard
 
     async def async_admit_deployment_turn(
         self,
