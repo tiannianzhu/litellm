@@ -19,9 +19,6 @@ from typing_extensions import ReadOnly, TypedDict
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import EMPTY_MAPPING
 from litellm.integrations.custom_guardrail import ModifyResponseException
-from litellm.litellm_core_utils.exception_mapping_utils import (
-    extract_error_message_from_string,
-)
 from litellm.llms.openai.responses.guardrail_translation.handler import (
     OpenAIResponsesHandler,
     build_blocked_response,
@@ -37,7 +34,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_set_request_parsed_body,
 )
-from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter
+from litellm.proxy.common_utils.openai_error_payload import ResponsesContextErrorFormatter, client_error_message
 from litellm.proxy.route_llm_request import raise_if_required_body_param_missing
 from litellm.types.llms.openai import (
     REASONING_EFFORT,
@@ -78,13 +75,9 @@ _TOOL_PAYLOAD_KEYS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 _EMPTY_TOOL_PAYLOAD: Final[Mapping[str, object]] = MappingProxyType({})
 
 
-def _extract_responses_error_message(raw_message: str) -> str:
-    return extract_error_message_from_string(raw_message) or raw_message
-
-
 def _normalize_responses_api_exception(exception: ProxyException) -> ProxyException:
     return ProxyException(
-        message=_extract_responses_error_message(exception.message),
+        message=client_error_message(exception),
         type=exception.type,
         param=exception.param,
         code=exception.code,

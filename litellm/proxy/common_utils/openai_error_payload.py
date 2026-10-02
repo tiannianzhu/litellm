@@ -5,18 +5,25 @@ string ``"None"`` satisfies."""
 import time
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
+from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import status
+import httpx
+from fastapi import Request, status
+from pydantic import TypeAdapter
 
 from litellm.constants import STRINGIFIED_NONE
 from litellm.proxy._types import ProxyException
 
 LITELLM_CALL_ID_HEADER: Final = "x-litellm-call-id"
 from litellm._logging import redact_internal_details_from_client_message
-from litellm.exceptions import ContextWindowExceededError
-from litellm.litellm_core_utils.exception_mapping_utils import extract_error_message_from_string
+from litellm.exceptions import LITELLM_EXCEPTION_TYPES, ContextWindowExceededError, MidStreamFallbackError
+from litellm.litellm_core_utils.bug_report import strip_bug_report_notice
+from litellm.litellm_core_utils.exception_mapping_utils import (
+    extract_error_message_from_dict,
+    extract_error_message_from_string,
+)
 from litellm.router_utils.add_retry_fallback_headers import HiddenParamsAsyncIteratorWrapper
 from litellm.types.llms.openai import ResponsesAPIResponse
 
@@ -27,6 +34,88 @@ _OPENAI_ERROR_TYPE_BY_STATUS: Final[Mapping[int, str]] = MappingProxyType(
         status.HTTP_429_TOO_MANY_REQUESTS: "rate_limit_error",
     }
 )
+_ERROR_MAPPING: Final = TypeAdapter(Mapping[str, object])
+_EXCEPTION_PREFIXES: Final = frozenset(f"litellm.{exception.__name__}" for exception in LITELLM_EXCEPTION_TYPES)
+_ROUTER_MESSAGE_SUFFIXES: Final = (
+    "\n\nLiteLLM: model group '",
+    "\n\nDeployment Info:",
+)
+
+
+def inference_error_surface(path: str, method: str = "POST") -> Literal["chat", "responses", "messages"] | None:
+    if method != "POST":
+        return None
+    normalized: Final = urlsplit(path).path.rstrip("/")
+    if normalized in ("/responses", "/v1/responses", "/openai/v1/responses"):
+        return "responses"
+    if normalized in ("/v1/messages", "/anthropic/v1/messages"):
+        return "messages"
+    if normalized in ("/chat/completions", "/v1/chat/completions", "/cursor/chat/completions") or (
+        normalized.endswith("/chat/completions") and normalized.startswith(("/engines/", "/openai/deployments/"))
+    ):
+        return "chat"
+    return None
+
+
+def inference_request_surface(request: Request) -> Literal["chat", "responses", "messages"] | None:
+    scope: Final = _ERROR_MAPPING.validate_python(request.scope)
+    route_path: Final = attribute_of(scope.get("route"), "path")
+    root_path: Final = scope.get("root_path", "")
+    return inference_error_surface(
+        route_path
+        if isinstance(route_path, str)
+        else request.url.path.removeprefix(root_path if isinstance(root_path, str) else ""),
+        request.method,
+    )
+
+
+def _message_from_value(value: object) -> str | None:
+    if isinstance(value, str):
+        return extract_error_message_from_string(value) or value or None
+    if not isinstance(value, Mapping):
+        return None
+    mapping: Final = _ERROR_MAPPING.validate_python(value)
+    return extract_error_message_from_dict(mapping) or next(
+        (text for key in ("detail", "error") if isinstance(text := mapping.get(key), str)), None
+    )
+
+
+def _response_error_message(exc: object) -> str | None:
+    response: Final = attribute_of(exc, "response")
+    if not isinstance(response, httpx.Response):
+        return None
+    try:
+        text: Final = response.text
+    except httpx.ResponseNotRead:
+        return None
+    return (
+        _message_from_value(text) if isinstance(exc, httpx.HTTPStatusError) else extract_error_message_from_string(text)
+    )
+
+
+def client_error_message(exc: object) -> str:
+    if isinstance(exc, MidStreamFallbackError) and exc.original_exception is not None:
+        return client_error_message(exc.original_exception)
+    source: Final = (
+        next(
+            (
+                message
+                for value in (attribute_of(exc, "body"), attribute_of(exc, "detail"))
+                if (message := _message_from_value(value)) is not None
+            ),
+            None,
+        )
+        or _response_error_message(exc)
+        or _message_from_value(attribute_of(exc, "message"))
+        or _message_from_value(exc)
+    )
+    raw: Final = source if source is not None else str(exc)
+    prefix, separator, remainder = raw.partition(": ")
+    unwrapped: Final = client_error_message(remainder) if separator and prefix in _EXCEPTION_PREFIXES else raw
+    end: Final = min(
+        (unwrapped.find(marker) for marker in _ROUTER_MESSAGE_SUFFIXES if marker in unwrapped), default=len(unwrapped)
+    )
+    return redact_internal_details_from_client_message(strip_bug_report_notice(unwrapped[:end].rstrip()))
 
 
 def attribute_of(value: object, name: str, default: object = None) -> object:
@@ -41,6 +130,10 @@ def error_status_code(exc: object, default: int) -> int:
         return carried
     stringified: Final = attribute_of(exc, "code")
     return int(stringified) if isinstance(stringified, str) and stringified.isdecimal() else default
+
+
+def inference_error_status_code(exc: object) -> int:
+    return exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else error_status_code(exc, 500)
 
 
 def openai_error_type(exc: object, status_code: int) -> str:
@@ -85,6 +178,8 @@ def headers_with_litellm_call_id(headers: Mapping[str, str] | None, litellm_call
 
 
 def is_context_window_error(exc: object) -> bool:
+    if isinstance(exc, MidStreamFallbackError) and exc.original_exception is not None:
+        return is_context_window_error(exc.original_exception)
     return isinstance(exc, ContextWindowExceededError) or any(
         attribute_of(exc, field) == "context_length_exceeded" for field in ("code", "openai_code")
     )
@@ -108,11 +203,7 @@ class ResponsesContextErrorFormatter:
     def format(self, exc: Exception, *, stream: object = None) -> str | None:
         if not is_context_window_error(exc):
             return None
-        raw_message: Final = attribute_of(exc, "message", str(exc))
-        message: Final = raw_message if isinstance(raw_message, str) else str(exc)
-        safe_message: Final = redact_internal_details_from_client_message(
-            extract_error_message_from_string(message) or message
-        )
+        safe_message: Final = client_error_message(exc)
         source: Final = (
             attribute_of(stream, "_inner") if isinstance(stream, HiddenParamsAsyncIteratorWrapper) else stream
         )

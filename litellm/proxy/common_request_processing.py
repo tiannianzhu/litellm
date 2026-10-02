@@ -100,11 +100,16 @@ from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
     ResponsesContextErrorFormatter,
     attribute_of,
+    client_error_message,
     error_status_code,
+    inference_error_status_code,
+    inference_error_surface,
+    inference_request_surface,
     is_context_window_error,
     openai_error_param,
     openai_error_type,
 )
+from litellm.proxy.common_utils.responses_stream_errors import responses_error_code
 from litellm.proxy.common_utils.sse_keepalive import (
     SSE_COMMENT_PING_BYTES,
     SSE_STREAM_START_TAIL,
@@ -929,14 +934,18 @@ async def _buffer_first_chunk_honoring_disconnect(
     raise _ClientDisconnectedBeforeFirstChunk()
 
 
-def sse_error_payload(exc: BaseException) -> tuple[int, Mapping[str, object]]:
+def sse_error_payload(exc: BaseException, *, clean_message: bool = False) -> tuple[int, Mapping[str, object]]:
     """Build the ProxyException-shaped ``{"error": ...}`` body used in SSE error frames.
 
     Matches ``ProxyException.to_dict()`` so streaming and non-streaming error frames
     are byte-identical.
     """
     # Preserve status code from HTTPException (e.g. guardrail blocks)
-    error_status: Final = error_status_code(exc, status.HTTP_500_INTERNAL_SERVER_ERROR)
+    error_status: Final = (
+        inference_error_status_code(exc)
+        if clean_message
+        else error_status_code(exc, status.HTTP_500_INTERNAL_SERVER_ERROR)
+    )
     raw_detail: Final = attribute_of(exc, "detail", "Error processing stream start")
     message, structured_fields = serialize_http_exception_detail(raw_detail)
 
@@ -944,10 +953,10 @@ def sse_error_payload(exc: BaseException) -> tuple[int, Mapping[str, object]]:
     merged_fields: Final = {**existing_fields, **structured_fields} if structured_fields else (existing_fields or None)
 
     error_obj: Final = {
-        "message": message,
+        "message": client_error_message(exc) if clean_message else message,
         "type": openai_error_type(exc, error_status),
         "param": openai_error_param(exc),
-        "code": str(error_status),
+        "code": "context_length_exceeded" if clean_message and is_context_window_error(exc) else str(error_status),
     }
     if not merged_fields:
         return error_status, error_obj
@@ -977,6 +986,7 @@ async def _resolve_stream_headers(
 
 
 _NO_GENERAL_SETTINGS: Final[Mapping[str, object]] = MappingProxyType({})
+_ERROR_REQUEST_DATA: Final = TypeAdapter(Mapping[str, object])
 
 
 async def create_response(
@@ -1008,6 +1018,27 @@ async def create_response(
         # Now get the first chunk from the actual generator
         first_chunk_value = await _buffer_first_chunk_honoring_disconnect(generator, request)
         resolved_headers: Final = await _resolve_stream_headers(headers, refresh_headers)
+
+        stream_exception: Final = request.scope.get("litellm_stream_exception") if request is not None else None
+        if isinstance(stream_exception, Exception) and not isinstance(first_chunk_value, AnthropicErrorSseFrame):
+            with contextlib.suppress(Exception):
+                await generator.aclose()
+            error_status, error_detail = sse_error_payload(stream_exception, clean_message=True)
+            error_payload: Final = (
+                {**error_detail, "code": responses_error_code(stream_exception)}
+                if request is not None and inference_request_surface(request) == "responses"
+                else error_detail
+            )
+            return JSONResponse(
+                status_code=error_status,
+                content={
+                    "error": with_call_id(
+                        JSON_OBJECT.validate_python(error_payload),
+                        error_body_call_id(general_settings, resolved_headers.get(LITELLM_CALL_ID_HEADER)),
+                    )
+                },
+                headers=resolved_headers,
+            )
 
         if isinstance(first_chunk_value, AnthropicErrorSseFrame):
             with contextlib.suppress(Exception):
@@ -1082,9 +1113,24 @@ async def create_response(
         )
     except Exception as e:
         # Unexpected error consuming first chunk.
-        verbose_proxy_logger.exception("Error consuming first chunk from generator: %s", e)
+        log_llm_api_exception(e, headers.get(LITELLM_CALL_ID_HEADER))
 
-        error_status, error_obj = sse_error_payload(e)
+        surface: Final = inference_request_surface(request) if request is not None else None
+        error_status, error_obj = sse_error_payload(e, clean_message=surface is not None)
+        if surface is not None:
+            body: Final = (
+                anthropic_error_sse_frame(error_status, client_error_message(e)).json_body(
+                    error_body_call_id(general_settings, headers.get(LITELLM_CALL_ID_HEADER))
+                )
+                if surface == "messages"
+                else {
+                    "error": with_call_id(
+                        JSON_OBJECT.validate_python(error_obj),
+                        error_body_call_id(general_settings, headers.get(LITELLM_CALL_ID_HEADER)),
+                    )
+                }
+            )
+            return JSONResponse(status_code=error_status, content=body, headers=headers)
 
         async def error_gen_message() -> AsyncGenerator[str, None]:
             for frame in _sse_error_frames(error_obj):
@@ -1170,9 +1216,31 @@ async def _aclose_late_response(produced: Response) -> None:
             verbose_proxy_logger.debug("error closing relayed streaming generator: %s", exc)
 
 
-async def _relay_late_response(produced: Response) -> AsyncGenerator[bytes, None]:
+async def _relay_late_response(produced: Response, request: Request | None = None) -> AsyncGenerator[bytes, None]:
     """Replay a Response that was built after a keepalive had already opened the wire."""
     if not isinstance(produced, StreamingResponse):
+        surface: Final = inference_request_surface(request) if request is not None else None
+        if produced.status_code >= 400 and surface == "messages":
+            yield b"event: error\ndata: " + bytes(produced.body) + b"\n\n"
+            return
+        if produced.status_code >= 400 and surface == "responses":
+            from litellm.proxy.common_utils.responses_stream_errors import ResponsesStreamErrorState
+
+            payload: Final = JSON_OBJECT.validate_json(bytes(produced.body))
+            detail: Final = JSON_OBJECT.validate_python(payload.get("error", payload))
+            code: Final = detail.get("code")
+            frame: Final = ResponsesStreamErrorState().format_failure(
+                ProxyException(
+                    message=client_error_message(detail),
+                    type="invalid_request_error" if produced.status_code < 500 else "internal_server_error",
+                    param=None,
+                    code=produced.status_code,
+                    openai_code=code if isinstance(code, str) else None,
+                )
+            )
+            if frame is not None:
+                yield frame.encode()
+            return
         # The status line is already on the wire, so a non-streaming body, an error
         # body included, can only reach the client as an SSE frame.
         yield b"data: " + (bytes(produced.body) or b"{}") + b"\n\n"
@@ -1219,6 +1287,7 @@ async def open_sse_before_first_byte(
     media_type: str = "text/event-stream",
     on_late_failure: Callable[[Exception], Awaitable[HTTPException | None]] | None = None,
     responses_error: ResponsesContextErrorFormatter | None = None,
+    request: Request | None = None,
 ) -> _LateResponseT | StreamingResponse:
     """Write SSE keepalive comments while the upstream LLM call is still in flight.
 
@@ -1255,9 +1324,8 @@ async def open_sse_before_first_byte(
             try:
                 produced: Final = produce_task.result()
             except Exception as exc:  # noqa: BLE001  # the status line is already sent; surface it as a frame
-                verbose_proxy_logger.exception(
-                    "request failed after its SSE keepalive had opened the response: %s", exc
-                )
+                if on_late_failure is None:
+                    log_llm_api_exception(exc, None)
                 # The caller's own `except` never sees this, so its failure hook
                 # would never fire and the failure would go unaudited. The hook
                 # also gets to sanitize what reaches the client, by returning or
@@ -1267,11 +1335,24 @@ async def open_sse_before_first_byte(
                 if responses_frame is not None:
                     yield responses_frame.encode()
                     return
-                _, error_obj = sse_error_payload(sanitized)
+                surface: Final = inference_request_surface(request) if request is not None else None
+                if surface == "messages":
+                    yield anthropic_error_sse_frame(
+                        inference_error_status_code(sanitized), client_error_message(sanitized)
+                    ).encode()
+                    return
+                if surface == "responses":
+                    from litellm.proxy.common_utils.responses_stream_errors import ResponsesStreamErrorState
+
+                    failed_frame: Final = ResponsesStreamErrorState().format_failure(sanitized)
+                    if failed_frame is not None:
+                        yield failed_frame.encode()
+                    return
+                _, error_obj = sse_error_payload(sanitized, clean_message=surface is not None)
                 for frame in _sse_error_frames(error_obj):
                     yield frame.encode()
                 return
-            async for chunk in _relay_late_response(produced):
+            async for chunk in _relay_late_response(produced, request):
                 yield chunk
         finally:
             if not produce_task.done():
@@ -2516,6 +2597,7 @@ class ProxyBaseLLMRequestProcessing:
         async def _audit_late_failure(exc: Exception) -> HTTPException | None:
             # Once a keepalive is on the wire this can no longer raise, so the
             # caller's `except` never runs its own post_call_failure_hook.
+            log_llm_api_exception(exc, self.litellm_call_id)
             return await proxy_logging_obj.post_call_failure_hook(
                 user_api_key_dict=user_api_key_dict,
                 original_exception=exc,
@@ -2547,6 +2629,7 @@ class ProxyBaseLLMRequestProcessing:
             ping_interval_seconds=ttft_keepalive_interval(self.data, llm_router),
             on_late_failure=_audit_late_failure,
             responses_error=responses_error,
+            request=request,
         )
 
     async def _process_llm_request(
@@ -3724,6 +3807,15 @@ class ProxyBaseLLMRequestProcessing:
 
         self._apply_router_cooldown_retry_after(safe_headers, e)
 
+        proxy_request: Final = _ERROR_REQUEST_DATA.validate_python(self.data.get("proxy_server_request") or {})
+        request_method: Final = proxy_request.get("method", "POST")
+        inference: Final = (
+            inference_error_surface(
+                str(proxy_request.get("url", "")), request_method if isinstance(request_method, str) else ""
+            )
+            is not None
+        )
+
         if isinstance(e, ProxyException):
             e.headers = {
                 **{k: v for k, v in e.headers.items() if k.lower() not in UNSAFE_PROXY_RESPONSE_HEADERS},
@@ -3741,12 +3833,20 @@ class ProxyBaseLLMRequestProcessing:
             error_text: Final = error_body.decode("utf-8")
 
             error_headers: Final = {k: v if isinstance(v, str) else str(v) for k, v in safe_headers.items()}
+            if inference:
+                raise ProxyException(
+                    message=client_error_message(e),
+                    type=openai_error_type(e, http_status_error.response.status_code),
+                    param=openai_error_param(e),
+                    code=http_status_error.response.status_code,
+                    headers=TypeAdapter(dict[str, str]).validate_python(error_headers),
+                ) from e
             raise HTTPException(
                 status_code=http_status_error.response.status_code,
                 detail={"error": error_text},
                 headers=error_headers,
             )
-        error_msg: Final = f"{e}"
+        error_msg: Final = client_error_message(e) if inference else f"{e}"
         # Check for AttributeError in the exception chain.
         # The AttributeError may be wrapped in multiple layers
         # (e.g. AttributeError -> OpenAIException -> APIConnectionError),
@@ -3789,7 +3889,9 @@ class ProxyBaseLLMRequestProcessing:
                 )
         client_message: Final = getattr(e, "message", error_msg)
         raise ProxyException(
-            message=redact_internal_details_from_client_message(
+            message=client_error_message(e)
+            if inference
+            else redact_internal_details_from_client_message(
                 strip_bug_report_notice(client_message) if isinstance(client_message, str) else error_msg
             ),
             type=openai_error_type(e, _code),
@@ -4004,9 +4106,7 @@ class ProxyBaseLLMRequestProcessing:
                 await release_budget_reservation_on_cancel(getattr(user_api_key_dict, "budget_reservation", None))
             raise
         except Exception as e:
-            verbose_proxy_logger.exception(
-                "litellm.proxy.proxy_server.async_data_generator(): Exception occured - %s", e
-            )
+            log_llm_api_exception(e, request_litellm_call_id(_ERROR_REQUEST_DATA.validate_python(request_data)))
             transformed_exception: Final = await proxy_logging_obj.post_call_failure_hook(
                 user_api_key_dict=user_api_key_dict,
                 original_exception=e,
@@ -4019,14 +4119,22 @@ class ProxyBaseLLMRequestProcessing:
                 e,
             )
 
-            if isinstance(e, HTTPException):
+            inference: Final = request is not None and inference_request_surface(request) is not None
+            if isinstance(e, HTTPException) and not inference:
                 raise e
-            stream_error_status: Final = error_status_code(e, status.HTTP_500_INTERNAL_SERVER_ERROR)
+            stream_error_status: Final = (
+                inference_error_status_code(e)
+                if inference
+                else error_status_code(e, status.HTTP_500_INTERNAL_SERVER_ERROR)
+            )
             proxy_exception: Final = ProxyException(
-                message=redact_internal_details_from_client_message(getattr(e, "message", str(e))),
+                message=client_error_message(e)
+                if inference
+                else redact_internal_details_from_client_message(getattr(e, "message", str(e))),
                 type=openai_error_type(e, stream_error_status),
                 param=openai_error_param(e),
                 code=stream_error_status,
+                openai_code="context_length_exceeded" if is_context_window_error(e) else getattr(e, "code", None),
             )
             stream_completed = True
             error_frame: Final = serialize_error(proxy_exception)

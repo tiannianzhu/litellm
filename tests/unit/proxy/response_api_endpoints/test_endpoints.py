@@ -22,9 +22,59 @@ from litellm.types.llms.openai import ResponsesAPIResponse
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "path,field",
+    (("/v1/chat/completions", "max_tokens"), ("/v1/responses", "max_output_tokens"), ("/v1/messages", "max_tokens")),
+)
+async def test_configured_output_token_limits_are_actionable_through_the_real_router(monkeypatch, path, field):
+    import litellm.proxy.proxy_server as ps
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+
+    limit: Final = 13
+    requested: Final = 19
+    router: Final = litellm.Router(
+        model_list=[
+            {
+                "model_name": "fixture-public",
+                "litellm_params": {
+                    "model": "openai/fixture-backend",
+                    "api_base": "https://fixture.invalid/v1",
+                    "api_key": "fixture-key",
+                },
+                "model_info": {"max_output_tokens": limit},
+            }
+        ],
+        num_retries=0,
+    )
+    monkeypatch.setattr(ps, "llm_router", router)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setitem(app.dependency_overrides, user_api_key_auth, _auth_override)
+    body: Final = {
+        "model": "fixture-public",
+        field: requested,
+        **({"input": "hello"} if path.endswith("responses") else {"messages": [{"role": "user", "content": "hello"}]}),
+    }
+    with respx.mock as transport:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://fixture") as client:
+            response: Final = await client.post(path, json=body)
+        assert not transport.calls
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert f"{field}={requested}" in response.json()["error"]["message"]
+    assert str(limit) in response.json()["error"]["message"]
+    assert response.json()["error"]["message"] == (
+        f"{field}={requested} exceeds the configured output token limit of {limit}"
+    )
+    assert "fixture-backend" not in response.text
+    assert "deployment" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "path,error_kind",
     [
         ("/v1/responses", "rate_limit"),
+        ("/v1/responses", "insufficient_quota"),
+        ("/v1/responses", "invalid_prompt"),
         ("/v1/responses", "numeric_rate_limit"),
         ("/v1/responses", "server_error"),
         ("/v1/responses", "response_failed"),
@@ -36,7 +86,10 @@ from litellm.types.llms.openai import ResponsesAPIResponse
 async def test_streaming_upstream_errors_keep_the_client_protocol(
     monkeypatch: pytest.MonkeyPatch,
     path: str,
-    error_kind: Literal["rate_limit", "numeric_rate_limit", "server_error", "response_failed", "cyber_policy"],
+    error_kind: Literal[
+        "rate_limit", "insufficient_quota", "invalid_prompt", "numeric_rate_limit", "server_error",
+        "response_failed", "cyber_policy",
+    ],
 ) -> None:
     import litellm.proxy.proxy_server as ps
     from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -45,6 +98,7 @@ async def test_streaming_upstream_errors_keep_the_client_protocol(
     message: Final = "Upstream cannot complete this response"
     code: Final = {
         "rate_limit": "rate_limit_exceeded", "numeric_rate_limit": "429",
+        "insufficient_quota": "insufficient_quota", "invalid_prompt": "invalid_prompt",
         "server_error": "server_error", "response_failed": "server_error", "cyber_policy": "cyber_policy",
     }[error_kind]
     error: Final = {"message": message, "code": code, "type": None, "param": "input"}
@@ -96,6 +150,13 @@ async def test_streaming_upstream_errors_keep_the_client_protocol(
         for frame in frames if "data: [DONE]" not in frame
     )
 
+    if not partial:
+        assert result.status_code == (
+            429 if error_kind in ("rate_limit", "insufficient_quota") else 400 if error_kind == "invalid_prompt" else 500
+        ), result.text
+        assert result.json()["error"]["message"] == message
+        assert result.json()["error"]["code"] == code
+        return
     assert result.status_code == 200, result.text
     assert message in result.text
     if path == "/v1/responses":
@@ -330,10 +391,7 @@ async def test_responses_stream_error_protocol_and_failure_cleanup(monkeypatch, 
     if phase in ("before_chunk", "after_chunk"):
         assert closed.is_set()
     if not context_error or sanitize:
-        # Upstream's ResponsesStreamErrorState terminal-frames any failure raised inside the
-        # streaming generator as response.failed; failures before/around it (headers, keepalive)
-        # stay on the plain error payload.
-        in_generator = phase in ("before_chunk", "after_chunk")
+        in_generator = phase in ("before_chunk", "after_chunk", "after_ping")
         assert ("response.failed" in response.text) is in_generator
         assert response.status_code == (400 if phase == "before_headers" else 200)
         if sanitize:

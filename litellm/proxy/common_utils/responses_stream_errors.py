@@ -4,11 +4,15 @@ from http import HTTPStatus
 from types import MappingProxyType
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
-from litellm._logging import redact_internal_details_from_client_message
 from litellm._uuid import uuid
 from litellm.exceptions import MidStreamFallbackError
+from litellm.proxy.common_utils.openai_error_payload import (
+    client_error_message,
+    inference_error_status_code,
+    is_context_window_error,
+)
 from litellm.types.llms.openai import ResponseFailedEvent, ResponsesAPIResponse, ResponsesAPIStreamEvents
 
 
@@ -32,7 +36,7 @@ class _FailureDetails(BaseModel):
     model_config = ConfigDict(frozen=True, from_attributes=True)
 
     message: str | None = None
-    code: str | int | None = None
+    code: str | int | None = Field(default=None, validation_alias=AliasChoices("openai_code", "code"))
     type: str | None = None
     status_code: int | None = None
 
@@ -63,13 +67,13 @@ def _failure_details(original: Exception) -> _FailureDetails:
     mapped: Final = _FailureDetails.model_validate(original)
     body: Final = getattr(original, "body", None)
     if not isinstance(body, Mapping):
-        return mapped
+        return mapped.model_copy(update={"status_code": inference_error_status_code(original)})
     upstream: Final = _FailureDetails.model_validate(body)
     return _FailureDetails(
         message=upstream.message or mapped.message,
         code=upstream.code if upstream.code is not None else mapped.code,
         type=upstream.type or mapped.type,
-        status_code=mapped.status_code,
+        status_code=inference_error_status_code(original),
     )
 
 
@@ -99,6 +103,13 @@ def _response_error_code(details: _FailureDetails) -> str:
     if isinstance(details.code, str) and details.code and not details.code.isdecimal():
         return details.code
     return _status_error_code(details.status_code)
+
+
+def responses_error_code(exception: Exception) -> str:
+    original: Final = _original_failure(exception)
+    if is_context_window_error(original):
+        return "context_length_exceeded"
+    return _response_error_code(_failure_details(original))
 
 
 class ResponsesStreamErrorState:
@@ -132,7 +143,6 @@ class ResponsesStreamErrorState:
         if self.terminal_emitted:
             return None
         original: Final = _original_failure(exception)
-        details: Final = _failure_details(original)
         response: Final = ResponsesAPIResponse.model_validate(
             MappingProxyType(
                 {
@@ -144,8 +154,8 @@ class ResponsesStreamErrorState:
                     "output": (),
                     "error": MappingProxyType(
                         {
-                            "code": _response_error_code(details),
-                            "message": redact_internal_details_from_client_message(details.message or str(original)),
+                            "code": responses_error_code(original),
+                            "message": client_error_message(original),
                         }
                     ),
                 }

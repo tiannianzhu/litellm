@@ -33,6 +33,7 @@ from litellm.proxy.common_utils.error_body_call_id import error_body_call_id
 from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.proxy.common_utils.openai_error_payload import (
     LITELLM_CALL_ID_HEADER,
+    client_error_message,
     error_status_code,
     openai_error_param,
     openai_error_type,
@@ -73,7 +74,7 @@ def _anthropic_error_json_response(exc: ProxyException, request: Request) -> JSO
     _close_dangling_otel_server_span(request, status_code, exc=exc)
     envelope: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
         status_code=status_code,
-        raw_message=exc.message,
+        raw_message=client_error_message(exc),
         request_id=request.headers.get("x-request-id"),
     )
     body_call_id: Final = error_body_call_id(general_settings_view(), exc.headers.get(LITELLM_CALL_ID_HEADER))
@@ -239,7 +240,7 @@ async def anthropic_response(
             )
         body: Final = AnthropicExceptionMapping.transform_to_anthropic_error(
             status_code=e.status_code,
-            raw_message=e.message,
+            raw_message=client_error_message(e),
             request_id=request.headers.get("x-request-id"),
         )
         return JSONResponse(status_code=e.status_code, content=body)
@@ -275,10 +276,9 @@ async def anthropic_response(
         if isinstance(e, HTTPException):
             return _anthropic_error_json_response(proxy_exception_from_http_exception(e, headers), request)
 
-        error_msg: Final = f"{e}"
         return _anthropic_error_json_response(
             ProxyException(
-                message=getattr(e, "message", error_msg),
+                message=client_error_message(e),
                 type=openai_error_type(e, error_status_code(e, 500)),
                 param=openai_error_param(e),
                 code=error_status_code(e, 500),

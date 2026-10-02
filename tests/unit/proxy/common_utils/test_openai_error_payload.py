@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Final
 
 import pytest
 from fastapi import HTTPException
@@ -7,12 +8,32 @@ from fastapi import HTTPException
 from litellm.proxy._types import ProxyErrorTypes, ProxyException
 from litellm.proxy.common_utils.openai_error_payload import (
     ResponsesContextErrorFormatter,
+    client_error_message,
     error_status_code,
     litellm_call_id_headers,
     openai_error_param,
     openai_error_type,
     with_litellm_call_id,
 )
+
+
+def test_message_unwrap_removes_only_litellm_wrappers_and_appended_router_diagnostics():
+    import litellm
+    from litellm.router_utils.common_utils import format_fallback_outcome_message
+
+    original: Final = "This model always has reasoning enabled and cannot be disabled."
+    exception: Final = litellm.UnsupportedParamsError(
+        message=original + format_fallback_outcome_message("fixture-group", ("fixture-fallback",), "fixture failure"),
+        max_retries=3, num_retries=2, litellm_debug_info="fixture diagnostic",
+    )
+    assert client_error_message(exception) == original
+    assert client_error_message("CustomerError: retain this prefix and JSON {\"x\": 1}") == (
+        "CustomerError: retain this prefix and JSON {\"x\": 1}"
+    )
+    assert "fixture-group" in exception.message
+    assert client_error_message("Invalid configuration:\nmodel=fixture\nChoose a supported value.") == (
+        "Invalid configuration:\nmodel=fixture\nChoose a supported value."
+    )
 
 
 def test_responses_context_error_preserves_terminal_response_and_usage_through_router_wrapper():
