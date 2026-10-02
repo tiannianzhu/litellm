@@ -126,6 +126,7 @@ from litellm.llms.openai_like.model_info import (
 from litellm.router_strategy.base_routing_strategy import BaseRoutingStrategy
 from litellm.router_strategy.budget_limiter import RouterBudgetLimiting
 from litellm.router_strategy.complexity_router.context_compaction import (
+    Surface,
     arm_compaction,
     compact_to_fit,
     compaction_pending,
@@ -798,6 +799,77 @@ class FallbackAwareStreamWrapper(CustomStreamWrapper):
                 "response_cost": None,
             }
         self.fallback_headers_adopted = True
+
+
+_TOKEN_LIMIT_MAPPING_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+
+
+def _output_limit_error(caps: tuple[tuple[str, object], ...], limit: int) -> str | None:
+    for field, value in caps:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"{field} must be a positive integer"
+        if value > limit:
+            return f"{field}={value} exceeds the configured output token limit of {limit}"
+    if len(frozenset(value for _, value in caps)) > 1:
+        return "Conflicting output token limits: " + ", ".join(f"{field}={value}" for field, value in caps)
+    return None
+
+
+def _deployment_output_token_params(
+    deployment: Mapping[str, object], request: Mapping[str, object], surface: Surface | None
+) -> Mapping[str, object]:
+    if surface is None:
+        return MappingProxyType({})
+    info: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment.get("model_info") or {})
+    limit: Final = coerce_token_limit(info.get("max_output_tokens"))
+    if limit is None:
+        return MappingProxyType({})
+    params: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment.get("litellm_params") or {})
+    extra: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(request.get("extra_body") or {})
+    client_caps: Final = tuple(
+        (key, value) for key, value in request.items() if key in OUTPUT_TOKEN_CEILING_PARAMS and value is not None
+    ) + tuple(
+        (f"extra_body.{key}", value)
+        for key, value in extra.items()
+        if key in OUTPUT_TOKEN_CEILING_PARAMS and value is not None
+    )
+    field: Final = (
+        "max_output_tokens"
+        if surface == "responses"
+        else "max_completion_tokens"
+        if surface == "chat" and request.get("max_completion_tokens") is not None
+        else "max_tokens"
+    )
+    default: Final = next(
+        (
+            params[key]
+            for key in (field, "max_tokens", "max_completion_tokens", "max_output_tokens")
+            if params.get(key) is not None
+        ),
+        limit,
+    )
+    selected_caps: Final = client_caps or ((field, default),)
+    error: Final = _output_limit_error(selected_caps, limit)
+    if error is not None:
+        raise litellm.BadRequestError(message=error, model=str(deployment.get("model_name", "")), llm_provider="")
+    merged_extra: Final = _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(
+        request.get("extra_body", params.get("extra_body")) or {}
+    )
+    return MappingProxyType(
+        {
+            **{key: None for key in OUTPUT_TOKEN_CEILING_PARAMS},
+            field: selected_caps[0][1],
+            **(
+                {
+                    "extra_body": {
+                        key: value for key, value in merged_extra.items() if key not in OUTPUT_TOKEN_CEILING_PARAMS
+                    }
+                }
+                if merged_extra
+                else {}
+            ),
+        }
+    )
 
 
 def as_output_cap(value: object) -> int | None:
@@ -2662,6 +2734,11 @@ class Router:
                 "caching": self.cache_responses,
                 "client": model_client,
                 **kwargs,
+                **_deployment_output_token_params(
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                    "chat",
+                ),
             }
             response: Final = litellm.completion(**input_kwargs)
             verbose_router_logger.info("litellm.completion(model=%s)\x1b[32m 200 OK\x1b[0m", model_name)
@@ -3797,6 +3874,11 @@ class Router:
                 "caching": self.cache_responses,
                 "client": model_client,
                 **kwargs,
+                **_deployment_output_token_params(
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                    "chat",
+                ),
             }
             input_kwargs.pop("silent_model", None)
             input_kwargs.pop("include_fallback_errors", None)
@@ -5416,6 +5498,11 @@ class Router:
                 **kwargs,
                 "model": model_name,
                 **_with_router_resolved_session_model(kwargs.get("session"), model_name),
+                **_deployment_output_token_params(
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                    _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                    surface_for_call(original_generic_function.__name__),
+                ),
             }
             # Only set custom_llm_provider if it's not None
             if custom_llm_provider is not None:
@@ -5892,6 +5979,11 @@ class Router:
                     "custom_llm_provider": custom_llm_provider,
                     "caching": self.cache_responses,
                     **kwargs,
+                    **_deployment_output_token_params(
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(deployment),
+                        _TOKEN_LIMIT_MAPPING_ADAPTER.validate_python(kwargs),
+                        surface_for_call(handler_name) or surface_for_call("a" + handler_name),
+                    ),
                 }
             )
 

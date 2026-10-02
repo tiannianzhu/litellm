@@ -19415,3 +19415,111 @@ async def test_non_chat_surfaces_mark_their_deployment_pick(monkeypatch: pytest.
     router.completion(model="gpt-4o", messages=[{"role": "user", "content": "hi"}])
 
     assert events == [_pick("embed", "initial", 1), _pick("gpt-4o", "initial", 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "field"),
+    [
+        ("completion", "max_tokens"),
+        ("responses", "max_output_tokens"),
+        ("acompletion", "max_tokens"),
+        ("acompletion", "max_completion_tokens"),
+        ("aresponses", "max_output_tokens"),
+        ("aanthropic_messages", "max_tokens"),
+    ],
+)
+@pytest.mark.parametrize("requested", [None, 8, 32, 33])
+async def test_deployment_output_limit_defaults_overrides_and_rejects_on_wire(
+    monkeypatch: pytest.MonkeyPatch, method: str, field: str, requested: int | None
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    default: Final = 16
+    limit: Final = 32
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "bounded-output",
+                "litellm_params": {
+                    "model": "hosted_vllm/bounded-output",
+                    "api_base": "https://output-limit.local/v1",
+                    "api_key": "test-key",
+                    "use_chat_completions_api": True,
+                    "max_tokens": default,
+                },
+                "model_info": {"max_output_tokens": limit},
+            }
+        ],
+        num_retries=0,
+    )
+    payload: Final = {"input": "hello"} if method in ("aresponses", "responses") else {"messages": [{"role": "user", "content": "hello"}]}
+    supplied: Final = {} if requested is None else {field: requested}
+    async def invoke() -> object:
+        result: Final = getattr(router, method)(model="bounded-output", **payload, **supplied)
+        return await result if isinstance(result, Awaitable) else result
+
+    with respx.mock(assert_all_called=False) as http:
+        route: Final = http.post("https://output-limit.local/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-output-limit",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "bounded-output",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                },
+            )
+        )
+        if requested is not None and requested > limit:
+            with pytest.raises(litellm.BadRequestError, match=f"{field}={requested}.*limit of {limit}") as error:
+                await invoke()
+            assert error.value.status_code == 400
+            assert not route.called
+        else:
+            await invoke()
+            assert route.call_count == 1
+            body: Final = json.loads(route.calls[0].request.content)
+            assert body.get("max_tokens", body.get("max_completion_tokens")) == (default if requested is None else requested)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"max_tokens": 8, "max_completion_tokens": 9},
+        {"max_tokens": 8, "max_output_tokens": 33},
+        {"max_tokens": 8, "extra_body": {"max_tokens": 33}},
+        {"max_tokens": 8, "extra_body": {"max_tokens": 9}},
+        {"max_tokens": True},
+        {"max_tokens": 0},
+        {"max_tokens": -1},
+        {"max_tokens": 1.5},
+    ],
+)
+async def test_deployment_output_limit_rejects_conflicts_and_extra_body_bypass(
+    monkeypatch: pytest.MonkeyPatch, supplied: Mapping[str, object]
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "bounded-output",
+                "litellm_params": {
+                    "model": "hosted_vllm/bounded-output",
+                    "api_base": "https://output-limit.local/v1",
+                    "api_key": "test-key",
+                    "max_tokens": 16,
+                },
+                "model_info": {"max_output_tokens": 32},
+            }
+        ],
+        num_retries=0,
+    )
+    with respx.mock(assert_all_called=False) as http:
+        route: Final = http.post("https://output-limit.local/v1/chat/completions")
+        with pytest.raises(litellm.BadRequestError) as error:
+            await router.acompletion(model="bounded-output", messages=[{"role": "user", "content": "hello"}], **supplied)
+        assert error.value.status_code == 400
+        assert not route.called
