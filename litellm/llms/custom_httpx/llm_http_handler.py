@@ -108,6 +108,7 @@ from litellm.litellm_core_utils.chat_completion_agentic_loop import (
 from litellm.litellm_core_utils.core_helpers import (
     as_str_mapping,
     callable_of,
+    coerce_token_limit,
     float_of,
     iter_items,
     require_attributes,
@@ -269,6 +270,7 @@ from litellm.utils import (
     ModelResponse,
     ProviderConfigManager,
     async_pre_call_deployment_hook,
+    deployment_model_info,
 )
 
 
@@ -786,6 +788,20 @@ def _log_generate_content_request(
 @lru_cache(maxsize=None)
 def _responses_api_optional_request_param_names() -> frozenset[str]:
     return frozenset(get_type_hints(ResponsesAPIOptionalRequestParams).keys())
+
+
+def _validate_responses_output_token_limit(
+    data: Mapping[str, object], litellm_params: GenericLiteLLMParams, model: str, custom_llm_provider: str
+) -> None:
+    info: Final = deployment_model_info(litellm_params)
+    limit: Final = coerce_token_limit(info.get("max_output_tokens")) if info is not None else None
+    output_tokens: Final = coerce_token_limit(data.get("max_output_tokens"))
+    if limit is not None and output_tokens is not None and output_tokens > limit:
+        raise litellm.BadRequestError(
+            message=f"max_output_tokens={output_tokens} exceeds the configured output token limit of {limit}",
+            model=model,
+            llm_provider=custom_llm_provider,
+        )
 
 
 def _custom_logger_callbacks(logging_obj: LiteLLMLoggingObj) -> list["CustomLogger"]:
@@ -3408,6 +3424,7 @@ class BaseLLMHTTPHandler:
                 )
             )
         data.update(_bridged_chat_request_fields(data, logging_obj))
+        _validate_responses_output_token_limit(data, litellm_params, model, custom_llm_provider)
         stream = bool(stream or data.get("stream"))
 
         # Preserve the OpenAI-style request context (not sent to the provider) for streaming
@@ -3616,6 +3633,7 @@ class BaseLLMHTTPHandler:
                 )
             )
         data.update(_bridged_chat_request_fields(data, logging_obj))
+        _validate_responses_output_token_limit(data, litellm_params, model, custom_llm_provider)
         stream = bool(stream or data.get("stream"))
 
         # Preserve the OpenAI-style request context (not sent to the provider) for streaming
@@ -7519,6 +7537,7 @@ class BaseLLMHTTPHandler:
                 custom_llm_provider=custom_llm_provider,
                 first_message=first_message,
                 quota_callbacks=_ws_quota_callbacks,
+                request_defaults=request_defaults,
                 turn_admission=_ws_turn_admission,
                 guardrail_callbacks=_ws_guardrail_callbacks,  # pyright: ignore[reportUnknownArgumentType]  # duck-typed callbacks from litellm.callbacks
                 frame_guard=frame_guard,

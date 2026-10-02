@@ -2860,6 +2860,7 @@ class ResponsesWebSocketStreaming:
     ) -> None:
         guarded: Final = await self._guard_frame(message)
         if guarded is None:
+            await _refund_frame_quota(quota_refunds)
             return
         admitted: Final = await self._admit_or_reject_turn(guarded, message, turn_admission, quota_refunds)
         if admitted is None:
@@ -3318,8 +3319,11 @@ class ResponsesWebSocketStreaming:
     async def client_to_backend(self) -> None:
         """Forward response.create events from client to backend."""
         try:
-            if self.first_message is not None and await self._enforce_or_reject_frame(self.first_message) is not None:
-                await self._forward_guarded_frame(self.first_message)
+            if (
+                self.first_message is not None
+                and (first_refunds := await self._enforce_or_reject_frame(self.first_message)) is not None
+            ):
+                await self._forward_guarded_frame(self.first_message, quota_refunds=first_refunds)
 
             while True:
                 message = await self.websocket.receive_text()
@@ -3403,6 +3407,7 @@ class ManagedResponsesWebSocketHandler:
         first_message: str | None = None,
         quota_callbacks: Sequence[ProjectQuotaCallback] | None = None,
         turn_admission: ResponsesWsTurnAdmission | None = None,
+        request_defaults: ResponsesWebSocketRequestDefaults | None = None,
         frame_guard: ResponsesWsFrameGuard | None = None,
         guardrail_callbacks: Sequence[PresidioGuardrailCallback] | None = None,
         on_unfinished_turn: Callable[[], None] | None = None,
@@ -3429,6 +3434,7 @@ class ManagedResponsesWebSocketHandler:
         self.first_message = first_message
         self.quota_callbacks: tuple[ProjectQuotaCallback, ...] = tuple(quota_callbacks) if quota_callbacks else ()
         self.turn_admission: ResponsesWsTurnAdmission | None = turn_admission
+        self.request_defaults = request_defaults
         self._failure: Exception | None = None
         # Carry through safe pass-through kwargs (e.g. extra_headers)
         self.extra_kwargs: dict[str, object] = {k: v for k, v in kwargs.items() if k not in _MANAGED_WS_SKIP_KWARGS}
@@ -3895,6 +3901,7 @@ class ManagedResponsesWebSocketHandler:
             return
         guarded: Final = await self._guard_frame(raw_message)
         if guarded is None:
+            await _refund_frame_quota(quota_refunds)
             return
         verdict: Final = await _admit_frame_turn(turn_admission, raw_message)
         if isinstance(verdict, _RefusedTurn):
@@ -3905,7 +3912,10 @@ class ManagedResponsesWebSocketHandler:
         if guarded.pii_tokens:
             self._pii_tokens = {**self._pii_tokens, **guarded.pii_tokens}
 
-        call_kwargs: Final = self._build_base_call_kwargs(_load_json_object(guarded.frame))
+        frame_kwargs: Final = self._build_base_call_kwargs(_load_json_object(guarded.frame))
+        call_kwargs: Final = (
+            self.request_defaults.merged_into(frame_kwargs) if self.request_defaults is not None else frame_kwargs
+        )
         call_kwargs["stream"] = True
 
         # A frame that repeats the connection's public alias (model_group) must
@@ -3932,7 +3942,11 @@ class ManagedResponsesWebSocketHandler:
                 call_kwargs.get("litellm_metadata"), guarded.guardrail_information
             )
         self._update_proxy_request(call_kwargs, requested_model or self.model_group or model)
-        call_kwargs.update(self.extra_kwargs)
+        call_kwargs.update(
+            {key: value for key, value in self.extra_kwargs.items() if key not in _RESPONSE_CREATE_PARAMS}
+            if self.request_defaults is not None
+            else self.extra_kwargs
+        )
         turn_litellm_metadata: Final = call_kwargs.get("litellm_metadata")
         call_kwargs["litellm_metadata"] = {
             **(turn_litellm_metadata if _is_json_object(turn_litellm_metadata) else {}),
