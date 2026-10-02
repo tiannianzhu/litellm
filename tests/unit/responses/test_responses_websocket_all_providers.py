@@ -1863,6 +1863,83 @@ class _ProviderResponsesSocket:
         return None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", (True, False), ids=("native", "managed"))
+@pytest.mark.parametrize("nested", (False, True), ids=("flat", "nested"))
+async def test_router_websocket_enforces_output_limit_on_first_and_later_turns(
+    native: bool, nested: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import patch
+
+    import litellm
+    from litellm import Router
+    from litellm.responses.streaming_iterator import GuardedResponsesWsFrame
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    native_provider: Final = _ProviderResponsesSocket()
+    limit: Final = 64
+    default: Final = 32
+    smaller: Final = 24
+    bodies: Final = (
+        {"input": "first", "max_output_tokens": limit + 1},
+        {"input": "default"},
+        {"input": "smaller", "max_output_tokens": smaller},
+        {"input": "bypass", "extra_body": {"max_output_tokens": limit + 1}},
+        {"input": "boundary", "max_output_tokens": limit},
+    )
+    frames: Final = tuple(
+        json.dumps({"type": "response.create", **({"response": body} if nested else body)}) for body in bodies
+    )
+    client: Final = _ClientSocket(*frames[1:])
+
+    async def guard(raw: str) -> GuardedResponsesWsFrame:
+        frame: Final = json.loads(raw)
+        body: Final = frame["response"] if nested else frame
+        guarded: Final = {**body, "input": body["input"].upper()}
+        return GuardedResponsesWsFrame(
+            frame=json.dumps({**frame, "response": guarded} if nested else guarded),
+            guardrail_information=({"guardrail_name": "fixture"},),
+        )
+
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "bounded-ws",
+                "litellm_params": {
+                    "model": "openai/ws-fixture" if native else "hosted_vllm/ws-fixture",
+                    "api_key": "fixture-key",
+                    "api_base": "https://ws-output.test/v1",
+                    "max_output_tokens": default,
+                },
+                "model_info": {"id": "bounded-ws", "max_output_tokens": limit},
+            }
+        ],
+        num_retries=0,
+    )
+    with respx.mock(assert_all_called=False) as http:
+        managed_provider: Final = http.post("https://ws-output.test/v1/responses").mock(
+            side_effect=_provider_turn_stream
+        )
+        with patch("websockets.connect", native_provider.connect):
+            await router._aresponses_websocket(
+                model="bounded-ws",
+                websocket=client,
+                first_message=frames[0],
+                responses_ws_frame_guard=guard,
+            )
+        forwarded: Final = (
+            tuple(frame["response"] if nested else frame for frame in native_provider.sent)
+            if native
+            else tuple(json.loads(call.request.read()) for call in managed_provider.calls)
+        )
+
+    assert tuple(frame.get("max_output_tokens") for frame in forwarded) == (default, smaller, limit)
+    assert tuple(frame["input"] for frame in forwarded) == ("DEFAULT", "SMALLER", "BOUNDARY")
+    errors: Final = tuple(frame for frame in client.sent if frame.get("type") == "error")
+    assert len(errors) == 2
+    assert all(f"limit of {limit}" in str(frame["error"]) for frame in errors)
+
+
 class _TwoOutputTokenTurns(CustomLLM):
     def __init__(self, failing_turns: frozenset[int] = frozenset()) -> None:
         super().__init__()

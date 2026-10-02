@@ -8,17 +8,21 @@ Which strategy and selector apply is the Rust core's routing context (``routing_
 selectors, limiters and checks are the live Python objects the host keeps.
 """
 
+import json
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
+from pydantic import TypeAdapter
+
+from litellm import exceptions as litellm_exceptions
 from litellm._internal_context import request_parent_otel_span
 from litellm._logging import verbose_router_logger
-from litellm.constants import USAGE_BASED_ROUTING_COUNTED_TOKENS_METADATA_KEY
+from litellm.constants import OUTPUT_TOKEN_CEILING_PARAMS, USAGE_BASED_ROUTING_COUNTED_TOKENS_METADATA_KEY
 from litellm.litellm_core_utils.core_helpers import get_parent_otel_span_from_kwargs, without
-from litellm.router_rust.invoke.shaping import as_dict
+from litellm.router_rust.invoke.shaping import as_dict, deployment_output_token_params
 from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     count_before_callbacks,
     find_deployment_metadata,
@@ -27,7 +31,10 @@ from litellm.router_utils.router_callbacks.track_deployment_metrics import (
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
+    from litellm.responses.streaming_iterator import ResponsesWsFrameGuard
     from litellm.router_rust.invoke.endpoints import EndpointCore
+
+_FRAME_MAPPING: Final = TypeAdapter(Mapping[str, object])
 
 
 def turn_admission(
@@ -131,6 +138,41 @@ async def _count_usage_based_routing_tokens(
     return True
 
 
+def output_guard(
+    core: "EndpointCore", deployment: Mapping[str, object], frame_guard: object
+) -> "ResponsesWsFrameGuard":
+    from litellm.responses.streaming_iterator import GuardedResponsesWsFrame, ResponsesWsFrameGuard
+
+    original: Final = TypeAdapter[ResponsesWsFrameGuard | None](ResponsesWsFrameGuard | None).validate_python(
+        frame_guard
+    )
+
+    async def guard(message: str) -> GuardedResponsesWsFrame:
+        guarded: Final = await original(message) if original is not None else GuardedResponsesWsFrame(frame=message)
+        frame: Final = _FRAME_MAPPING.validate_json(guarded.frame)
+        nested: Final = frame.get("response")
+        body: Final = _FRAME_MAPPING.validate_python(nested) if isinstance(nested, Mapping) else frame
+        try:
+            limits: Final = deployment_output_token_params(
+                _deployment_as_configured_now(core, deployment), body, "responses"
+            )
+        except litellm_exceptions.BadRequestError as error:
+            if guarded.bill_refusal is not None:
+                guarded.bill_refusal(error)
+            raise
+        if not limits:
+            return guarded
+        bounded: Final = {
+            key: value
+            for key, value in {**body, **limits}.items()
+            if key not in OUTPUT_TOKEN_CEILING_PARAMS or value is not None
+        }
+        rewritten: Final = {**frame, "response": bounded} if isinstance(nested, Mapping) else bounded
+        return replace(guarded, frame=json.dumps(rewritten))
+
+    return guard
+
+
 def _deployment_as_configured_now(core: "EndpointCore", deployment: Mapping[str, object]) -> Mapping[str, object]:
     model_info: Final = deployment.get("model_info")
     model_id: Final = as_dict(model_info).get("id") if isinstance(model_info, dict) else None  # pyright: ignore[reportUnknownArgumentType]  # the configured model_info dict
@@ -231,6 +273,7 @@ async def _admit_turn_through_routing_strategy(
 __all__ = [
     "TurnUsageRecorder",
     "admit_deployment_turn",
+    "output_guard",
     "record_deployment_turn_usage",
     "turn_admission",
     "turn_usage_recorder",

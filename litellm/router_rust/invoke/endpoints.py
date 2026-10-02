@@ -38,6 +38,7 @@ from litellm.router_rust.invoke.shaping import (
     STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
     Shaping,
     as_dict,
+    deployment_output_token_params,
     deployment_params_with_request_reasoning_override,
     drop_unsupported_classifier_reasoning_effort,
     metadata_bucket,
@@ -924,6 +925,7 @@ def attempt_call(
                     "caching": caching,
                     "client": model_client(core, plan, deployment, kwargs),
                     **kwargs,
+                    **deployment_output_token_params(deployment, kwargs, "chat"),
                 }
             )
             return AttemptCall(plan.host_op, final, kwargs, str(params.get("model")), group)
@@ -971,13 +973,14 @@ def attempt_call(
         case "generic":
             return _generic_attempt(core, plan, kwargs, deployment, data, requested, group)
         case "generic_sync":
+            handler_name: Final = invoked_handler_name(core, plan) or ""
             update_kwargs_with_deployment(
                 shaping,
                 deployment,
                 kwargs,
                 usage=core.router_usage,
                 function_name="generic_api_call",
-                splits_stream_timeout=invoked_handler_name(core, plan) in STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
+                splits_stream_timeout=handler_name in STREAM_TIMEOUT_AWARE_GENERIC_HANDLERS,
             )
             endpoint = kwargs.get("endpoint")  # rebind-ok: rebound as the Python router rebinds it
             if endpoint and isinstance(endpoint, str):
@@ -988,6 +991,9 @@ def attempt_call(
                 "custom_llm_provider": _generic_provider(data),
                 "caching": caching,
                 **kwargs,
+                **deployment_output_token_params(
+                    deployment, kwargs, surface_for_call(handler_name) or surface_for_call("a" + handler_name)
+                ),
             }
             return AttemptCall(plan.host_op, final, kwargs, model_name, group)
         case "moderation":
@@ -1014,7 +1020,7 @@ def _generic_attempt(
 ) -> AttemptCall:
     """`_ageneric_api_call_with_fallbacks_helper` for one deployment."""
     from litellm.llms.base_llm.passthrough.transformation import replace_path_segment
-    from litellm.router_rust.invoke.websocket import turn_admission, turn_usage_recorder
+    from litellm.router_rust.invoke.websocket import output_guard, turn_admission, turn_usage_recorder
 
     handler: Final = invoked_handler_name(core, plan)
     socket: Final = handler == "_aresponses_websocket"
@@ -1053,9 +1059,13 @@ def _generic_attempt(
             {
                 "turn_admission": turn_admission(core, requested, deployment, kwargs),
                 "turn_usage_recorder": turn_usage_recorder(core, requested, kwargs),
+                "responses_ws_frame_guard": output_guard(core, deployment, kwargs.get("responses_ws_frame_guard")),
             }
             if socket
             else {}
+        ),
+        **deployment_output_token_params(
+            deployment, kwargs, "responses" if socket else surface_for_call(handler or "")
         ),
     }
     if provider is not None:

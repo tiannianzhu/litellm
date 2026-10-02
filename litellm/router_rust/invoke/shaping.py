@@ -20,6 +20,7 @@ from litellm.constants import (
     BAGGAGE_MAPPED_TAGS_METADATA_KEY,
     INTERNAL_CALL_ORIGIN_METADATA_KEY,
     KUBERNETES_POD_ROUTING_KEY,
+    OUTPUT_TOKEN_CEILING_PARAMS,
     ROUTING_REQUEST_TAGS_METADATA_KEY,
 )
 from litellm.litellm_core_utils.batch_utils import get_router_metadata_variable_name
@@ -28,7 +29,7 @@ from litellm.litellm_core_utils.clientside_credential_handler import (
     is_clientside_credential,  # pyright: ignore[reportUnknownVariableType]  # litellm's untyped helpers and request values
 )
 from litellm.litellm_core_utils.completion_timeout import CompletionTimeout
-from litellm.litellm_core_utils.core_helpers import allowed_openai_param_names, without
+from litellm.litellm_core_utils.core_helpers import allowed_openai_param_names, coerce_token_limit, without
 from litellm.litellm_core_utils.get_litellm_params import SUPPLEMENTAL_KWARGS_KEYS
 from litellm.litellm_core_utils.get_llm_provider_logic import declared_authenticating_provider, inferred_provider
 from litellm.litellm_core_utils.request_timeout_resolver import get_service_tier_timeout
@@ -36,6 +37,7 @@ from litellm.litellm_core_utils.routing_common_utils import deployment_model_id_
 from litellm.litellm_core_utils.tool_fields import TOOL_FIELDS, drop_policy
 from litellm.responses.retrieve_stream_query import requests_streamed_retrieval, without_retrieve_stream_defaults
 from litellm.router_api import deployment_id as generate_deployment_id
+from litellm.router_strategy.complexity_router.context_compaction import Surface
 from litellm.router_strategy.tag_based_routing import (
     baggage_stamp_for_serving_deployment,
     get_tags_from_request_kwargs,
@@ -93,6 +95,78 @@ def _mapping(value: object) -> Mapping[str, object] | None:
         return _MAPPING.validate_python(value)
     except ValidationError:
         return None
+
+
+def _output_limit_error(caps: tuple[tuple[str, object], ...], limit: int) -> str | None:
+    for field, value in caps:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"{field} must be a positive integer"
+        if value > limit:
+            return f"{field}={value} exceeds the configured output token limit of {limit}"
+    if len(frozenset(value for _, value in caps)) > 1:
+        return "Conflicting output token limits: " + ", ".join(f"{field}={value}" for field, value in caps)
+    return None
+
+
+def deployment_output_token_params(
+    deployment: Mapping[str, object], request: Mapping[str, object], surface: Surface | None
+) -> Mapping[str, object]:
+    if surface is None:
+        return MappingProxyType({})
+    info: Final = _MAPPING.validate_python(deployment.get("model_info") or {})
+    limit: Final = coerce_token_limit(info.get("max_output_tokens"))
+    if limit is None:
+        return MappingProxyType({})
+    params: Final = _MAPPING.validate_python(deployment.get("litellm_params") or {})
+    extra: Final = _MAPPING.validate_python(request.get("extra_body") or {})
+    merged_extra: Final = _MAPPING.validate_python(request.get("extra_body", params.get("extra_body")) or {})
+    defaults: Final[Mapping[str, object]] = {
+        **params,
+        **{key: value for key, value in merged_extra.items() if value is not None},
+    }
+    client_caps: Final = tuple(
+        (key, value) for key, value in request.items() if key in OUTPUT_TOKEN_CEILING_PARAMS and value is not None
+    ) + tuple(
+        (f"extra_body.{key}", value)
+        for key, value in extra.items()
+        if key in OUTPUT_TOKEN_CEILING_PARAMS and value is not None
+    )
+    field: Final = (
+        "max_output_tokens"
+        if surface == "responses"
+        else "max_completion_tokens"
+        if surface == "chat" and request.get("max_completion_tokens") is not None
+        else "max_tokens"
+    )
+    default: Final = next(
+        (
+            defaults[key]
+            for key in (field, "max_tokens", "max_completion_tokens", "max_output_tokens")
+            if defaults.get(key) is not None
+        ),
+        limit,
+    )
+    selected_caps: Final = client_caps or ((field, default),)
+    error: Final = _output_limit_error(selected_caps, limit)
+    if error is not None:
+        raise litellm_exceptions.BadRequestError(
+            message=error, model=str(deployment.get("model_name", "")), llm_provider=""
+        )
+    return MappingProxyType(
+        {
+            **{key: None for key in OUTPUT_TOKEN_CEILING_PARAMS},
+            field: selected_caps[0][1],
+            **(
+                {
+                    "extra_body": {
+                        key: value for key, value in merged_extra.items() if key not in OUTPUT_TOKEN_CEILING_PARAMS
+                    }
+                }
+                if merged_extra
+                else {}
+            ),
+        }
+    )
 
 
 def metadata_bucket(
@@ -632,6 +706,7 @@ __all__ = [
     "Shaping",
     "as_dict",
     "call_timeout",
+    "deployment_output_token_params",
     "deployment_params_with_request_reasoning_override",
     "drop_unsupported_classifier_reasoning_effort",
     "merge_tools_from_deployment",

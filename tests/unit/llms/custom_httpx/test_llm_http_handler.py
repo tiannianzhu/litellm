@@ -233,6 +233,60 @@ def test_prepare_fake_stream_request():
     assert result_data["messages"] == [{"role": "user", "content": "Hello"}]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", (False, True))
+@pytest.mark.parametrize("floor_fits", (False, True))
+async def test_responses_provider_minimum_respects_the_deployment_output_ceiling(
+    is_async: bool, floor_fits: bool, respx_mock: respx.MockRouter
+) -> None:
+    from litellm.llms.openai.responses.transformation import OPENAI_RESPONSES_API_MIN_MAX_OUTPUT_TOKENS
+
+    minimum: Final = OPENAI_RESPONSES_API_MIN_MAX_OUTPUT_TOKENS
+    ceiling: Final = minimum if floor_fits else minimum - 1
+    route: Final = respx_mock.post("https://responses.example.com/v1/responses").respond(
+        200,
+        json={
+            "id": "resp_output_ceiling",
+            "object": "response",
+            "created_at": 1,
+            "model": "output-limit-fixture",
+            "status": "completed",
+            "output": [],
+        },
+    )
+    client: Final = (
+        AsyncHTTPHandler(transport=httpx.AsyncHTTPTransport()) if is_async else HTTPHandler(client=httpx.Client())
+    )
+    request: Final = {
+        "model": "openai/output-limit-fixture",
+        "input": "hello",
+        "api_key": "synthetic-output-limit-key",
+        "api_base": "https://responses.example.com/v1",
+        "max_output_tokens": minimum - 1,
+        "model_info": {"max_output_tokens": ceiling},
+        "client": client,
+    }
+    try:
+        if floor_fits:
+            response: Final = await litellm.aresponses(**request) if is_async else litellm.responses(**request)
+            assert response.status == "completed"
+            assert len(route.calls) == 1
+            assert json.loads(route.calls[0].request.content)["max_output_tokens"] == minimum
+        else:
+            if is_async:
+                with pytest.raises(litellm.BadRequestError, match="exceeds the configured output token limit"):
+                    await litellm.aresponses(**request)
+            else:
+                with pytest.raises(litellm.BadRequestError, match="exceeds the configured output token limit"):
+                    litellm.responses(**request)
+            assert not route.called
+    finally:
+        if isinstance(client, AsyncHTTPHandler):
+            await client.close()
+        else:
+            client.client.close()
+
+
 def test_response_api_handler_streams_when_provider_transform_adds_stream():
     handler = BaseLLMHTTPHandler()
     config = Mock()
