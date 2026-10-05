@@ -3858,6 +3858,12 @@ def test_get_spend_logs_metadata_keeps_master_key_alias_readable():
     assert meta["user_api_key"] == LITELLM_PROXY_MASTER_KEY_ALIAS
 
 
+def test_get_spend_logs_metadata_without_input_preserves_default_fields() -> None:
+    missing_input: Final = _get_spend_logs_metadata(None)
+    default_input: Final = _get_spend_logs_metadata({"status": "success"})
+    assert missing_input == default_input
+
+
 def test_get_spend_logs_metadata_keeps_user_agent():
     """`add_litellm_data_to_request` stamps the caller's User-Agent next to its IP, but
     the spend log metadata dropped it, so an abusive client could not be identified

@@ -218,6 +218,11 @@ def _get_spend_logs_metadata(
 
     if metadata is None:
         return SpendLogsMetadata(
+            actor_agent_id=None,
+            target_agent_id=None,
+            billing_agent_id=None,
+            agent_execution_mode=None,
+            verified_human_user_id=None,
             user_api_key=None,
             user_api_key_alias=None,
             user_api_key_team_id=None,
@@ -243,6 +248,7 @@ def _get_spend_logs_metadata(
             model_map_information=None,
             usage_object=None,
             guardrail_information=None,
+            routing_decision=None,
             internal_call_origin=None,
             litellm_roi_estimator=False,
             eval_information=None,
