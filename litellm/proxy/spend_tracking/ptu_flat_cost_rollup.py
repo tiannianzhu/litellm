@@ -306,21 +306,18 @@ def _queue_deployment_day(table: _SentinelBatchTable, deployment_day: _Deploymen
     bills it to the new holders alone, whether or not the run may prune. The delete is scoped
     by the day and deployment rather than by the teams no longer charged, since a share map
     names any number of teams and a negated team list would be an unbounded ``NOT IN``.
-
-    ``model`` holds the deployment id because it is part of the table's unique key and a
-    rename must not move the row. ``model_group`` carries the operator-facing name, which
-    is outside the key and is what the usage views display.
     """
     now: Final = datetime.now(timezone.utc)
     table.delete_many(where=_deployment_day_rows_filter(deployment_day))
     for charge in deployment_day.charges:
         table.upsert(
             where={
-                "team_id_date_api_key_model_custom_llm_provider_mcp_namespaced_tool_name_endpoint": {
+                "team_id_date_api_key_model_model_group_custom_llm_provider_mcp_namespaced_tool_name_endpoint": {
                     "team_id": charge.team_id,
                     "date": deployment_day.date_str,
                     "api_key": PTU_SENTINEL_API_KEY,
                     "model": charge.model_id,
+                    "model_group": charge.model_name,
                     "custom_llm_provider": "",
                     "mcp_namespaced_tool_name": "",
                     "endpoint": "",

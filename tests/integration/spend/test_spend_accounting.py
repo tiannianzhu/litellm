@@ -119,7 +119,7 @@ async def _event_count(db: Prisma, keys: tuple[str, ...]) -> int:
     return int(rows[0]["count"])
 
 
-def _daily_row(entity_column: str, entity_id: str, api_key: str, day: str) -> str:
+def _daily_row(entity_column: str, entity_id: str, api_key: str, day: str, model_group: str | None = None) -> str:
     metrics: Final = {
         "prompt_tokens": 11,
         "completion_tokens": 12,
@@ -143,7 +143,7 @@ def _daily_row(entity_column: str, entity_id: str, api_key: str, day: str) -> st
             "date": day,
             "api_key": api_key,
             "model": f"contract-model-{api_key}",
-            "model_group": f"contract-group-{api_key}",
+            "model_group": model_group if model_group is not None else f"contract-group-{api_key}",
             "custom_llm_provider": "contract-provider",
             "endpoint": "chat",
             **metrics,
@@ -373,6 +373,52 @@ async def test_six_daily_entities_and_user_global_metrics_commit_together_and_re
         await db.execute_raw(
             'DELETE FROM "LiteLLM_DailyGlobalSpend" WHERE date = $1 AND model = $2', day, model
         )
+
+
+@pytest.mark.parametrize("separate_flushes", (False, True))
+async def test_daily_model_groups_remain_separate_in_user_and_global_rollups(
+    db: Prisma, event: Callable[..., AccountingEvent], separate_flushes: bool
+) -> None:
+    run: Final = uuid.uuid4().hex
+    day: Final = "2199-01-02"
+    api_key: Final = f"group-key-{run}"
+    user_id: Final = f"group-user-{run}"
+    model: Final = f"contract-model-{api_key}"
+    items: Final = tuple(
+        event(
+            str(index),
+            payload_json=AccountingEffects(
+                charges=(),
+                daily=(DailyCharge(entity="user", row_json=_daily_row("user_id", user_id, api_key, day, group)),),
+            ).model_dump_json(),
+        )
+        for index, group in enumerate(("alpha", "beta", "alpha"))
+    )
+    try:
+        for item in items:
+            await _store(db).append(item)
+            if separate_flushes:
+                assert await _store(db).flush(apply_accounting_events) == 1
+        if not separate_flushes:
+            assert await _store(db).flush(apply_accounting_events) == 3
+
+        for table in ("LiteLLM_DailyUserSpend", "LiteLLM_DailyGlobalSpend"):
+            rows: Final = await db.query_raw(
+                f'SELECT model_group, spend, prompt_tokens, completion_tokens, api_requests FROM "{table}" '
+                "WHERE date = $1 AND model = $2 ORDER BY model_group",
+                day,
+                model,
+            )
+            assert tuple(row["model_group"] for row in rows) == ("alpha", "beta")
+            assert tuple(
+                rows[0][metric] for metric in ("spend", "prompt_tokens", "completion_tokens", "api_requests")
+            ) == (32.5, 22, 24, 42)
+            assert tuple(
+                rows[1][metric] for metric in ("spend", "prompt_tokens", "completion_tokens", "api_requests")
+            ) == (16.25, 11, 12, 21)
+    finally:
+        await db.execute_raw('DELETE FROM "LiteLLM_DailyUserSpend" WHERE user_id = $1', user_id)
+        await db.execute_raw('DELETE FROM "LiteLLM_DailyGlobalSpend" WHERE date = $1 AND model = $2', day, model)
 
 
 async def test_entity_and_membership_balances_apply_from_durable_event(

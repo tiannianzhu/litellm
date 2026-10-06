@@ -20,6 +20,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm._service_logger import ServiceTypes
 from litellm.constants import DB_SPEND_UPDATE_JOB_NAME, REDIS_UPDATE_BUFFER_KEY, SPEND_ROLLUP_LOCK_TIMEOUT_MS
 from litellm.proxy._types import DailyTagSpendTransaction, Litellm_EntityType, SpendLogsPayload, SpendUpdateQueueItem
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.proxy.db.db_spend_update_writer import (
     _TEAM_ADVISORY_LOCK_SQL,
     _TEAM_MEMBER_SPEND_SQL,
@@ -37,8 +38,38 @@ from litellm.proxy.db.db_transaction_queue.window_spend_update_queue import (
 from litellm.proxy.db.rollup_lock_timeout import ROLLUP_LOCK_TIMEOUT_SQL
 from litellm.responses.streaming_iterator import drain_logging_tasks
 from litellm.proxy.db.spend_accounting import AccountingEffects, AccountingEvent
+from litellm.proxy.utils import PrismaClient, ProxyLogging
 from litellm.types.caching import RedisPipelineLpopOperation, RedisPipelineRpushOperation
 from tests.unit.proxy.db.fake_prisma_engine import engine_call
+
+
+@pytest.mark.asyncio
+async def test_writer_queue_preserves_model_groups_for_one_physical_model() -> None:
+    writer: Final = DBSpendUpdateWriter()
+    prisma: Final = PrismaClient("postgresql://unused:unused@localhost/unused", ProxyLogging(UserApiKeyCache()))
+    payload: Final[dict[str, object]] = {
+        "request_id": "fixture-request",
+        "user": "fixture-user",
+        "startTime": "2001-02-03T12:00:00Z",
+        "api_key": "fixture-key",
+        "model": "fixture-model",
+        "custom_llm_provider": "fixture-provider",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "spend": 0.25,
+        "metadata": "{}",
+    }
+    for group in ("alpha", "beta", "alpha"):
+        await writer.add_spend_log_transaction_to_daily_user_transaction(
+            payload={**payload, "model_group": group}, prisma_client=prisma
+        )
+
+    updates: Final = await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+
+    assert sorted((row["model_group"], row["spend"], row["api_requests"]) for row in updates.values()) == [
+        ("alpha", 0.5, 2),
+        ("beta", 0.25, 1),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1602,23 +1633,17 @@ async def test_add_spend_log_transaction_to_daily_org_transaction_injects_org_id
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_org_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_org_transaction(
         payload=payload,
         prisma_client=mock_prisma,
         org_id=org_id,
     )
 
-    # Should enqueue one org spend update
-    writer.daily_org_spend_update_queue.add_update.assert_called_once()
-
-    # Validate key and injected fields
-    call_args = writer.daily_org_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-    for key, transaction in update_dict.items():
-        assert key == f"{org_id}_2024-01-01_test-key_gpt-4_openai_"
+    updates: Final = (
+        await writer.daily_org_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    )
+    assert len(updates) == 1
+    for transaction in updates.values():
         assert transaction["organization_id"] == org_id
         assert transaction["date"] == "2024-01-01"
         assert transaction["api_key"] == "test-key"
@@ -1682,20 +1707,16 @@ async def test_add_spend_log_transaction_to_daily_end_user_transaction_injects_e
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_end_user_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_end_user_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
 
-    writer.daily_end_user_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_end_user_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-    for key, transaction in update_dict.items():
-        assert key == f"{end_user_id}_2024-01-01_test-key_gpt-4_openai_"
+    updates: Final = (
+        await writer.daily_end_user_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    )
+    assert len(updates) == 1
+    for transaction in updates.values():
         assert transaction["end_user_id"] == end_user_id
         assert transaction["date"] == "2024-01-01"
         assert transaction["api_key"] == "test-key"
@@ -1758,20 +1779,16 @@ async def test_add_spend_log_transaction_to_daily_agent_transaction_injects_agen
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_agent_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_agent_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
 
-    writer.daily_agent_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_agent_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-    for key, transaction in update_dict.items():
-        assert key == f"{agent_id}_2024-01-01_test-key_gpt-4_openai_"
+    updates: Final = (
+        await writer.daily_agent_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    )
+    assert len(updates) == 1
+    for transaction in updates.values():
         assert transaction["agent_id"] == agent_id
         assert transaction["date"] == "2024-01-01"
         assert transaction["api_key"] == "test-key"
@@ -1875,23 +1892,14 @@ async def test_endpoint_field_is_correctly_mapped_from_call_type(call_type: str,
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_user_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
 
-    writer.daily_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-
-    for key, transaction in update_dict.items():
-        # Verify endpoint is included in the key
-        assert key == f"test-user_2024-01-01_test-key_gpt-4_openai_{expected_endpoint}"
-
+    updates: Final = await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    assert len(updates) == 1
+    for transaction in updates.values():
         # Verify endpoint is set in the transaction
         assert transaction["endpoint"] == expected_endpoint
         assert transaction["user_id"] == "test-user"
@@ -1922,21 +1930,14 @@ async def test_endpoint_field_maps_retrieve_batch_spend_row_to_batches_endpoint(
         "metadata": '{"usage_object": {}}',
     }
 
-    writer.daily_spend_update_queue.add_update = AsyncMock()
-
     await writer.add_spend_log_transaction_to_daily_user_transaction(
         payload=payload,
         prisma_client=mock_prisma,
     )
 
-    writer.daily_spend_update_queue.add_update.assert_called_once()
-
-    call_args = writer.daily_spend_update_queue.add_update.call_args[1]
-    update_dict = call_args["update"]
-    assert len(update_dict) == 1
-
-    for key, transaction in update_dict.items():
-        assert key == "test-user_2024-01-01_test-key_gpt-4_openai_/batches"
+    updates: Final = await writer.daily_spend_update_queue.flush_and_get_aggregated_daily_spend_update_transactions()
+    assert len(updates) == 1
+    for transaction in updates.values():
         assert transaction["endpoint"] == "/batches"
 
 
