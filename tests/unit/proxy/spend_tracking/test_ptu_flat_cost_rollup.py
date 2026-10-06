@@ -241,13 +241,13 @@ async def test_rollup_writes_sentinel_row_with_hourly_cost():
     assert created["api_key"] == PTU_SENTINEL_API_KEY
     assert created["ptu_flat_cost"] == pytest.approx(240.0)
     assert created["team_id"] == "team_x"
-    # identity in the key, display beside it, so a rename cannot move the row
     assert created["model"] == "m1"
     assert created["model_group"] == "gpt-4o-mini-ptu"
     keyed = table.upsert.await_args.kwargs["where"][
-        "team_id_date_api_key_model_custom_llm_provider_mcp_namespaced_tool_name_endpoint"
+        "team_id_date_api_key_model_model_group_custom_llm_provider_mcp_namespaced_tool_name_endpoint"
     ]
     assert keyed["model"] == "m1"
+    assert keyed["model_group"] == created["model_group"]
 
 
 @pytest.mark.asyncio
@@ -751,7 +751,7 @@ class _FakeSentinelTable:
     async def upsert(self, where, data):
         if self._upsert_gate is not None:
             await self._upsert_gate.wait()
-        key = where["team_id_date_api_key_model_custom_llm_provider_mcp_namespaced_tool_name_endpoint"]
+        key = where["team_id_date_api_key_model_model_group_custom_llm_provider_mcp_namespaced_tool_name_endpoint"]
         if key["team_id"] == self.failing_team:
             raise RuntimeError(f"write rejected for {self.failing_team}")
         row_key = (key["team_id"], key["date"], key["api_key"], key["model"])
