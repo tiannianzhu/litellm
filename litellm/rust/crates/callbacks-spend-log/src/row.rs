@@ -572,7 +572,17 @@ pub(crate) fn build(
         "guardrail_information",
         builder.sanitize_guardrail_information(&guardrail_information, input),
     );
-    clean.set("usage_object", attribution.metadata("usage_object").clone());
+    let standard_usage = attribution.metadata("usage_object");
+    let usage_object = if matches!(
+        input.call_type.as_deref(),
+        Some("transcription" | "atranscription")
+    ) && as_str(get_or_none(usage, "type")) == Some("duration")
+    {
+        or(standard_usage, usage)
+    } else {
+        standard_usage
+    };
+    clean.set("usage_object", usage_object.clone());
     clean.set("model_map_information", model_map_information);
     clean.set(
         "cold_storage_object_key",

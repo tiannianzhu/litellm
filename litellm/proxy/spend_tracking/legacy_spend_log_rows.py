@@ -1,14 +1,6 @@
 # pyright: reportPrivateUsage=false
-# The frozen ledger-off builder still reads the private helpers it shares with spend_tracking_utils.
-"""Deprecated: the ledger-off SpendLogs row builder.
-
-Frozen as it was before the ledger. With the ledger on, ``get_logging_payload`` builds every row in
-Rust (``rust_spend_log_rows.spendlogs_payload_rust``), and nothing here runs. Delete this module
-together with the ledger-off setting; do not add to it. ``record_goldens.py`` replays it to record the
-Rust builder's goldens, which stay as recorded once it is gone.
-
-Moved out of ``spend_tracking_utils`` unchanged. The helpers both builders share stay there.
-"""
+# The Python row builder shares internal helpers with spend_tracking_utils.
+"""Build SpendLogs rows when the ledger is disabled."""
 
 import json
 from collections.abc import Mapping
@@ -721,7 +713,6 @@ def logging_payload(
     end_time: datetime,
     llm_router: "Router | None" = None,
 ) -> SpendLogsPayload:
-    """The ledger-off ``get_logging_payload``, frozen as it was before the Rust row builder."""
     row_kwargs: Final = _CUSTOMER_METADATA_ADAPTER.validate_python(kwargs)
     subscription_usage: Final = claude_subscription_usage(as_str_mapping(row_kwargs) or {}, response_obj)
     rejected_as_unknown_model: Final = isinstance(response_obj, ProxyModelNotFoundError)
@@ -904,10 +895,15 @@ def logging_payload(
     # clean up litellm metadata
     standard_error: Final = standard_logging_payload.get("error_information") if standard_logging_payload else None
     selected_error: Final = standard_error if standard_error is not None else spend_log_error_information(metadata)
+    standard_usage: Final[dict[str, object] | None] = (
+        standard_logging_payload["metadata"].get("usage_object") if standard_logging_payload is not None else None
+    )
     clean_metadata = _get_spend_logs_metadata(
         metadata,
         error_information=(
-            _scrub_raw_model_from_error_information(selected_error, raw_model) if model_is_placeholdered else selected_error
+            _scrub_raw_model_from_error_information(selected_error, raw_model)
+            if model_is_placeholdered
+            else selected_error
         ),
         original_exception=failure_exception,
         no_log=no_log,
@@ -947,9 +943,10 @@ def logging_payload(
             else None
         ),
         usage_object=(
-            standard_logging_payload["metadata"].get("usage_object", None)
-            if standard_logging_payload is not None
-            else None
+            (standard_usage or usage)
+            if call_type in (CallTypes.transcription.value, CallTypes.atranscription.value)
+            and usage.get("type") == "duration"
+            else standard_usage
         ),
         model_map_information=(
             standard_logging_payload["model_map_information"] if standard_logging_payload is not None else None

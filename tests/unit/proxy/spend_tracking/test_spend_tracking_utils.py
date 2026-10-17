@@ -40,16 +40,24 @@ from litellm.litellm_core_utils.litellm_logging import (
     Logging,
     StandardLoggingPayloadSetup,
     create_dummy_standard_logging_payload,
+    get_standard_logging_object_payload,
 )
-from litellm.litellm_core_utils.litellm_logging import get_standard_logging_object_payload
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-from litellm.llms.base_llm.ocr.transformation import OCRResponse, OCRUsageInfo
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps, safe_json_structure
+from litellm.llms.base_llm.ocr.transformation import OCRResponse, OCRUsageInfo
 from litellm.proxy._types import SpendLogsMetadata, SpendLogsMetadataFields, SpendLogsPayload, UserAPIKeyAuth
 from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup, add_litellm_data_to_request
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import get_passthrough_router_request_metadata
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import HttpPassThroughEndpointHelpers
 from litellm.proxy.route_llm_request import ProxyModelNotFoundError
+from litellm.proxy.spend_tracking.legacy_spend_log_rows import (
+    _get_messages_for_spend_logs_payload,
+    _get_proxy_server_request_for_spend_logs_payload,
+    _get_request_duration_ms,
+    _get_response_for_spend_logs_payload,
+    _scrub_raw_model_from_error_information,
+    _stored_request_without_requester_ip_address,
+)
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _extract_usage_for_ocr_call,
     _get_session_id_for_spend_log,
@@ -69,21 +77,14 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     should_store_prompts_and_responses_in_spend_logs,
     spend_log_row_with_retained_metadata,
 )
-from litellm.proxy.spend_tracking.legacy_spend_log_rows import (
-    _get_messages_for_spend_logs_payload,
-    _get_proxy_server_request_for_spend_logs_payload,
-    _get_request_duration_ms,
-    _get_response_for_spend_logs_payload,
-    _scrub_raw_model_from_error_information,
-    _stored_request_without_requester_ip_address,
-)
 from litellm.proxy.utils import hash_token
-from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     SETTLES_BACKGROUND_RESPONSE_KWARG,
     BackgroundResponseSettlement,
     PassthroughStandardLoggingPayload,
 )
+from litellm.types.proxy.auth.customer_hierarchy import CustomerHierarchyAuth
+from litellm.types.rerank import RerankResponse, RerankResponseMeta
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
     BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN,
@@ -95,6 +96,8 @@ from litellm.types.utils import (
     StandardLoggingPayload,
     StandardLoggingPayloadErrorInformation,
     StandardLoggingVectorStoreRequest,
+    TranscriptionResponse,
+    TranscriptionUsageDurationObject,
 )
 
 
@@ -666,6 +669,85 @@ def test_batch_spend_row_stores_the_same_usage_extras_as_a_chat_call_with_its_co
     )
 
 
+def test_get_logging_payload_records_rerank_input_tokens_without_changing_spend() -> None:
+    timestamp: Final = datetime.datetime(2026, 1, 1, tzinfo=timezone.utc)
+    meta: Final = RerankResponseMeta(tokens={"output_tokens": 3}, billed_units={"total_tokens": 12})
+    response: Final = RerankResponse(id="rerank-usage", results=[], meta=meta)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-rerank-model",
+            "call_type": "arerank",
+            "response_cost": 0.125,
+            "litellm_params": {"metadata": {}},
+        },
+        response_obj=response,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (9, 3, 12)
+    assert payload["spend"] == 0.125
+    assert response.meta == meta
+
+
+@pytest.mark.parametrize(
+    ("through_collector", "stored_seconds", "expected_seconds"),
+    ((False, None, 2.0), (True, None, 2.0), (True, 3.0, 3.0)),
+    ids=("direct", "collector-empty-snapshot", "collector-existing-snapshot"),
+)
+def test_get_logging_payload_preserves_free_transcription_duration_usage(
+    through_collector: bool, stored_seconds: float | None, expected_seconds: float
+) -> None:
+    from litellm.proxy.spend_tracking.spend_event import (
+        SpendEvent,
+        build_spend_event,
+        decode_spend_event,
+        spend_event_callback_args,
+    )
+
+    timestamp: Final = datetime.datetime(2026, 1, 1, tzinfo=timezone.utc)
+    response: Final = TranscriptionResponse(text="recognized words").model_copy(
+        update=MappingProxyType({"usage": TranscriptionUsageDurationObject(type="duration", seconds=2)})
+    )
+    original_snapshot: Final = create_dummy_standard_logging_payload()
+    snapshot: Final[StandardLoggingPayload] = {
+        **original_snapshot,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "response_cost": 0.0,
+        "metadata": {
+            **original_snapshot["metadata"],
+            "usage_object": {"type": "duration", "seconds": stored_seconds} if stored_seconds is not None else {},
+        },
+    }
+    kwargs: Final = {
+        "model": "fixture-asr",
+        "call_type": "atranscription",
+        "response_cost": 0.0,
+        "litellm_params": {"metadata": {}},
+        "standard_logging_object": snapshot,
+    }
+    encoded_event: Final = (
+        build_spend_event(kwargs, response, timestamp, timestamp, store_bodies=False) if through_collector else None
+    )
+    assert encoded_event is None or isinstance(encoded_event, bytes)
+    event: Final = decode_spend_event(encoded_event) if encoded_event is not None else None
+    assert event is None or isinstance(event, SpendEvent)
+    callback_args: Final = spend_event_callback_args(event) if event is not None else None
+    payload: Final = get_logging_payload(
+        kwargs=kwargs if callback_args is None else dict(callback_args.kwargs),
+        response_obj=response if callback_args is None else callback_args.response_obj,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (0, 0, 0)
+    assert payload["spend"] == 0.0
+    assert json.loads(payload["metadata"])["usage_object"] == {"type": "duration", "seconds": expected_seconds}
+    assert payload["completionStartTime"] == (None if through_collector else timestamp)
+
+
 class _HashingCache(litellm.Cache):
     def __init__(self) -> None:
         pass
@@ -912,11 +994,14 @@ def test_invalid_caller_session_does_not_invent_a_trace_session(
 
 
 def test_invalid_logged_session_does_not_block_spend_log_storage() -> None:
-    assert _get_session_id_for_spend_log(
-        kwargs={"litellm_session_id": "convo\x00x", "litellm_trace_id": "request-trace"},
-        metadata={"session_id": "convo\x00x"},
-        standard_logging_payload={**_TRACE_ONLY_STANDARD_LOGGING, "session_id": "convo\x00x"},
-    ) is None
+    assert (
+        _get_session_id_for_spend_log(
+            kwargs={"litellm_session_id": "convo\x00x", "litellm_trace_id": "request-trace"},
+            metadata={"session_id": "convo\x00x"},
+            standard_logging_payload={**_TRACE_ONLY_STANDARD_LOGGING, "session_id": "convo\x00x"},
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -9563,3 +9648,60 @@ async def test_client_metadata_cannot_attribute_a_chat_request_to_generate_conte
     )
     assert updated["metadata"]["user_api_key_request_route"] == "/chat/completions"
     assert "route_call_type" not in stored
+
+
+@pytest.mark.parametrize(("seconds", "failed"), ((None, False), (0.0, True), (2.0, False), (2.0, True)))
+def test_prepared_transcription_keeps_duration_in_spend_logs_and_durable_snapshot(
+    seconds: float | None, failed: bool
+) -> None:
+    from litellm.accounting.snapshot import build_accounting_payload
+
+    now: Final = datetime.datetime(2026, 1, 1, tzinfo=timezone.utc)
+    logger: Final = Logging(
+        model="fixture-asr",
+        messages=[],
+        stream=False,
+        call_type="atranscription",
+        start_time=now,
+        litellm_call_id="transcription-request",
+        function_id="transcription-request",
+    )
+    logger.update_environment_variables(
+        model="fixture-asr", custom_llm_provider="openai", litellm_params={}, optional_params={}
+    )
+    cost: Final = 0.125 if seconds else 0.0
+    response: Final = TranscriptionResponse(text="recognized words").model_copy(
+        update={"usage": TranscriptionUsageDurationObject(type="duration", seconds=seconds)}
+        if seconds is not None
+        else {}
+    )
+    response.hidden_params = {"response_cost": cost}
+    prepared: Final = logger.prepare_response_cost(response, now)
+    assert prepared is not None
+    error: Final = RuntimeError("post-call failed")
+    if failed:
+        logger._failure_handler_helper_fn(error, "fixture", now, now)
+    snapshot: Final = logger.model_call_details["standard_logging_object"] if failed else prepared.payload
+    spend: Final = get_logging_payload(
+        {
+            **logger.model_call_details,
+            "standard_logging_object": snapshot,
+            "litellm_params": {"metadata": {"status": "failure" if failed else "success"}},
+        },
+        error if failed else response,
+        now,
+        now,
+    )
+    accounting: Final = build_accounting_payload(
+        spend, entities={}, model_access_groups=(), windows=(), router=lambda: None
+    )
+    fields: Final = TypeAdapter(dict[str, object])
+    stored: Final = fields.validate_python(accounting["metadata"])
+    usage: Final = fields.validate_python(stored.get("usage_object") or {})
+    assert snapshot["response_cost"] == spend["spend"] == accounting["spend"] == cost
+    assert (spend["prompt_tokens"], spend["completion_tokens"], spend["total_tokens"]) == (0, 0, 0)
+    assert spend["status"] == accounting["status"] == ("failure" if failed else "success")
+    assert usage.get("seconds") == seconds
+    if seconds is not None:
+        assert usage["type"] == "duration"
+        assert isinstance(response.usage, TranscriptionUsageDurationObject) and response.usage.seconds == seconds
