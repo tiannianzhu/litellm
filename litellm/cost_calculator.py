@@ -1198,6 +1198,24 @@ def _extract_service_tier(source: object) -> str | None:
 def get_usage_object(
     completion_response: object,
 ) -> Usage | None:
+    if isinstance(completion_response, RerankResponse):
+        meta: Final = completion_response.meta
+        if meta is None:
+            return None
+        tokens: Final = meta.get("tokens")
+        billed_units: Final = meta.get("billed_units")
+        reported_input_tokens: Final = tokens.get("input_tokens") if tokens is not None else None
+        billed_tokens: Final = billed_units.get("total_tokens") if billed_units is not None else None
+        input_tokens: Final = reported_input_tokens if reported_input_tokens is not None else billed_tokens
+        output_tokens: Final = tokens.get("output_tokens") if tokens is not None else None
+        if input_tokens is None and output_tokens is None:
+            return None
+        return Usage(
+            prompt_tokens=input_tokens or 0,
+            completion_tokens=output_tokens or 0,
+            total_tokens=(input_tokens or 0) + (output_tokens or 0),
+        )
+
     usage_obj: Final = cast(
         Usage | ResponseAPIUsage | dict | BaseModel,
         (

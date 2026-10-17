@@ -34,7 +34,7 @@ from litellm.llms.together_ai.cost_calculator import get_model_params_and_catego
 from litellm.types.llms.base import CachedTokensDetails
 from litellm.types.llms.openai import HttpxBinaryResponseContent, OpenAIRealtimeStreamList, ResponseAPIUsage, ResponsesAPIResponse
 from litellm.types.llms.xai import RealtimeMeteredUsage
-from litellm.types.rerank import RerankResponse
+from litellm.types.rerank import RerankResponse, RerankResponseMeta
 from litellm.types.utils import CacheCreationTokenDetails, CallTypes, Choices, CompletionTokensDetailsWrapper, EmbeddingResponse, ImageObject, ImageResponse, ImageUsage, ImageUsageInputTokensDetails, LiteLLMRealtimeStreamLoggingObject, Message, ModelInfo, ModelResponse, PromptTokensDetails, PromptTokensDetailsWrapper, Usage
 from litellm.types.videos.main import VideoObject
 from litellm.utils import _invalidate_model_cost_lowercase_map, supports_prompt_caching
@@ -1864,6 +1864,35 @@ def test_tiered_pricing_only_deployment_completion_cost_is_nonzero():
     expected = 12 * 4e-07 + 377 * 1.6e-06
     assert cost == pytest.approx(expected)
     assert cost > 0
+
+
+@pytest.mark.parametrize(
+    "meta,expected",
+    (
+        (
+            RerankResponseMeta(
+                tokens={"input_tokens": 7, "output_tokens": 3}, billed_units={"total_tokens": 101, "search_units": 2}
+            ),
+            (7, 3, 10),
+        ),
+        (RerankResponseMeta(billed_units={"total_tokens": 37}), (37, 0, 37)),
+        (RerankResponseMeta(tokens={"input_tokens": 0}, billed_units={"total_tokens": 101}), (0, 0, 0)),
+        (RerankResponseMeta(billed_units={"search_units": 3}), None),
+    ),
+)
+def test_get_usage_object_uses_rerank_token_counts_without_treating_search_units_as_tokens(
+    meta: RerankResponseMeta, expected: tuple[int, int, int] | None
+) -> None:
+    from litellm.cost_calculator import get_usage_object
+
+    response: Final = RerankResponse(results=[], meta=meta)
+    usage: Final = get_usage_object(response)
+
+    if expected is None:
+        assert usage is None
+        return
+    assert usage is not None
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == expected
 
 
 def test_per_query_priced_rerank_deployment_completion_cost_is_nonzero():

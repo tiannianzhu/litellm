@@ -160,6 +160,49 @@ def test_streaming_event_reconstructs_complete_streaming_response():
     assert args.kwargs["complete_streaming_response"] == args.response_obj
 
 
+def test_rerank_event_round_trip_preserves_reported_usage_and_fee_in_spend_logs() -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+    from litellm.types.rerank import RerankResponse
+
+    started: Final = datetime(2026, 1, 1)
+    response: Final = RerankResponse(
+        id="rerank-collector-usage",
+        results=[],
+        meta={"billed_units": {"total_tokens": 37}, "tokens": {"input_tokens": 37}},
+    )
+    logging: Final = Logging(
+        model="fixture-rerank",
+        messages=[],
+        stream=False,
+        call_type="arerank",
+        start_time=started,
+        litellm_call_id="rerank-collector-call",
+        function_id="rerank-collector-function",
+    )
+    logging.update_environment_variables(litellm_params={}, optional_params={})
+    logging.model_call_details["response_cost"] = 0.125
+    logging._success_handler_helper_fn(result=response, start_time=started, end_time=started)
+    event: Final = decode_spend_event(_build(logging.model_call_details, response))
+    assert not isinstance(event, SpendEventDecodeError)
+    args: Final = spend_event_callback_args(event)
+    assert args.response_obj is not None
+    assert isinstance(args.response_obj.get("usage"), dict)
+    assert args.response_obj["usage"]["prompt_tokens"] == 37
+    assert args.response_obj["usage"]["completion_tokens"] == 0
+    assert args.response_obj["usage"]["total_tokens"] == 37
+    payload: Final = get_logging_payload(
+        kwargs=dict(args.kwargs), response_obj=args.response_obj, start_time=args.start_time, end_time=args.end_time
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (37, 0, 37)
+    assert payload["spend"] == 0.125
+    metadata: Final = json.loads(payload["metadata"])
+    assert metadata["usage_object"]["prompt_tokens"] == payload["prompt_tokens"]
+    assert metadata["usage_object"]["completion_tokens"] == payload["completion_tokens"]
+    assert metadata["usage_object"]["total_tokens"] == payload["total_tokens"]
+
+
 class _HashingCache(Cache):
     def __init__(self) -> None:
         pass

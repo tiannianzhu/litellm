@@ -37,6 +37,7 @@ from litellm.constants import (
 from litellm.constants import (
     MAX_STRING_LENGTH_PROMPT_IN_DB as DEFAULT_MAX_STRING_LENGTH_PROMPT_IN_DB,
 )
+from litellm.cost_calculator import get_usage_object
 from litellm.integrations.otel.model.metadata import caller_session_id
 from litellm.integrations.otel.model.trace_controls import TraceControls
 from litellm.litellm_core_utils.classifier_logging import (
@@ -80,6 +81,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     SETTLES_BACKGROUND_RESPONSE_KWARG,
     BackgroundResponseSettlement,
 )
+from litellm.types.rerank import RerankResponse
 from litellm.types.router import DeploymentTypedDict, LiteLLM_Params, SilentExperimentFlag
 from litellm.types.utils import (
     BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN,
@@ -668,6 +670,8 @@ def get_logging_payload(
         _usage: Final = (
             chat_usage_of_batch.model_dump()
             if chat_usage_of_batch is not None
+            else get_usage_object(response_obj)
+            if isinstance(response_obj, RerankResponse)
             else response_obj_dict.get("usage", None) or {}
         )
         if isinstance(_usage, litellm.Usage):

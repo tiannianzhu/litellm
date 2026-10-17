@@ -6996,7 +6996,7 @@ class StandardLoggingPayloadSetup:
 
     @staticmethod
     def get_usage_as_dict(
-        response_obj: dict | None,
+        response_obj: dict | RerankResponse | None,
         combined_usage_object: Usage | None = None,
     ) -> dict:
         """
@@ -7006,6 +7006,9 @@ class StandardLoggingPayloadSetup:
         _empty: Final[dict[str, object]] = {}
         if combined_usage_object is not None:
             return combined_usage_object.model_dump()
+        if isinstance(response_obj, RerankResponse):
+            rerank_usage: Final = get_usage_object(response_obj)
+            return rerank_usage.model_dump() if rerank_usage is not None else _empty
         if not response_obj:
             return _empty
         _raw: Final = response_obj.get("usage", None)
@@ -7652,8 +7655,9 @@ def get_standard_logging_object_payload(
         call_type: Final = kwargs.get("call_type")
         cache_hit: Final = kwargs.get("cache_hit", False)
         # Extract usage as a plain dict, avoiding Pydantic round-trip
+        usage_response: Final = init_response_obj if isinstance(init_response_obj, RerankResponse) else response_obj
         raw_usage_dict: Final = StandardLoggingPayloadSetup.get_usage_as_dict(
-            response_obj=None if is_unbilled_non_inference_call(call_type, metadata, response_obj) else response_obj,
+            response_obj=None if is_unbilled_non_inference_call(call_type, metadata, response_obj) else usage_response,
             combined_usage_object=cast(Usage | None, kwargs.get("combined_usage_object"))
             or (batch_chat_usage(init_response_obj) if isinstance(init_response_obj, LiteLLMBatch) else None),
         )

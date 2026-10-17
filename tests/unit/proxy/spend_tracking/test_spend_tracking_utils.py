@@ -69,6 +69,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     SETTLES_BACKGROUND_RESPONSE_KWARG,
     BackgroundResponseSettlement,
 )
+from litellm.types.rerank import RerankResponse, RerankResponseMeta
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
     BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN,
@@ -282,6 +283,33 @@ def test_batch_spend_row_stores_the_same_usage_extras_as_a_chat_call_with_its_co
             prompt_tokens=29, completion_tokens=46, total_tokens=75, prompt_tokens_details={"cached_tokens": 8}
         )
     )
+
+
+@pytest.mark.parametrize(
+    "meta",
+    (
+        RerankResponseMeta(billed_units={"total_tokens": 37}),
+        RerankResponseMeta(tokens={"input_tokens": 37, "output_tokens": 0}),
+    ),
+)
+def test_get_logging_payload_records_rerank_input_tokens_without_changing_spend(meta: RerankResponseMeta) -> None:
+    timestamp: Final = datetime.datetime(2026, 1, 1, tzinfo=timezone.utc)
+    response: Final = RerankResponse(id="rerank-usage", results=[], meta=meta)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-rerank-model",
+            "call_type": "arerank",
+            "response_cost": 0.125,
+            "litellm_params": {"metadata": {}},
+        },
+        response_obj=response,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (37, 0, 37)
+    assert payload["spend"] == 0.125
+    assert response.meta == meta
 
 
 class _HashingCache(litellm.Cache):
