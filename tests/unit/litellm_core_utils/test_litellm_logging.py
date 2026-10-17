@@ -4179,6 +4179,36 @@ def test_get_usage_as_dict():
     assert result == {}
 
 
+def test_standard_logging_preserves_rerank_reported_token_usage() -> None:
+    from litellm.types.rerank import RerankResponse
+
+    started: Final = datetime_unit_test(2026, 1, 1)
+    response: Final = RerankResponse(
+        id="rerank-standard-usage",
+        results=[],
+        meta={"billed_units": {"total_tokens": 37}, "tokens": {"input_tokens": 37}},
+    )
+    logging: Final = Logging(
+        model="fixture-rerank",
+        messages=[],
+        stream=False,
+        call_type="arerank",
+        start_time=started,
+        litellm_call_id="rerank-standard-call",
+        function_id="rerank-standard-function",
+    )
+    logging.update_environment_variables(litellm_params={}, optional_params={})
+    logging.model_call_details["response_cost"] = 0.125
+    logging._success_handler_helper_fn(result=response, start_time=started, end_time=started)
+    snapshot: Final = logging.model_call_details["standard_logging_object"]
+
+    assert (snapshot["prompt_tokens"], snapshot["completion_tokens"], snapshot["total_tokens"]) == (37, 0, 37)
+    assert snapshot["response_cost"] == 0.125
+    assert snapshot["metadata"]["usage_object"]["prompt_tokens"] == 37
+    assert snapshot["metadata"]["usage_object"]["completion_tokens"] == 0
+    assert snapshot["metadata"]["usage_object"]["total_tokens"] == 37
+
+
 @pytest.mark.parametrize(
     "usage, include_usage",
     [(None, False), (None, True), ({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, True)],
