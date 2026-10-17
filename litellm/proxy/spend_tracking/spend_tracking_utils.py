@@ -913,6 +913,9 @@ def get_logging_payload(
     payload_error_information: Final = (
         standard_logging_payload.get("error_information", None) if standard_logging_payload is not None else None
     )
+    standard_usage: Final[dict[str, object] | None] = (
+        standard_logging_payload["metadata"].get("usage_object", None) if standard_logging_payload is not None else None
+    )
     clean_metadata = _get_spend_logs_metadata(
         persisted_metadata,
         is_silent_experiment=(
@@ -956,9 +959,9 @@ def get_logging_payload(
             else None
         ),
         usage_object=(
-            standard_logging_payload["metadata"].get("usage_object", None)
-            if standard_logging_payload is not None
-            else None
+            (standard_usage or usage)
+            if call_type in ("transcription", "atranscription") and usage.get("type") == "duration"
+            else standard_usage
         ),
         model_map_information=(
             standard_logging_payload["model_map_information"] if standard_logging_payload is not None else None

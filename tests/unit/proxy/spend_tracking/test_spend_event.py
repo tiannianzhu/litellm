@@ -164,6 +164,65 @@ def test_streaming_event_reconstructs_complete_streaming_response():
     assert args.kwargs["complete_streaming_response"] == args.response_obj
 
 
+@pytest.mark.parametrize(
+    ("meta", "expected"),
+    (
+        ({"billed_units": {"total_tokens": 12}, "tokens": {"output_tokens": 3}}, (9, 3, 12)),
+        ({"tokens": {"input_tokens": 0}}, (0, 0, 0)),
+        ({"billed_units": {"search_units": 3}}, None),
+    ),
+)
+def test_rerank_event_round_trip_preserves_reported_usage_and_fee_in_spend_logs(
+    meta: dict[str, object], expected: tuple[int, int, int] | None
+) -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+    from litellm.types.rerank import RerankResponse
+
+    started: Final = datetime(2026, 1, 1)
+    response: Final = RerankResponse(
+        id="rerank-collector-usage",
+        results=[],
+        meta=meta,
+    )
+    logging: Final = Logging(
+        model="fixture-rerank",
+        messages=[],
+        stream=False,
+        call_type="arerank",
+        start_time=started,
+        litellm_call_id="rerank-collector-call",
+        function_id="rerank-collector-function",
+    )
+    logging.update_environment_variables(litellm_params={}, optional_params={})
+    logging.model_call_details["response_cost"] = 0.125
+    logging._success_handler_helper_fn(result=response, start_time=started, end_time=started)
+    line: Final = _build(logging.model_call_details, response)
+    counts: Final = expected if expected is not None else (0, 0, 0)
+    usage: Final = dict(zip(("prompt_tokens", "completion_tokens", "total_tokens"), counts))
+    serialized_response: Final = json.loads(line)["response"]
+    assert serialized_response == {
+        "id": "rerank-collector-usage",
+        **(
+            {"usage": {**usage, "completion_tokens_details": None, "prompt_tokens_details": None}}
+            if expected is not None
+            else {}
+        ),
+    }
+    event: Final = decode_spend_event(line)
+    assert not isinstance(event, SpendEventDecodeError)
+    args: Final = spend_event_callback_args(event)
+    assert args.response_obj == serialized_response
+    payload: Final = get_logging_payload(
+        kwargs=dict(args.kwargs), response_obj=args.response_obj, start_time=args.start_time, end_time=args.end_time
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == counts
+    assert payload["spend"] == 0.125
+    metadata: Final = json.loads(payload["metadata"])
+    assert metadata["usage_object"] == (usage if expected is not None else {})
+
+
 class _HashingCache(Cache):
     def __init__(self) -> None:
         pass

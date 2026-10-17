@@ -4737,7 +4737,12 @@ def test_rerank_metadata_reaches_standard_and_spend_logs(
     assert StandardLoggingPayloadSetup.get_usage_as_dict(response.model_dump()) == (
         expected_usage if expected is not None else {}
     )
-    kwargs: Final = {"model": "rerank-model", "call_type": "arerank", "litellm_params": {"metadata": {}}}
+    kwargs: Final = {
+        "model": "rerank-model",
+        "call_type": "arerank",
+        "response_cost": 0.125,
+        "litellm_params": {"metadata": {}},
+    }
     standard: Final = get_standard_logging_object_payload(
         kwargs=kwargs,
         init_response_obj=response,
@@ -4753,6 +4758,7 @@ def test_rerank_metadata_reaches_standard_and_spend_logs(
         kwargs={**kwargs, "standard_logging_object": standard}, response_obj=response, start_time=now, end_time=now
     )
     assert (spend["prompt_tokens"], spend["completion_tokens"], spend["total_tokens"]) == counts
+    assert standard["response_cost"] == spend["spend"] == 0.125
 
 
 @pytest.mark.parametrize("combined", [None, Usage(prompt_tokens=11, completion_tokens=2, total_tokens=13)])
