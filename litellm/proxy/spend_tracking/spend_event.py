@@ -32,6 +32,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     SETTLES_BACKGROUND_RESPONSE_KWARG,
     BackgroundResponseSettlement,
 )
+from litellm.types.rerank import RerankResponse, get_rerank_usage
 from litellm.types.utils import LiteLLMBatch, Usage
 from litellm.types.videos.utils import is_video_status_call_type
 
@@ -318,7 +319,13 @@ def _compact_response(response_obj: object) -> CompactResponse | None:
     dumped: Final = response_obj.model_dump() if isinstance(response_obj, BaseModel) else _mapping_or_none(response_obj)
     if dumped is None:
         return None
-    scalars: Final = _COMPACT_RESPONSE.validate_python(_drop_keys(dumped, frozenset({"choices"})))
+    rerank_usage: Final = get_rerank_usage(dumped) if isinstance(response_obj, RerankResponse) else None
+    with_usage: Final = (
+        {**dumped, "usage": {**rerank_usage, "completion_tokens_details": None, "prompt_tokens_details": None}}
+        if rerank_usage is not None
+        else dumped
+    )
+    scalars: Final = _COMPACT_RESPONSE.validate_python(_drop_keys(with_usage, frozenset({"choices"})))
     tool_call_names: Final = response_tool_call_names(response_obj)
     if not tool_call_names:
         return scalars

@@ -269,6 +269,7 @@ from litellm.types.utils import (
     StandardLoggingZeroCostDiagnostic,
     TextCompletionResponse,
     TranscriptionResponse,
+    TranscriptionUsageDurationObject,
     Usage,
     batch_chat_usage,
 )
@@ -4021,8 +4022,13 @@ class Logging(LiteLLMLoggingBaseClass):
             )
 
             result = result.model_copy()
-            transformed_usage = TranscriptionUsageObjectTransformation.transform_transcription_usage_object(
-                result.usage
+            usage: Final = result.usage
+            transformed_usage = (
+                None
+                if usage is None
+                else Usage(**usage.model_dump())
+                if isinstance(usage, TranscriptionUsageDurationObject)
+                else TranscriptionUsageObjectTransformation.transform_transcription_usage_object(usage)
             )
             setattr(result, "usage", transformed_usage)
         return result

@@ -20,6 +20,7 @@ import re
 import sys
 import threading
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, cast
@@ -32,12 +33,15 @@ import respx
 import litellm
 from litellm import Router
 from litellm.constants import DEFAULT_MAX_LRU_CACHE_SIZE
-from litellm.litellm_core_utils.ptu_pricing import ptu_config_error
+from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap, adopt_model_cost_map
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.llm_cost_calc.utils import SERVICE_TIER_COST_KEY_SUFFIXES
-from litellm.litellm_core_utils.get_model_cost_map import GetModelCostMap
+from litellm.litellm_core_utils.model_cost_table import publish
+from litellm.litellm_core_utils.ptu_pricing import ptu_config_error
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy.utils import create_model_info_response
 from litellm.router_api import ChangeSet
+from litellm.types.rerank import RerankResponse
 from litellm.types.router import (
     Deployment,
     DeploymentTypedDict,
@@ -48,8 +52,6 @@ from litellm.types.router import (
 from litellm.utils import (
     reapply_runtime_model_cost_registrations,
 )
-from litellm.litellm_core_utils.model_cost_table import publish
-
 
 _COPILOT_TOKEN_EXPIRES_AT: Final = 4_102_444_800
 
@@ -1175,7 +1177,7 @@ def test_bedrock_deployment_inherits_invoked_profile_around_custom_prices(
     service_tier: str,
 ) -> None:
     from litellm.cost_calculator import completion_cost
-    from litellm.types.utils import ModelResponse, Usage, PromptTokensDetailsWrapper
+    from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
 
     model: Final = "openai.gpt-5.6-sol"
     profile: Final = f"us.{model}"
@@ -1255,7 +1257,7 @@ def test_bedrock_deployment_keeps_custom_prices_when_profile_lookup_fails(
     reload: bool,
 ) -> None:
     from litellm.cost_calculator import completion_cost
-    from litellm.types.utils import ModelResponse, Usage, PromptTokensDetailsWrapper
+    from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
 
     model: Final = "anthropic.unmapped-profile-pricing-test"
     profile: Final = (
@@ -4425,3 +4427,68 @@ def test_pricing_provider_fills_unset_rates_from_that_providers_catalog_row() ->
     finally:
         _restore_model_cost_entries(model_cost_entries)
         litellm.get_model_info.cache_clear()
+
+
+def test_rerank_config_prices_bill_each_deployment_and_survive_catalog_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend: Final = "hosted_vllm/fixture-backend"
+    catalog_rate: Final = 0.009
+    catalog: Final = {
+        backend: {
+            "litellm_provider": "hosted_vllm",
+            "mode": "rerank",
+            "input_cost_per_token": catalog_rate,
+        }
+    }
+    monkeypatch.setattr(litellm, "model_cost", copy.deepcopy(catalog))
+    deployments: Final = tuple(
+        Deployment(
+            model_name=f"fixture-client-{index}",
+            litellm_params=LiteLLM_Params(
+                model=backend,
+                api_base="https://billing.test/v1",
+                input_cost_per_token=rate,
+            ),
+            model_info=ModelInfo(id=f"fixture-deployment-{index}", mode="rerank"),
+        )
+        for index, rate in enumerate((0.001, 0.002))
+    )
+    router: Final = Router(model_list=[deployment.to_json() for deployment in deployments])
+
+    def charge(deployment: Deployment) -> float | None:
+        response: Final = RerankResponse(meta={"billed_units": {"total_tokens": 100}})
+        logging: Final = Logging(
+            model=backend,
+            messages=[],
+            stream=False,
+            call_type="arerank",
+            start_time=datetime(2026, 1, 1),
+            litellm_call_id="fixture-billing",
+            function_id="fixture-billing",
+        )
+        logging.update_environment_variables(
+            litellm_params={
+                **deployment.litellm_params.model_dump(exclude_none=True),
+                "metadata": {"model_info": deployment.model_info.model_dump(exclude_none=True)},
+            },
+            optional_params={},
+            custom_llm_provider="hosted_vllm",
+        )
+        return logging._response_cost_calculator(response)
+
+    for deployment in deployments:
+        assert router.get_deployment(deployment.model_info.id) is not None
+        rate: Final = deployment.litellm_params.input_cost_per_token
+        assert rate is not None
+        assert charge(deployment) == pytest.approx(100 * rate)
+    assert litellm.model_cost[backend]["input_cost_per_token"] == catalog_rate
+    assert all(deployment.model_name not in litellm.model_cost for deployment in deployments)
+
+    adopt_model_cost_map(copy.deepcopy(catalog))
+
+    for deployment in deployments:
+        rate_after: Final = deployment.litellm_params.input_cost_per_token
+        assert rate_after is not None
+        assert charge(deployment) == pytest.approx(100 * rate_after)
+    assert litellm.model_cost[backend]["input_cost_per_token"] == catalog_rate
