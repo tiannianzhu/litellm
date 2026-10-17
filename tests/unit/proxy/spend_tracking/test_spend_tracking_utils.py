@@ -69,6 +69,7 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     SETTLES_BACKGROUND_RESPONSE_KWARG,
     BackgroundResponseSettlement,
 )
+from litellm.types.rerank import RerankResponse, RerankResponseMeta
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.utils import (
     BACKGROUND_RESPONSE_COST_POLL_CALL_ORIGIN,
@@ -78,6 +79,8 @@ from litellm.types.utils import (
     StandardLoggingModelInformation,
     StandardLoggingPayload,
     StandardLoggingPayloadErrorInformation,
+    TranscriptionResponse,
+    TranscriptionUsageDurationObject,
 )
 
 
@@ -282,6 +285,94 @@ def test_batch_spend_row_stores_the_same_usage_extras_as_a_chat_call_with_its_co
             prompt_tokens=29, completion_tokens=46, total_tokens=75, prompt_tokens_details={"cached_tokens": 8}
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("meta", "expected"),
+    (
+        (RerankResponseMeta(billed_units={"total_tokens": 37}), (37, 0, 37)),
+        (RerankResponseMeta(tokens={"input_tokens": 37, "output_tokens": 0}), (37, 0, 37)),
+        (RerankResponseMeta(tokens={"output_tokens": 3}, billed_units={"total_tokens": 12}), (9, 3, 12)),
+    ),
+)
+def test_get_logging_payload_records_rerank_input_tokens_without_changing_spend(
+    meta: RerankResponseMeta, expected: tuple[int, int, int]
+) -> None:
+    timestamp: Final = datetime.datetime(2026, 1, 1, tzinfo=timezone.utc)
+    response: Final = RerankResponse(id="rerank-usage", results=[], meta=meta)
+    payload: Final = get_logging_payload(
+        kwargs={
+            "model": "test-rerank-model",
+            "call_type": "arerank",
+            "response_cost": 0.125,
+            "litellm_params": {"metadata": {}},
+        },
+        response_obj=response,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == expected
+    assert payload["spend"] == 0.125
+    assert response.meta == meta
+
+
+@pytest.mark.parametrize(
+    ("through_collector", "stored_seconds", "expected_seconds"),
+    ((False, None, 2.0), (True, None, 2.0), (True, 3.0, 3.0)),
+    ids=("direct", "collector-empty-snapshot", "collector-existing-snapshot"),
+)
+def test_get_logging_payload_preserves_free_transcription_duration_usage(
+    through_collector: bool, stored_seconds: float | None, expected_seconds: float
+) -> None:
+    from litellm.proxy.spend_tracking.spend_event import (
+        SpendEvent,
+        build_spend_event,
+        decode_spend_event,
+        spend_event_callback_args,
+    )
+
+    timestamp: Final = datetime.datetime(2026, 1, 1, tzinfo=timezone.utc)
+    response: Final = TranscriptionResponse(text="recognized words").model_copy(
+        update=MappingProxyType({"usage": TranscriptionUsageDurationObject(type="duration", seconds=2)})
+    )
+    original_snapshot: Final = create_dummy_standard_logging_payload()
+    snapshot: Final[StandardLoggingPayload] = {
+        **original_snapshot,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "response_cost": 0.0,
+        "metadata": {
+            **original_snapshot["metadata"],
+            "usage_object": {"type": "duration", "seconds": stored_seconds} if stored_seconds is not None else {},
+        },
+    }
+    kwargs: Final = {
+        "model": "fixture-asr",
+        "call_type": "atranscription",
+        "response_cost": 0.0,
+        "litellm_params": {"metadata": {}},
+        "standard_logging_object": snapshot,
+    }
+    encoded_event: Final = (
+        build_spend_event(kwargs, response, timestamp, timestamp, store_bodies=False) if through_collector else None
+    )
+    assert encoded_event is None or isinstance(encoded_event, bytes)
+    event: Final = decode_spend_event(encoded_event) if encoded_event is not None else None
+    assert event is None or isinstance(event, SpendEvent)
+    callback_args: Final = spend_event_callback_args(event) if event is not None else None
+    payload: Final = get_logging_payload(
+        kwargs=kwargs if callback_args is None else dict(callback_args.kwargs),
+        response_obj=response if callback_args is None else callback_args.response_obj,
+        start_time=timestamp,
+        end_time=timestamp,
+    )
+
+    assert (payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"]) == (0, 0, 0)
+    assert payload["spend"] == 0.0
+    assert json.loads(payload["metadata"])["usage_object"] == {"type": "duration", "seconds": expected_seconds}
+    assert payload["completionStartTime"] == (None if through_collector else timestamp)
 
 
 class _HashingCache(litellm.Cache):

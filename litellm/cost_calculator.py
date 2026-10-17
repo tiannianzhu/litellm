@@ -126,7 +126,7 @@ from litellm.types.llms.openai import (
     ResponsesAPIResponse,
 )
 from litellm.types.llms.xai import RealtimeMeteredUsage
-from litellm.types.rerank import RerankBilledUnits, RerankResponse
+from litellm.types.rerank import RerankBilledUnits, RerankResponse, get_rerank_usage
 from litellm.types.utils import (
     CallTypesLiteral,
     LiteLLMRealtimeStreamLoggingObject,
@@ -1202,6 +1202,12 @@ def _extract_service_tier(source: object) -> str | None:
 def get_usage_object(
     completion_response: object,
 ) -> Usage | None:
+    if isinstance(completion_response, RerankResponse):
+        rerank_usage: Final = get_rerank_usage(
+            {"results": completion_response.results, "meta": completion_response.meta}
+        )
+        return Usage(**rerank_usage) if rerank_usage is not None else None
+
     usage_obj: Final = cast(
         Usage | ResponseAPIUsage | dict | BaseModel,
         (

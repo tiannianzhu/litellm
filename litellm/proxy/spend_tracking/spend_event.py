@@ -23,10 +23,12 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from typing_extensions import NotRequired, ReadOnly, TypedDict
 
 import litellm
+from litellm.cost_calculator import get_usage_object
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.db.spend_log_tool_index import response_tool_call_names
 from litellm.types.interactions import InteractionsAPIResponse
 from litellm.types.llms.base import LiteLLMBaseModel
+from litellm.types.rerank import RerankResponse
 from litellm.types.utils import LiteLLMBatch, Usage
 
 SPEND_EVENT_VERSION: Final = 1
@@ -302,7 +304,9 @@ def _compact_response(response_obj: object) -> CompactResponse | None:
     dumped: Final = response_obj.model_dump() if isinstance(response_obj, BaseModel) else _mapping_or_none(response_obj)
     if dumped is None:
         return None
-    scalars: Final = _COMPACT_RESPONSE.validate_python(_drop_keys(dumped, frozenset({"choices"})))
+    rerank_usage: Final = get_usage_object(response_obj) if isinstance(response_obj, RerankResponse) else None
+    with_usage: Final = {**dumped, "usage": rerank_usage.model_dump()} if rerank_usage is not None else dumped
+    scalars: Final = _COMPACT_RESPONSE.validate_python(_drop_keys(with_usage, frozenset({"choices"})))
     tool_call_names: Final = response_tool_call_names(response_obj)
     if not tool_call_names:
         return scalars

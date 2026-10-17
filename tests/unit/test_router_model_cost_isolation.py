@@ -18,6 +18,7 @@ import queue
 import re
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final, cast
@@ -31,10 +32,13 @@ import litellm
 from litellm import Router
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import DEFAULT_MAX_LRU_CACHE_SIZE
+from litellm.litellm_core_utils.get_model_cost_map import _expand_model_aliases, adopt_model_cost_map
+from litellm.litellm_core_utils.litellm_logging import Logging
 from litellm.litellm_core_utils.ptu_pricing import ptu_config_error
 from litellm.litellm_core_utils.llm_cost_calc.utils import SERVICE_TIER_COST_KEY_SUFFIXES
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.llms.openai_like.model_info import MODEL_INFO_REFRESH_SECONDS
+from litellm.types.rerank import RerankResponse
 from litellm.types.router import (
     Deployment,
     DeploymentTypedDict,
@@ -4502,3 +4506,74 @@ def test_pricing_provider_fills_unset_rates_from_that_providers_catalog_row() ->
     finally:
         _restore_model_cost_entries(model_cost_entries)
         litellm.get_model_info.cache_clear()
+
+def test_rerank_config_prices_bill_each_deployment_and_survive_catalog_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend: Final = "hosted_vllm/fixture-backend"
+    catalog_rate: Final = 0.009
+    catalog: Final = {
+        backend: {
+            "litellm_provider": "hosted_vllm",
+            "mode": "rerank",
+            "input_cost_per_token": catalog_rate,
+        }
+    }
+    monkeypatch.setattr(litellm, "model_cost", copy.deepcopy(catalog))
+    deployments: Final = tuple(
+        Deployment(
+            model_name=f"fixture-client-{index}",
+            litellm_params=LiteLLM_Params(
+                model=backend,
+                api_base="https://billing.test/v1",
+                input_cost_per_token=rate,
+            ),
+            model_info=ModelInfo(id=f"fixture-deployment-{index}", mode="rerank"),
+        )
+        for index, rate in enumerate((0.001, 0.002))
+    )
+    router: Final = Router(model_list=[deployment.to_json() for deployment in deployments])
+
+    def charge(deployment: Deployment) -> float | None:
+        response: Final = RerankResponse(meta={"billed_units": {"total_tokens": 100}})
+        logging: Final = Logging(
+            model=backend,
+            messages=[],
+            stream=False,
+            call_type="arerank",
+            start_time=datetime(2026, 1, 1),
+            litellm_call_id="fixture-billing",
+            function_id="fixture-billing",
+        )
+        logging.update_environment_variables(
+            litellm_params={
+                **deployment.litellm_params.model_dump(exclude_none=True),
+                "metadata": {"model_info": deployment.model_info.model_dump(exclude_none=True)},
+            },
+            optional_params={},
+            custom_llm_provider="hosted_vllm",
+        )
+        return logging._response_cost_calculator(response)
+
+    for deployment in deployments:
+        assert router.get_deployment(deployment.model_info.id) is not None
+        rate: Final = deployment.litellm_params.input_cost_per_token
+        assert rate is not None
+        assert charge(deployment) == pytest.approx(100 * rate)
+    assert litellm.model_cost[backend]["input_cost_per_token"] == catalog_rate
+    assert all(deployment.model_name not in litellm.model_cost for deployment in deployments)
+
+    refreshed: Final = _expand_model_aliases(
+        {
+            **catalog,
+            "fixture-canonical": {"aliases": ["fixture-alias"], "input_cost_per_token": catalog_rate},
+        }
+    )
+    adopt_model_cost_map(refreshed)
+
+    for deployment in deployments:
+        rate_after: Final = deployment.litellm_params.input_cost_per_token
+        assert rate_after is not None
+        assert charge(deployment) == pytest.approx(100 * rate_after)
+    assert litellm.model_cost[backend]["input_cost_per_token"] == catalog_rate
+    assert litellm.model_cost["fixture-alias"] is litellm.model_cost["fixture-canonical"]
