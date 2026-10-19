@@ -499,6 +499,27 @@ def test_token_counter_counts_gemini_function_declarations():
     assert openai_tokens == gemini_tokens == camel_case_tokens
 
 
+@pytest.mark.parametrize("item_schema", (None, True, False), ids=("omitted", "any", "none"))
+def test_token_counter_counts_tools_with_untyped_array_items(item_schema: bool | None) -> None:
+    messages: Final = [{"role": "user", "content": "Choose values"}]
+    array_schema: Final = {"type": "array", **({"items": item_schema} if item_schema is not None else {})}
+
+    tokens: Final = token_counter_new(
+        messages=messages,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "choose_values",
+                    "parameters": {"type": "object", "properties": {"values": array_schema}},
+                },
+            }
+        ],
+    )
+
+    assert tokens > token_counter_new(messages=messages)
+
+
 def test_token_counter_skips_non_mapping_tools():
     openai_tool: Final = {
         "type": "function",
