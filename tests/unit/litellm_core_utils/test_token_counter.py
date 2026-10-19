@@ -51,7 +51,6 @@ from litellm.litellm_core_utils.token_counter import (
 from litellm.litellm_core_utils.token_counter import token_counter as token_counter_new
 from litellm.llms.anthropic.messages.adapters.transformation import LiteLLMAnthropicMessagesAdapter
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionToolParam
-from litellm.types.utils import SelectTokenizerResponse
 from tests.large_text import text
 from tests.unit.litellm_core_utils.event_loop_lag import (
     assert_loop_stayed_free,
@@ -531,8 +530,13 @@ def test_token_counter_skips_non_mapping_tools():
 
 @pytest.mark.parametrize(
     ("shorthand", "explicit"),
-    [({"type": "array"}, {"type": "array", "items": {}}), (True, {})],
-    ids=["array_without_items", "boolean_subschema"],
+    [
+        ({"type": "array"}, {"type": "array", "items": {}}),
+        ({"type": "array", "items": True}, {"type": "array", "items": {}}),
+        ({"type": "array", "items": False}, {"type": "array", "items": {}}),
+        (True, {}),
+    ],
+    ids=["array_without_items", "array_any_items", "array_no_items", "boolean_subschema"],
 )
 def test_token_counter_counts_json_schema_shorthands_like_their_explicit_form(shorthand: object, explicit: object) -> None:
     assert _count_with_property_schema(shorthand) == _count_with_property_schema(explicit)
@@ -941,7 +945,6 @@ def test_load_test_token_counter(model):
 
     Assert time taken is < 1.5s.
     """
-    import tiktoken
 
     messages = [{"role": "user", "content": text}] * 10
 
@@ -3334,6 +3337,8 @@ def test_messages_reach_token_count_prices_pdf_pages_like_token_counter():
 def _png_data_url(width: int, height: int) -> str:
     ihdr = b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + width.to_bytes(4, "big") + height.to_bytes(4, "big")
     return "data:image/png;base64," + base64.b64encode(ihdr + b"\x08\x06\x00\x00\x00").decode()
+
+
 
 
 @pytest.mark.parametrize(

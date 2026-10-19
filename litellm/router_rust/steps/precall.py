@@ -344,22 +344,15 @@ class PreCallFacts:
     def _count(self) -> int | None:
         try:
             tokenizer_model: Final = self._tokenizer_model()
-            if not self._input_is_a_list():
-                return count_tokens(
-                    self._host,
-                    self._messages,
-                    self._input,
-                    self._request,
-                    tokenizer_model,
-                    self._candidate_records(),
-                    self._fits_within(),
-                )
-            text_input: Final = _text_input(self._input, self._candidate_records())
-            match _embedding_batch(text_input):
-                case _TextBatch() if not tokenizer_model:
-                    return 0
-                case _:
-                    return _input_tokens(self._host, text_input, self._request, tokenizer_model, self._fits_within())
+            return count_tokens(
+                self._host,
+                self._messages,
+                self._input,
+                self._request,
+                tokenizer_model,
+                self._candidate_records(),
+                self._fits_within(),
+            )
         except Exception as e:  # noqa: BLE001  # best-effort: an uncountable prompt must not fail the request
             verbose_router_logger.error(
                 "litellm.router.py::_acount_pre_call_check_tokens: failed to count tokens. Got - %s", e
@@ -385,8 +378,6 @@ class PreCallFacts:
                 else await offload_token_count(_text_input)(self._input, self._candidate_records())
             )
             match _embedding_batch(text_input):
-                case _TextBatch() if not tokenizer_model:
-                    return 0
                 case _TextBatch(texts):
                     counter: Final = self._host.invoke("token_counter")  # pyright: ignore[reportUnknownMemberType]  # see count_tokens
                     fits_within: Final = self._fits_within()
