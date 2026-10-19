@@ -18,7 +18,7 @@ from enum import Enum
 from functools import partial
 from itertools import accumulate, chain, groupby
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from litellm._logging import verbose_router_logger
 from litellm.constants import PDF_DATA_URL_PREFIX
@@ -460,25 +460,28 @@ class PreCallFacts:
     def _input_is_a_list(self) -> bool:
         return self._messages is None and _is_list(self._input)
 
+    def _could_be_embedding_token_ids(self) -> bool:
+        input_value: Final = self._input
+        if self._messages is not None or not isinstance(input_value, list) or not input_value:
+            return False
+        first: Final = cast(Sequence[object], input_value)[0]  # cast-ok: only reads an item as object
+        return _is_token_id(first) or _is_list(first)
+
+    def _literal_embedding_count(self) -> int | None:
+        batch: Final = _embedding_batch(self._input)
+        return _token_id_count(self._host, batch.longest) if isinstance(batch, _TokenIdBatch) else None
+
     def _count(self, openai_model: str | None) -> int | None:
         try:
-            counter: Final = _counter(self._host, _tokenizer(openai_model))
-            if not self._input_is_a_list():
-                return _count_tokens(
-                    self._host,
-                    counter,
-                    self._messages,
-                    self._input,
-                    self._request,
-                    self._candidate_records(),
-                    self._fits_within(),
-                )
-            text_input: Final = _text_input(self._input, self._candidate_records())
-            match _embedding_batch(text_input):
-                case _TextBatch() if openai_model is None:
-                    return 0
-                case _:
-                    return _input_tokens(self._host, counter, text_input, self._request, self._fits_within())
+            return _count_tokens(
+                self._host,
+                _counter(self._host, _tokenizer(openai_model)),
+                self._messages,
+                self._input,
+                self._request,
+                self._candidate_records(),
+                self._fits_within(),
+            )
         except Exception as e:  # noqa: BLE001  # best-effort: an uncountable prompt must not fail the request
             verbose_router_logger.error(
                 "litellm.router.py::_acount_pre_call_check_tokens: failed to count tokens. Got - %s", e
@@ -504,8 +507,6 @@ class PreCallFacts:
                 else await offload_token_count(_text_input)(self._input, self._candidate_records())
             )
             match _embedding_batch(text_input):
-                case _TextBatch() if openai_model is None:
-                    return 0
                 case _TextBatch(texts):
                     fits_within: Final = self._fits_within()
                     count_slice: Final = offload_token_count(_longest_text_tokens)
@@ -562,6 +563,9 @@ class PreCallFacts:
 
     def _counts(self) -> Mapping[str, _DeploymentCount]:
         models: Final = self._openai_models()
+        literal_count: Final = self._literal_embedding_count() if self._could_be_embedding_token_ids() else None
+        if literal_count is not None:
+            return {id: _DeploymentCount(literal_count, estimated=False) for id in models}
         keys: Final = {id: _token_count_key(model) for id, model in models.items()}
         counted: Final = {key: self._count(model) for key, model in _model_by_key(models, keys).items()}
         counts: Final = _deployment_counts(keys, counted, self._estimated(models))
@@ -570,6 +574,11 @@ class PreCallFacts:
 
     async def _counts_async(self) -> Mapping[str, _DeploymentCount]:
         models: Final = self._openai_models()
+        literal_count: Final = (
+            await offload_token_count(self._literal_embedding_count)() if self._could_be_embedding_token_ids() else None
+        )
+        if literal_count is not None:
+            return {id: _DeploymentCount(literal_count, estimated=False) for id in models}
         keys: Final = {id: _token_count_key(model) for id, model in models.items()}
         counted: Final = {key: await self._count_async(model) for key, model in _model_by_key(models, keys).items()}
         counts: Final = _deployment_counts(keys, counted, self._estimated(models))

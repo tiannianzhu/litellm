@@ -5,7 +5,6 @@ import base64
 import copy
 import importlib
 import io
-import json
 import sys
 import threading
 import time
@@ -14,7 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 from itertools import chain
 from queue import SimpleQueue
 from typing import Final, Literal, cast
-from unittest.mock import AsyncMock, MagicMock, patch, sentinel
+from unittest.mock import MagicMock, patch, sentinel
 
 import anyio.to_thread
 import pytest
@@ -560,8 +559,13 @@ def test_token_counter_skips_non_mapping_tools():
 
 @pytest.mark.parametrize(
     ("shorthand", "explicit"),
-    [({"type": "array"}, {"type": "array", "items": {}}), (True, {})],
-    ids=["array_without_items", "boolean_subschema"],
+    [
+        ({"type": "array"}, {"type": "array", "items": {}}),
+        ({"type": "array", "items": True}, {"type": "array", "items": {}}),
+        ({"type": "array", "items": False}, {"type": "array", "items": {}}),
+        (True, {}),
+    ],
+    ids=["array_without_items", "array_any_items", "array_no_items", "boolean_subschema"],
 )
 def test_token_counter_counts_json_schema_shorthands_like_their_explicit_form(shorthand: object, explicit: object) -> None:
     assert _count_with_property_schema(shorthand) == _count_with_property_schema(explicit)
@@ -970,7 +974,6 @@ def test_load_test_token_counter(model):
 
     Assert time taken is < 1.5s.
     """
-    import tiktoken
 
     messages = [{"role": "user", "content": text}] * 10
 
