@@ -692,7 +692,7 @@ def _bedrock_data_uri_media_scope(
 
 
 def _data_uri_media_scope(model: str, media: Sequence[Mapping[str, object]]) -> _DataUriMediaScope | None:
-    from litellm.utils import supports_embedding_image_input
+    from litellm.utils import supports_embedding_image_input, supports_factory
 
     try:
         resolved_model, provider, _, _ = litellm.get_llm_provider(model=model)
@@ -700,6 +700,10 @@ def _data_uri_media_scope(model: str, media: Sequence[Mapping[str, object]]) -> 
         return None
     if provider == "bedrock":
         return _bedrock_data_uri_media_scope(resolved_model, media)
+    if provider in ("gemini", "vertex_ai") and supports_factory(
+        model, custom_llm_provider=provider, key="supports_multimodal"
+    ):
+        return "per_item"
     if not supports_embedding_image_input(model):
         return None
     if provider == "cohere":

@@ -347,10 +347,10 @@ async def test_an_embedding_input_that_fits_the_window_in_characters_but_not_in_
 
 
 @pytest.mark.asyncio
-async def test_an_embedding_batch_is_never_refused_on_the_default_tokenizers_count(make_core: MakeCore) -> None:
+async def test_an_embedding_batch_with_unknown_models_is_checked_by_the_default_tokenizer(make_core: MakeCore) -> None:
     dense: Final = "\ua66e" * 40
     assert litellm.token_counter(text=dense) > 50
-    assert await _picked(_small_and_big(make_core, small=50), input=["hi", dense]) == {"small", "big"}
+    assert await _picked(_small_and_big(make_core, small=50), input=["hi", dense]) == {"big"}
 
 
 @pytest.mark.asyncio

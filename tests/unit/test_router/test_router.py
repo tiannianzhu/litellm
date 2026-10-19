@@ -1,23 +1,25 @@
-import ast, asyncio, importlib, time
+import asyncio
+import base64
 import contextlib
 import copy
 import functools
 import gc
-import itertools
+import importlib
+import inspect
 import io
-import base64
 import json
-import linecache
 import logging
 import os
 import sys
 import threading
+import time
+import traceback
 import warnings
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import CodeType, FrameType, MappingProxyType, SimpleNamespace
-from typing import TYPE_CHECKING, Final, Literal, TypeVar, cast
+from types import MappingProxyType, SimpleNamespace
+from typing import TYPE_CHECKING, Final, List, Literal, Optional, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
@@ -25,48 +27,42 @@ import openai
 import pytest
 import respx
 from fastapi import HTTPException
-from opentelemetry import trace
-from pydantic import BaseModel, TypeAdapter
 
 import litellm
 from litellm import APIConnectionError, Router
 from litellm._logging import verbose_logger, verbose_router_logger
-from litellm.caching import RedisClusterCache
 from litellm.caching.in_memory_cache import DEFAULT_MAX_SIZE_IN_MEMORY
-from litellm.caching.redis_cache import _redis_circuit_breaker_guard
 from litellm.exceptions import GuardrailRaisedException, MidStreamFallbackError, ModifyResponseException
-from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.otel.plumbing.context import set_request_root_span
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
-from litellm.llms.anthropic.messages.native.streaming_iterator import closing_superseded_attempt
+from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.llms.anthropic.messages.native.agentic_streaming_iterator import (
     AGENTIC_LOOP_LIMIT_ERROR_SSE_BYTES,
     SERVER_FULFILLED_TOOL_LEAK_ERROR_SSE_BYTES,
 )
+from litellm.llms.base_llm.vector_store.transformation import (
+    LiteLLMVectorStoreEmbeddingExecutor,
+    RouterVectorStoreEmbeddingExecutor,
+)
 from litellm.llms.bedrock.common_utils import BedrockError
 from litellm.models.access_group import LiteLLM_AccessGroupTable
 from litellm.proxy._types import LiteLLM_TeamTable, LitellmUserRoles, Member, ProxyException, UserAPIKeyAuth
+from litellm.router_api import RoutingContext as RouterContext
 from litellm.router_rust.invoke.streaming import (
     MAX_BUFFERED_PRE_CONTENT_ANTHROPIC_CHUNKS,
     MAX_HELD_PRE_OUTPUT_RESPONSES_EVENTS,
-    FallbackAwareAnthropicMessagesStream,
-    _stream_commits_now,
     _anthropic_stream_error_is_gateway_verdict,
-    _stream_fallback_error_for_raised,
     _anthropic_stream_forwards_ping_live,
-    _stream_raised_error_status,
     _anthropic_stream_should_decline_fallback,
     _is_retriable_anthropic_status,
     _responses_stream_holds_event,
+    _stream_commits_now,
+    _stream_raised_error_status,
 )  # noqa: PLC2701
 from litellm.router_rust.surface.registry import _search_tool_support  # noqa: PLC2701
-from litellm.proxy.response_polling.polling_handler import should_use_polling_for_request
-from litellm.router_strategy import simple_shuffle
-from litellm.router_strategy.complexity_router.complexity_router import ComplexityRouter
-from litellm.router_strategy.savings_baseline import Baseline, _models_in
-from litellm.router_utils.client_initalization_utils import MaxParallelRequestsLimit
 from litellm.router_utils.cooldown_handlers import (
     _async_get_cooldown_deployments,
     _is_cooldown_required,
@@ -74,7 +70,6 @@ from litellm.router_utils.cooldown_handlers import (
     get_cooldown_deployments,
 )
 from litellm.router_utils.fallback_event_handlers import (
-    DISABLE_FALLBACKS_METADATA_KEY,
     MID_STREAM_FALLBACK_CONTROLS_KEY,
 )
 from litellm.router_utils.prompt_caching_cache import PromptCachingCache
@@ -82,7 +77,6 @@ from litellm.router_utils.router_callbacks.track_deployment_metrics import get_d
 from litellm.scheduler import FlowItem
 from litellm.types.integrations.custom_logger import AgenticLoopPlan, AgenticLoopRequestPatch
 from litellm.types.llms.openai import AllMessageValues, ChatCompletionRequest
-from litellm.router_api import RoutingContext as RouterContext
 from litellm.types.router import (
     CustomRoutingStrategyBase,
     Deployment,
@@ -95,20 +89,12 @@ from litellm.types.router import (
     RouterRateLimitError,
     RoutingContext,
 )
-from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
-from litellm.llms.base_llm.vector_store.transformation import (
-    LiteLLMVectorStoreEmbeddingExecutor,
-    RouterVectorStoreEmbeddingExecutor,
-)
 from litellm.types.utils import CallTypes, CredentialItem, Usage
 from litellm.litellm_core_utils.model_cost_table import publish
 from tests._vcr_conftest_common import install_live_call_probe, record_vcr_outcome
 from tests.fake_openai_endpoint import FAKE_OPENAI_API_BASE
 from tests.large_text import text
 from tests.unit.conftest import redis_cache_double
-import traceback
-import inspect
-from typing import List, Optional
 
 if TYPE_CHECKING:
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -985,7 +971,8 @@ async def test_async_router_afile_content_uses_deployment_custom_llm_provider():
 
     This prevents "None is not a valid LlmProviders" errors when calling file content operations.
     """
-    from unittest.mock import AsyncMock, MagicMock, patch
+    from unittest.mock import MagicMock, patch
+
     from litellm.types.llms.openai import HttpxBinaryResponseContent
 
     router = litellm.Router(
@@ -4495,14 +4482,16 @@ def test_context_window_pre_call_check_counts_an_embedding_image_as_text_on_a_te
 
 
 @pytest.mark.parametrize(
-    ("backend", "fits"),
+    ("backend", "caption", "fits"),
     [
-        pytest.param("vertex_ai/gemini-embedding-2", True, id="image-backend-without-an-openai-tokenizer"),
-        pytest.param("text-embedding-3-small", False, id="text-only-backend-counts-the-image"),
+        pytest.param("vertex_ai/gemini-embedding-2", "hello", True, id="short-caption-without-known-tokenizer"),
+        pytest.param("vertex_ai/gemini-embedding-2", "word " * 40, False, id="long-caption-without-known-tokenizer"),
+        pytest.param("text-embedding-3-small", "word " * 40, False, id="text-only-backend-counts-the-image"),
     ],
 )
-def test_context_window_pre_call_check_on_a_caption_next_to_an_embedding_image(backend: str, fits: bool, caplog):
-    caption: Final = "word " * 40
+def test_context_window_pre_call_check_on_a_caption_next_to_an_embedding_image(
+    backend: str, caption: str, fits: bool, caplog
+):
     router: Final = _embedding_context_router(backend, window=20)
     deployments: Final = router.registry().deployments("embedder")
 
@@ -4610,6 +4599,68 @@ async def test_aanthropic_messages_enforces_context_window_with_system_and_tools
         )
 
 
+
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("local_model_cost_map", "isolate_router_model_cost_state")
+@pytest.mark.parametrize("asynchronous", (False, True), ids=("sync", "async"))
+@pytest.mark.parametrize(
+    ("backend", "media_type", "text", "rejected"),
+    (
+        ("gemini/gemini-embedding-2", "image/png", "hello", False),
+        ("gemini/gemini-embedding-2", "application/pdf", "", False),
+        ("gemini/gemini-embedding-2", "image/png", "hello " * 40, True),
+    ),
+    ids=("image-and-text", "pdf-only", "long-text"),
+)
+async def test_embedding_context_checks_preserve_media_without_skipping_text(
+    backend: str, media_type: str, text: str, rejected: bool, asynchronous: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    media: Final = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(
+        media,
+        format="PNG" if media_type == "image/png" else "PDF",
+        creationDate=time.gmtime(0),
+        modDate=time.gmtime(0),
+    )
+    data_uri: Final = f"data:{media_type};base64," + base64.b64encode(media.getvalue()).decode("ascii")
+    input_batch: Final = [data_uri, text] if text else [data_uri]
+    monkeypatch.setitem(
+        litellm.model_cost,
+        backend,
+        {
+            **litellm.model_cost.get(backend, {}),
+            "litellm_provider": backend.split("/", 1)[0],
+            "mode": "embedding",
+            "supports_embedding_image_input": backend.startswith(("bedrock/", "cohere/")),
+            "supports_multimodal": backend.startswith("gemini/"),
+        },
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "media-context",
+                "litellm_params": {"model": backend, "api_key": "unit-key"},
+                "model_info": {"id": "media-context", "max_input_tokens": 8},
+            }
+        ],
+        enable_pre_call_checks=True,
+        num_retries=0,
+    )
+    with pytest.raises(litellm.ContextWindowExceededError) if rejected else contextlib.nullcontext():
+        deployment: Final = (
+            await router.select("media-context", {}, input=input_batch)
+            if asynchronous
+            else router.get_available_deployment(model="media-context", input=input_batch)
+        )
+        assert deployment["model_info"]["id"] == "media-context"
+    assert input_batch == ([data_uri, text] if text else [data_uri])
+
+
 def test_count_pre_call_check_tokens_across_api_surfaces():
     """
     _count_pre_call_check_tokens must count tokens from chat `messages`, a Responses
@@ -4632,6 +4683,12 @@ def test_count_pre_call_check_tokens_across_api_surfaces():
     assert messages_tokens > 0
     assert string_input_tokens > 0
     assert list_input_tokens > 0
+    assert (
+        router._count_pre_call_check_tokens(
+            messages=[{"role": "user", "content": "hello world"}], input=["unrelated input " * 10]
+        )
+        == messages_tokens
+    )
 
     with pytest.raises(ValueError, match="Either messages or input must be provided to count tokens"):
         router._count_pre_call_check_tokens(messages=None, input=None)
@@ -6499,6 +6556,7 @@ async def test_health_probe_preserves_normal_caller_policy(
     strict_ids: tuple[str, ...],
 ) -> None:
     import time
+
     from litellm.types.router import AllowedFailsPolicy, RouterRateLimitError
 
     router: Final = Router(
@@ -14133,6 +14191,7 @@ class TestAutoRouterTraceProvenance:
     @pytest.fixture
     def _tracing(self, monkeypatch: pytest.MonkeyPatch) -> "tuple[OpenTelemetryV2, InMemorySpanExporter]":
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
         from litellm.integrations.otel import OpenTelemetryV2Config
         from litellm.integrations.otel.logger import OpenTelemetryV2
         from litellm.integrations.otel.plumbing import providers
@@ -14849,7 +14908,6 @@ async def test_rate_limit_error_callback():
 async def test_router_model_group_headers():
     os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     litellm.model_cost = litellm.get_model_cost_map(url="")
-    from litellm.types.utils import OPENAI_RESPONSE_HEADERS
 
     router = Router(
         model_list=[
@@ -14880,7 +14938,6 @@ async def test_router_model_group_headers():
 async def test_get_remaining_model_group_usage():
     os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     litellm.model_cost = litellm.get_model_cost_map(url="")
-    from litellm.types.utils import OPENAI_RESPONSE_HEADERS
 
     router = Router(
         model_list=[
