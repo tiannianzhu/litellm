@@ -7963,6 +7963,61 @@ async def test_aanthropic_messages_enforces_context_window_with_system_and_tools
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("local_model_cost_map", "isolate_router_model_cost_state")
+@pytest.mark.parametrize("asynchronous", (False, True), ids=("sync", "async"))
+@pytest.mark.parametrize(
+    ("input_batch", "exceeds_limit"),
+    (
+        pytest.param(["hello world", "hello world"], False, id="text-batch-fits"),
+        pytest.param(["hello world", "hello world " * 10], True, id="text-batch-exceeds"),
+        pytest.param([1, 2], False, id="token-input-fits"),
+        pytest.param([1, 2, 3], True, id="token-input-exceeds"),
+        pytest.param([[1, 2], [3, 4]], False, id="token-batch-fits"),
+        pytest.param([[1], [2, 3, 4]], True, id="token-batch-exceeds"),
+    ),
+)
+async def test_embedding_pre_call_checks_each_input_context(
+    input_batch: list[str] | list[int] | list[list[int]], exceeds_limit: bool, asynchronous: bool
+) -> None:
+    import tiktoken
+
+    limit: Final = (
+        len(tiktoken.get_encoding("cl100k_base").encode("hello world"))
+        if isinstance(input_batch[0], str)
+        else 2
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "embedding-context",
+                "litellm_params": {"model": "openai/unit-embedding", "api_key": "unit-key"},
+                "model_info": {"id": "embedding-context", "max_input_tokens": limit, "mode": "embedding"},
+            }
+        ],
+        enable_pre_call_checks=True,
+        num_retries=0,
+    )
+
+    with pytest.raises(litellm.ContextWindowExceededError) if exceeds_limit else contextlib.nullcontext():
+        deployment: Final = (
+            await router.async_get_available_deployment(model="embedding-context", input=input_batch, request_kwargs={})
+            if asynchronous
+            else router.get_available_deployment(model="embedding-context", input=input_batch)
+        )
+        assert deployment["model_info"]["id"] == "embedding-context"
+
+
+@pytest.mark.parametrize("input_batch", ([1, 2], [[1, 2]]), ids=("tokens", "token-batch"))
+def test_embedding_token_input_respects_disabled_counter(
+    input_batch: list[int] | list[list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(litellm, "disable_token_counter", True)
+    router: Final = Router(model_list=[])
+
+    assert router._count_pre_call_check_tokens(messages=None, input=input_batch) == 0
+
+
 def test_count_pre_call_check_tokens_across_api_surfaces():
     """
     _count_pre_call_check_tokens must count tokens from chat `messages`, a Responses
@@ -7985,6 +8040,12 @@ def test_count_pre_call_check_tokens_across_api_surfaces():
     assert messages_tokens > 0
     assert string_input_tokens > 0
     assert list_input_tokens > 0
+    assert (
+        router._count_pre_call_check_tokens(
+            messages=[{"role": "user", "content": "hello world"}], input=["unrelated input " * 10]
+        )
+        == messages_tokens
+    )
 
     with pytest.raises(ValueError, match='Either messages or input must be provided to count tokens'):
         router._count_pre_call_check_tokens(messages=None, input=None)

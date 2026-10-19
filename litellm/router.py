@@ -14161,6 +14161,19 @@ class Router:
         `tools` (Chat Completions, Responses and Anthropic Messages shapes) and the
         Anthropic Messages top-level `system` block.
         """
+        if messages is None and isinstance(input, list) and input:
+            if litellm.disable_token_counter is True:
+                return 0
+            if all(isinstance(item, str) for item in input):
+                texts: Final = cast(list[str], input)  # cast-ok: all batch entries are strings
+                return max(litellm.token_counter(text=text) for text in texts)
+            if all(type(item) is int for item in input):
+                return len(input)
+            if all(isinstance(item, list) for item in input):
+                batches: Final = cast(list[list[object]], input)  # cast-ok: all batch entries are lists
+                if all(all(type(token) is int for token in batch) for batch in batches):
+                    return max(len(batch) for batch in batches)
+
         from litellm.llms.anthropic.pass_through.messages.utils import (
             anthropic_system_to_openai_message,
         )
