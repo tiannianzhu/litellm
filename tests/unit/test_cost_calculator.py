@@ -3702,33 +3702,22 @@ def test_extract_cache_creation_tokens_zero_when_missing():
     assert _extract_cache_creation_tokens({"prompt_tokens_details": {"cache_write_tokens": None}}) == 0
 
 
-def test_custom_pricing_anthropic_style_cache_tokens_not_double_counted():
-    """
-    Anthropic providers report cache tokens at the top level of Usage, and
-    `prompt_tokens` EXCLUDES them. The helper expects `prompt_tokens` to
-    include cache tokens, so cost_per_token must adjust before invoking it —
-    otherwise regular_prompt_tokens goes negative and clamps to 0.
-    """
-    usage = Usage(
-        prompt_tokens=2000,
-        completion_tokens=100,
-        total_tokens=2100,
-        cache_read_input_tokens=1500,
-        cache_creation_input_tokens=300,
-    )
+def test_custom_pricing_anthropic_style_cache_tokens_not_double_counted() -> None:
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
 
-    response = ModelResponse(
-        id="test-id",
-        created=1234567890,
-        model="anthropic/claude-3-5-sonnet",
-        object="chat.completion",
-        choices=[],
-        usage=usage,
+    usage: Final = AnthropicConfig().calculate_usage(
+        usage_object={
+            "input_tokens": 2000,
+            "output_tokens": 100,
+            "cache_read_input_tokens": 1500,
+            "cache_creation_input_tokens": 300,
+        },
+        reasoning_content=None,
     )
-
-    cost = litellm.completion_cost(
+    response: Final = ModelResponse(model="cache-pricing-test", usage=usage)
+    cost: Final = completion_cost(
         completion_response=response,
-        model="anthropic/claude-3-5-sonnet",
+        model="cache-pricing-test",
         custom_llm_provider="anthropic",
         custom_cost_per_token={
             "input_cost_per_token": 0.000003,
@@ -3738,11 +3727,51 @@ def test_custom_pricing_anthropic_style_cache_tokens_not_double_counted():
         },
     )
 
-    # Anthropic prompt_tokens=2000 excludes cache. After normalization the
-    # helper sees 2000 + 1500 + 300 = 3800, of which 2000 are uncached.
-    expected = 2000 * 0.000003 + 1500 * 0.0000003 + 300 * 0.00000375 + 100 * 0.000015
+    assert cost == pytest.approx(2000 * 0.000003 + 1500 * 0.0000003 + 300 * 0.00000375 + 100 * 0.000015)
 
-    assert cost == pytest.approx(expected)
+
+@pytest.mark.parametrize("read_rate,write_rate", ((0.001, 0.03), (0.0, 0.0)))
+def test_custom_pricing_inclusive_usage_with_cache_aliases(read_rate: float, write_rate: float) -> None:
+    usage: Final = Usage(
+        prompt_tokens=110,
+        completion_tokens=5,
+        total_tokens=115,
+        cache_read_input_tokens=80,
+        cache_creation_input_tokens=20,
+    )
+    response: Final = ModelResponse(model="cache-pricing-test", usage=usage)
+    cost: Final = completion_cost(
+        completion_response=response,
+        model="cache-pricing-test",
+        custom_llm_provider="hosted_vllm",
+        custom_cost_per_token={
+            "input_cost_per_token": 0.01,
+            "output_cost_per_token": 0.02,
+            "cache_read_input_token_cost": read_rate,
+            "cache_creation_input_token_cost": write_rate,
+        },
+    )
+
+    assert cost == pytest.approx(10 * 0.01 + 80 * read_rate + 20 * write_rate + 5 * 0.02)
+
+
+def test_custom_pricing_raw_cache_arguments_preserve_uncached_prompt_tokens() -> None:
+    input_cost, output_cost = cost_per_token(
+        model="cache-pricing-test",
+        prompt_tokens=10,
+        completion_tokens=5,
+        cache_read_input_tokens=80,
+        cache_creation_input_tokens=20,
+        custom_llm_provider="anthropic",
+        custom_cost_per_token={
+            "input_cost_per_token": 0.01,
+            "output_cost_per_token": 0.02,
+            "cache_read_input_token_cost": 0.001,
+            "cache_creation_input_token_cost": 0.03,
+        },
+    )
+
+    assert (input_cost, output_cost) == pytest.approx((10 * 0.01 + 80 * 0.001 + 20 * 0.03, 5 * 0.02))
 
 
 def test_custom_pricing_without_cache_keys_preserves_legacy_behavior():
@@ -3755,6 +3784,7 @@ def test_custom_pricing_without_cache_keys_preserves_legacy_behavior():
         prompt_tokens=1000,
         completion_tokens=100,
         total_tokens=1100,
+        cache_read_input_tokens=400,
         prompt_tokens_details=PromptTokensDetailsWrapper(
             cached_tokens=400,
             audio_tokens=0,
