@@ -56,7 +56,7 @@ else:
 
 _ADVISOR_ORCHESTRATION_FAILURE_ATTR: Final = "_litellm_advisor_orchestration_failure"
 _DEPLOYMENT_SELECTION_FAILURE_ATTR: Final = "_litellm_deployment_selection_failure"
-_CREDENTIAL_VALUES_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+_MAPPING_ADAPTER: Final = TypeAdapter(Mapping[str, object])
 
 
 def mark_advisor_orchestration_failure(exception: BaseException) -> None:
@@ -133,6 +133,25 @@ RESPONSE_ID_CALL_TYPES: Final = frozenset(
 def is_response_lookup_not_found(exception: object, failure_kwargs: Mapping[str, object]) -> bool:
     """Whether a call on an existing response id failed with a provider 404: the response is not on that account."""
     return getattr(exception, "status_code", None) == 404 and failure_kwargs.get("call_type") in RESPONSE_ID_CALL_TYPES
+
+
+def is_embedding_endpoint_not_found(exception: Exception, request_kwargs: Mapping[str, object]) -> bool:
+    if (
+        not isinstance(exception, litellm.NotFoundError)
+        or exception.llm_provider != "hosted_vllm"
+        or request_kwargs.get("call_type") not in ("embedding", "aembedding")
+    ):
+        return False
+    from litellm.llms.hosted_vllm.embedding.transformation import HostedVLLMEmbeddingError
+
+    provider_error: Final = exception.__context__
+    if not isinstance(provider_error, HostedVLLMEmbeddingError):
+        return False
+    try:
+        body: Final = _MAPPING_ADAPTER.validate_json(provider_error.message)
+    except ValidationError:
+        return False
+    return body.get("detail") == "Not Found"
 
 
 _EXCEPTION_POLICY_FIELDS: Final[tuple[tuple[type, str], ...]] = (
@@ -382,6 +401,9 @@ def _should_run_cooldown_logic(
         verbose_router_logger.debug(
             "Should Not Run Cooldown Logic: litellm rejected the request before calling the deployment"
         )
+        return False
+
+    if request_kwargs is not None and is_embedding_endpoint_not_found(original_exception, request_kwargs):
         return False
 
     if request_kwargs is not None and _is_per_user_provider_request(request_kwargs):
@@ -882,13 +904,13 @@ def is_caller_entra_credential_failure(
         return False
     from litellm.llms.azure_ai.common_utils import AZURE_ENTRA_LITELLM_PARAM_KEYS, azure_entra_environment_defaults
 
-    call_params: Final = _CREDENTIAL_VALUES_ADAPTER.validate_python(model_call_details.get("litellm_params") or {})
+    call_params: Final = _MAPPING_ADAPTER.validate_python(model_call_details.get("litellm_params") or {})
 
     credential_name: Final = deployment.litellm_params.litellm_credential_name
     configured_by_precedence: Final[tuple[Mapping[str, object], ...]] = (
         router_defaults,
-        _CREDENTIAL_VALUES_ADAPTER.validate_python(deployment.litellm_params.model_dump(exclude_none=True)),
-        _CREDENTIAL_VALUES_ADAPTER.validate_python(
+        _MAPPING_ADAPTER.validate_python(deployment.litellm_params.model_dump(exclude_none=True)),
+        _MAPPING_ADAPTER.validate_python(
             CredentialAccessor.get_credential_values(credential_name) if credential_name is not None else {}
         ),
     )
@@ -917,7 +939,7 @@ def is_caller_scoped_auth_failure(deployment: Deployment | None, exception_statu
     if credential_name is None:
         return False
 
-    credential_values: Final[Mapping[str, object]] = _CREDENTIAL_VALUES_ADAPTER.validate_python(
+    credential_values: Final[Mapping[str, object]] = _MAPPING_ADAPTER.validate_python(
         CredentialAccessor.get_credential_values(credential_name)
     )
     credential_token_exchange_endpoint: Final = credential_values.get("token_exchange_endpoint")
