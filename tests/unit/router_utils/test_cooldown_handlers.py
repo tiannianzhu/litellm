@@ -3106,6 +3106,71 @@ async def test_fallback_group_stays_up_after_a_bad_key_cools_the_primary_under_t
     assert tuple(cooldown_deployments) == ("primary-dep",)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", (False, True), ids=("async", "sync"))
+@pytest.mark.parametrize(
+    ("status", "error_body", "should_cool_down"),
+    (
+        (404, {"detail": "Not Found"}, False),
+        (404, {"error": {"message": "The requested model does not exist"}}, True),
+        (500, {"error": {"message": "The model engine failed"}}, True),
+    ),
+    ids=("missing-endpoint", "missing-model", "engine-failure"),
+)
+async def test_embedding_endpoint_errors_preserve_chat_deployment_availability(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    sync: bool,
+    status: int,
+    error_body: Mapping[str, object],
+    should_cool_down: bool,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    embedding: Final = respx_mock.post("https://shared-model.local/v1/embeddings").mock(
+        return_value=httpx.Response(status, json=error_body)
+    )
+    chat: Final = respx_mock.post("https://shared-model.local/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=BACKUP_REPLY)
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "shared-model",
+                "litellm_params": {
+                    "model": "hosted_vllm/shared-model",
+                    "api_base": "https://shared-model.local/v1",
+                    "api_key": "test-key",
+                },
+                "model_info": {"id": "shared-deployment"},
+            }
+        ],
+        num_retries=0,
+        allowed_fails_policy=AllowedFailsPolicy(NotFoundErrorAllowedFails=0, InternalServerErrorAllowedFails=0),
+    )
+    error_type: Final = litellm.NotFoundError if status == 404 else litellm.InternalServerError
+    if sync:
+        with pytest.raises(error_type) as sync_error:
+            router.embedding(model="shared-model", input="hello", user="embedding-caller")
+        assert sync_error.value.status_code == status
+    else:
+        with pytest.raises(error_type) as async_error:
+            await router.aembedding(model="shared-model", input="hello", user="embedding-caller")
+        assert async_error.value.status_code == status
+    assert len(embedding.calls) == 1
+
+    if should_cool_down:
+        with pytest.raises(RouterRateLimitError):
+            await router.acompletion(model="shared-model", messages=[{"role": "user", "content": "hello"}])
+        assert len(chat.calls) == 0
+        return
+
+    response: Final = await router.acompletion(
+        model="shared-model", messages=[{"role": "user", "content": "hello"}], user="chat-caller"
+    )
+    assert response.choices[0].message.content == "ok"
+    assert len(chat.calls) == 1
+
+
 TIMED_OUT_DEPLOYMENT: Final = {
     "model_name": "test-model",
     "litellm_params": {"model": "openai/test-model", "api_key": "test-key"},
