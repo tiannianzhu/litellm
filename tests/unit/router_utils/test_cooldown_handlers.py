@@ -56,6 +56,7 @@ from litellm.types.router import (
     AllowedFailsPolicy,
     DeploymentTypedDict,
     LiteLLMParamsTypedDict,
+    RetryPolicy,
     RouterRateLimitError,
 )
 from litellm.types.utils import CooldownDeploymentInfo, CredentialItem
@@ -78,7 +79,9 @@ def _ctx_double(
     ctx.settings.return_value.allowed_fails_policy = None
     ctx.settings.return_value.allowed_fails_for.return_value = None
     ctx.health.return_value.store = store if store is not None else DualCache(in_memory_cache=InMemoryCache())
-    ctx.health.return_value.cooldowns = CooldownCache(RouterCooldownStore(connect(None).router_cooldowns()), cooldown_time)
+    ctx.health.return_value.cooldowns = CooldownCache(
+        RouterCooldownStore(connect(None).router_cooldowns()), cooldown_time
+    )
     return ctx
 
 
@@ -367,7 +370,9 @@ class TestShouldCooldownBasedOnDeploymentPolicy:
 class TestShouldCooldownBasedOnAllowedFailsPolicy:
     def _make_router(self, cooldown_time: float = 60.0, store: RouterCooldowns | None = None) -> MagicMock:
         ctx: Final = _ctx_double(cooldown_time=cooldown_time, allowed_fails=0)
-        ctx.health.return_value.cooldowns = CooldownCache(store or RouterCooldownStore(connect(None).router_cooldowns()), cooldown_time)
+        ctx.health.return_value.cooldowns = CooldownCache(
+            store or RouterCooldownStore(connect(None).router_cooldowns()), cooldown_time
+        )
         return ctx
 
     def test_cooldown_time_override_zero_is_not_falsy(self):
@@ -2945,6 +2950,71 @@ async def test_fallback_group_stays_up_after_a_bad_key_cools_the_primary_under_t
     assert tuple(cooldown_deployments) == ("primary-dep",)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", (False, True), ids=("async", "sync"))
+@pytest.mark.parametrize(
+    ("status", "error_body", "should_cool_down"),
+    (
+        (404, {"detail": "Not Found"}, False),
+        (404, {"error": {"message": "The requested model does not exist"}}, True),
+        (500, {"error": {"message": "The model engine failed"}}, True),
+    ),
+    ids=("missing-endpoint", "missing-model", "engine-failure"),
+)
+async def test_embedding_endpoint_errors_preserve_chat_deployment_availability(
+    respx_mock: respx.MockRouter,
+    monkeypatch: pytest.MonkeyPatch,
+    sync: bool,
+    status: int,
+    error_body: Mapping[str, object],
+    should_cool_down: bool,
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    embedding: Final = respx_mock.post("https://shared-model.local/v1/embeddings").mock(
+        return_value=httpx.Response(status, json=error_body)
+    )
+    chat: Final = respx_mock.post("https://shared-model.local/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=BACKUP_REPLY)
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "shared-model",
+                "litellm_params": {
+                    "model": "hosted_vllm/shared-model",
+                    "api_base": "https://shared-model.local/v1",
+                    "api_key": "test-key",
+                },
+                "model_info": {"id": "shared-deployment"},
+            }
+        ],
+        num_retries=0,
+        allowed_fails_policy=AllowedFailsPolicy(NotFoundErrorAllowedFails=0, InternalServerErrorAllowedFails=0),
+    )
+    error_type: Final = litellm.NotFoundError if status == 404 else litellm.InternalServerError
+    if sync:
+        with pytest.raises(error_type) as sync_error:
+            router.embedding(model="shared-model", input="hello", user="embedding-caller")
+        assert sync_error.value.status_code == status
+    else:
+        with pytest.raises(error_type) as async_error:
+            await router.aembedding(model="shared-model", input="hello", user="embedding-caller")
+        assert async_error.value.status_code == status
+    assert len(embedding.calls) == 1
+
+    if should_cool_down:
+        with pytest.raises(RouterRateLimitError):
+            await router.acompletion(model="shared-model", messages=[{"role": "user", "content": "hello"}])
+        assert len(chat.calls) == 0
+        return
+
+    response: Final = await router.acompletion(
+        model="shared-model", messages=[{"role": "user", "content": "hello"}], user="chat-caller"
+    )
+    assert response.choices[0].message.content == "ok"
+    assert len(chat.calls) == 1
+
+
 TIMED_OUT_DEPLOYMENT: Final = {
     "model_name": "test-model",
     "litellm_params": {"model": "openai/test-model", "api_key": "test-key"},
@@ -3544,3 +3614,103 @@ def test_is_response_lookup_not_found(status_code: int, call_type: str, expected
     error.status_code = status_code
 
     assert is_response_lookup_not_found(error, {"call_type": call_type}) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_model", (False, True), ids=("missing-endpoint", "missing-model"))
+async def test_embedding_retries_classify_the_current_failure_before_rechaining(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch, missing_model: bool
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    embedding: Final = respx_mock.post("https://retry-isolation.local/v1/embeddings").mock(
+        side_effect=[
+            httpx.Response(404, json={"detail": "Not Found"}),
+            httpx.Response(
+                404, json={"error": {"message": "Model missing"}} if missing_model else {"detail": "Not Found"}
+            ),
+        ]
+    )
+    chat: Final = respx_mock.post("https://retry-isolation.local/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=BACKUP_REPLY)
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": "retry-isolation",
+                "litellm_params": {
+                    "model": "hosted_vllm/retry-isolation",
+                    "api_base": "https://retry-isolation.local/v1",
+                    "api_key": "test-key",
+                },
+                "model_info": {"id": "retry-isolation-deployment"},
+            }
+        ],
+        num_retries=1,
+        retry_after=0,
+        retry_policy=RetryPolicy(NotFoundErrorRetries=1),
+        allowed_fails_policy=AllowedFailsPolicy(NotFoundErrorAllowedFails=0),
+    )
+    with pytest.raises(litellm.NotFoundError):
+        await router.aembedding(model="retry-isolation", input="hello")
+    assert embedding.call_count == 2
+    if missing_model:
+        with pytest.raises(RouterRateLimitError):
+            await router.acompletion(model="retry-isolation", messages=[{"role": "user", "content": "hello"}])
+        assert chat.call_count == 0
+        return
+    response: Final = await router.acompletion(model="retry-isolation", messages=[{"role": "user", "content": "hello"}])
+    assert response.choices[0].message.content == "ok"
+    assert chat.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_embedding_fallback_with_shared_logging_keeps_backup_chat_available(
+    respx_mock: respx.MockRouter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    primary: Final = respx_mock.post("https://fallback-primary.local/v1/embeddings").mock(
+        return_value=httpx.Response(500, json={"error": {"message": "Engine unavailable"}})
+    )
+    backup: Final = respx_mock.post("https://fallback-backup.local/v1/embeddings").mock(
+        return_value=httpx.Response(404, json={"detail": "Not Found"})
+    )
+    chat: Final = respx_mock.post("https://fallback-backup.local/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=BACKUP_REPLY)
+    )
+    router: Final = Router(
+        model_list=[
+            {
+                "model_name": name,
+                "litellm_params": {
+                    "model": f"hosted_vllm/{name}",
+                    "api_base": f"https://fallback-{name}.local/v1",
+                    "api_key": "test-key",
+                },
+                "model_info": {"id": f"{name}-deployment"},
+            }
+            for name in ("primary", "backup")
+        ],
+        fallbacks=[{"primary": ["backup"]}],
+        num_retries=0,
+        allowed_fails_policy=AllowedFailsPolicy(NotFoundErrorAllowedFails=0, InternalServerErrorAllowedFails=0),
+    )
+    logging_obj: Final = Logging(
+        model="primary",
+        messages=[],
+        stream=False,
+        call_type="aembedding",
+        start_time=datetime.datetime(2026, 1, 1),
+        litellm_call_id="shared-fallback",
+        function_id="shared-fallback",
+    )
+    logging_obj.update_environment_variables(
+        model="primary", custom_llm_provider="hosted_vllm", litellm_params={}, optional_params={}
+    )
+    with pytest.raises((litellm.NotFoundError, litellm.InternalServerError)):
+        await router.aembedding(model="primary", input="hello", litellm_logging_obj=logging_obj)
+    assert (primary.call_count, backup.call_count) == (1, 1)
+    response: Final = await router.acompletion(model="backup", messages=[{"role": "user", "content": "hello"}])
+    assert response.choices[0].message.content == "ok"
+    assert chat.call_count == 1

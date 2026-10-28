@@ -52,7 +52,10 @@ from litellm.litellm_core_utils.core_helpers import (
     get_litellm_metadata_from_kwargs,
     get_metadata_variable_name_from_kwargs,
 )
-from litellm.litellm_core_utils.get_llm_provider_logic import is_registered_custom_provider
+from litellm.litellm_core_utils.get_llm_provider_logic import (
+    is_registered_custom_provider,
+    resolve_model_and_provider_for_metadata,
+)
 from litellm.litellm_core_utils.service_tier_utils import (
     get_service_tier_from_standard_logging_payload,
 )
@@ -478,6 +481,13 @@ def _get_proxy_llm_router() -> Router | None:
     except Exception:
         return None
     return llm_router
+
+
+def _deployment_state_provider(model: str, custom_llm_provider: str | None) -> str:
+    try:
+        return resolve_model_and_provider_for_metadata(model=model, custom_llm_provider=custom_llm_provider)[1]
+    except Exception:
+        return ""
 
 
 _CALLER_CREDENTIAL_FIELDS: Final = frozenset(
@@ -4140,15 +4150,35 @@ class PrometheusLogger(CustomLogger):
         """
         Set the deployment state.
         """
-        ### get labels
-        _labels: Final = prometheus_label_factory(
-            supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_deployment_state"),
-            enum_values=UserAPIKeyLabelValues(
+        from litellm.litellm_core_utils.litellm_logging import mask_api_base_credentials
+
+        router: Final = _get_proxy_llm_router() if model_id else None
+        deployment: Final = router.registry().deployment(model_id) if router is not None and model_id else None
+        enum_values: Final = (
+            UserAPIKeyLabelValues(
+                litellm_model_name=deployment.model_name,
+                model_id=model_id,
+                api_base=mask_api_base_credentials(
+                    litellm.get_api_base(
+                        model=deployment.litellm_params.model, optional_params=deployment.litellm_params
+                    )
+                    or ""
+                ),
+                api_provider=_deployment_state_provider(
+                    deployment.litellm_params.model, deployment.litellm_params.custom_llm_provider
+                ),
+            )
+            if deployment is not None
+            else UserAPIKeyLabelValues(
                 litellm_model_name=litellm_model_name,
                 model_id=model_id,
                 api_base=api_base,
                 api_provider=api_provider,
-            ),
+            )
+        )
+        _labels: Final = prometheus_label_factory(
+            supported_enum_labels=self.get_labels_for_metric(metric_name="litellm_deployment_state"),
+            enum_values=enum_values,
         )
         self.litellm_deployment_state.labels(**_labels).set(state)
 
