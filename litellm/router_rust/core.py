@@ -5399,12 +5399,6 @@ class _Driver:
             self._answer_without_an_image = error
         level: Final = step.get("fallback_level")
         retry: Final = step.get("retry")
-        if isinstance(retry, int) and retry > 0:
-            self._chain_to_hop_first(error, level if isinstance(level, int) else 0)
-        self._level_errors[level if isinstance(level, int) else 0] = error
-        attempted_on: Final = step.get("deployment_id")
-        if isinstance(attempted_on, str):
-            self._attempt_errors[(level if isinstance(level, int) else 0, attempted_on)] = error
         logged: Final = logged_call(
             call.host_op if call is not None else self._plan.host_op,
             served or self._request,  # pyright: ignore[reportUnknownArgumentType]  # see above
@@ -5412,6 +5406,12 @@ class _Driver:
         )
         model_info: Final = as_str_mapping(deployment.get("model_info")) or {}
         exits: Final = self._core.failure_exits(error, logged, model_info.get("id"), served)  # pyright: ignore[reportUnknownArgumentType]  # see above
+        if isinstance(retry, int) and retry > 0:
+            self._chain_to_hop_first(error, level if isinstance(level, int) else 0)
+        self._level_errors[level if isinstance(level, int) else 0] = error
+        attempted_on: Final = step.get("deployment_id")
+        if isinstance(attempted_on, str):
+            self._attempt_errors[(level if isinstance(level, int) else 0, attempted_on)] = error
         # A call under an api_key or api_base the request supplied ran as a request-scoped deployment
         # (`_handle_clientside_credential`): its failure is never the shared deployment's.
         ran_as: Final = (as_str_mapping(as_str_mapping(served).get("model_info") if served else None) or {}).get("id")  # pyright: ignore[reportUnknownArgumentType]  # see above

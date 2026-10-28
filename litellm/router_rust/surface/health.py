@@ -299,6 +299,7 @@ class RustHealthCallbacks:
             is_background_response_poll_not_found,
             is_caller_scoped_auth_failure,
             is_caller_timeout_408,
+            is_embedding_endpoint_not_found,
             is_failure_outside_selected_deployment,
             is_message_thread_not_found,
             is_response_lookup_not_found,
@@ -319,7 +320,9 @@ class RustHealthCallbacks:
         )
         return {
             "outside_deployment": outside,
-            "caller_scoped": _is_per_user_provider_request(logged) or self.per_user_deployment(deployment_id),
+            "caller_scoped": _is_per_user_provider_request(logged)
+            or self.per_user_deployment(deployment_id)
+            or (isinstance(exception, Exception) and is_embedding_endpoint_not_found(exception, logged)),
         }
 
     def blocked_failure_exempt(self, exception: BaseException, kwargs: Mapping[str, object], generic: bool) -> bool:
@@ -399,6 +402,7 @@ class RustHealthCallbacks:
             is_advisor_orchestration_failure,
             is_caller_scoped_auth_failure,
             is_caller_timeout_408,
+            is_embedding_endpoint_not_found,
             is_previous_response_rejected,
             is_stream_stall,
         )
@@ -430,7 +434,9 @@ class RustHealthCallbacks:
             {
                 **attempt_failure(exception),
                 "status": failure_status(exception_status),
-                "caller_scoped": _is_per_user_provider_request(kwargs) or self.per_user_deployment(deployment_id),
+                "caller_scoped": _is_per_user_provider_request(kwargs)
+                or self.per_user_deployment(deployment_id)
+                or is_embedding_endpoint_not_found(exception, kwargs),
             },
             deployment_cooldown=True,
             count_only=exception_status == "",

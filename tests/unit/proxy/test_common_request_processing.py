@@ -176,7 +176,10 @@ async def test_failed_router_request_releases_body_without_cyclic_gc() -> None:
 async def test_normal_inference_responses_preserve_content_and_response_headers(path: str) -> None:
     from fastapi import FastAPI
 
-    frames: Final = ("event: message\ndata: {\"content\": \"literal litellm.BadRequestError: text\"}\n\n", "data: [DONE]\n\n")
+    frames: Final = (
+        'event: message\ndata: {"content": "literal litellm.BadRequestError: text"}\n\n',
+        "data: [DONE]\n\n",
+    )
     headers: Final = {
         "x-litellm-response-cost": "1.2e-06",
         "retry-after": "Sat, 03 Oct 2026 09:00:00 GMT",
@@ -231,7 +234,8 @@ async def test_inference_stream_error_preserves_original_message_through_seriali
         else litellm.UnsupportedParamsError(message="This model always has reasoning enabled and cannot be disabled.")
         if failure_kind == "unsupported"
         else httpx.HTTPStatusError(
-            "gateway HTTP status line", request=httpx.Request("POST", "https://fixture.invalid/v1"),
+            "gateway HTTP status line",
+            request=httpx.Request("POST", "https://fixture.invalid/v1"),
             response=httpx.Response(401, json={"error": {"message": "This credential has expired."}}),
         )
         if failure_kind == "upstream_auth"
@@ -313,7 +317,9 @@ async def test_inference_stream_error_preserves_original_message_through_seriali
     else:
         assert detail["message"] == "This credential has expired."
     if path.endswith("messages"):
-        assert detail["type"] == ("authentication_error" if failure_kind in ("auth", "upstream_auth") else "invalid_request_error")
+        assert detail["type"] == (
+            "authentication_error" if failure_kind in ("auth", "upstream_auth") else "invalid_request_error"
+        )
         if started:
             assert "event: error\n" in response.text
     assert "litellm." not in detail["message"]
@@ -14912,7 +14918,9 @@ async def test_base_process_llm_request_audits_a_failure_that_lands_after_its_ke
     from litellm._logging import verbose_proxy_logger
 
     monkeypatch.setattr(verbose_proxy_logger, "propagate", True)
-    processor = ProxyBaseLLMRequestProcessing(data={"model": "gpt-4o", "stream": True, "litellm_call_id": "call-fixture"})
+    processor = ProxyBaseLLMRequestProcessing(
+        data={"model": "gpt-4o", "stream": True, "litellm_call_id": "call-fixture"}
+    )
 
     with patch.object(litellm, "sse_keepalive_ping_interval_seconds", 0.05):
         with patch.object(ProxyBaseLLMRequestProcessing, "_process_llm_request", slow_failure):
