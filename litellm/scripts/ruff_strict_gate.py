@@ -80,12 +80,7 @@ def head_violations() -> list[Violation]:
     out = []
     for item in _ruff_json(REPO_ROOT, STRICT_CONFIG):
         name = Path(item["filename"])
-        rel = (
-            (name if name.is_absolute() else REPO_ROOT / name)
-            .resolve()
-            .relative_to(REPO_ROOT)
-            .as_posix()
-        )
+        rel = (name if name.is_absolute() else REPO_ROOT / name).resolve().relative_to(REPO_ROOT).as_posix()
         out.append(Violation(rel, item["location"]["row"], item["code"]))
     return out
 
@@ -141,15 +136,13 @@ def cmd_check(base: str) -> None:
         print(f"  {breach.rule}: total {breach.total} over ceiling {breach.ceiling} (this change added {breach.added})")
         for violation in sorted(v for v in new if v.code == breach.rule):
             print(f"    {violation.file}:{violation.line}")
-    print(
-        "Reduce the new violations or remove an equal number elsewhere; the ceiling is the merge-base count."
-    )
+    print("Reduce the new violations or remove an equal number elsewhere; the ceiling is the merge-base count.")
     raise SystemExit(1)
 
 
 def main() -> None:
     parser: Final = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", help="Comparison ref (default: origin's current default branch)")
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument(
         "--emit-counts-dir",
         type=Path,

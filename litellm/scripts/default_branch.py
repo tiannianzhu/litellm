@@ -41,16 +41,22 @@ def default_branch(repo_root: Path) -> str:
 
 
 def resolve_base_ref(base_ref: str | None, repo_root: Path) -> str:
-    if base_ref:
-        return base_ref
-    branch: Final = default_branch(repo_root)
-    _git(repo_root, "fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
-    return f"origin/{branch}"
+    resolved: Final = base_ref or os.environ.get("BASE_REF") or "upstream/main"
+    try:
+        _git(repo_root, "merge-base", resolved, "HEAD")
+    except SystemExit as exc:
+        raise SystemExit(
+            f"Cannot resolve the merge base with local {resolved}. "
+            "Run: make lint-fetch-base, or provide BASE_REF=<ref> / --base <ref>."
+        ) from exc
+    return resolved
 
 
 def main() -> None:
-    parser: Final = argparse.ArgumentParser(description="Resolve the live default branch of origin.")
-    parser.add_argument("--base", help="Explicit comparison ref; skips default-branch discovery")
+    parser: Final = argparse.ArgumentParser(
+        description="Resolve the local comparison ref or query origin's default branch."
+    )
+    parser.add_argument("--base", help="Comparison ref (default: BASE_REF or upstream/main)")
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--branch", action="store_true", help="Print only the default branch name, without fetching")
     args: Final = parser.parse_args()
