@@ -1,13 +1,24 @@
+import re
 import uuid
+from collections.abc import Iterator
 from hashlib import sha256
+from pathlib import Path
 from typing import Final
 
 import pytest
 from integration._support.client import Gateway, eventually, object_value, string_value
-from integration._support.database import read_rows
+from psycopg import Connection, sql
 from pydantic import JsonValue
 
+from tests.integration._support.database import isolated_schema, read_rows
+
 COST_PER_REQUEST: Final = 20 * 0.001 + 20 * 0.002
+
+
+@pytest.fixture
+def postgresql_connection() -> Iterator[Connection[tuple[object, ...]]]:
+    with isolated_schema() as database:
+        yield database.connection
 
 
 def _logged(key: str, requests: int) -> list[dict[str, JsonValue]]:
@@ -71,3 +82,137 @@ def test_default_report_groups_each_days_spend_by_team_with_per_key_breakdown(ga
         assert filtered.status_code == 200, filtered.text
         only: Final = filtered.json()
         assert len(only) == 1 and [object_value(team)["team_name"] for team in only[0]["teams"]] == [quiet_alias], only
+
+
+@pytest.mark.parametrize(
+    ("message", "error_class", "error_code", "expected"),
+    (
+        (
+            "Cannot connect to host worker.invalid:9000 ssl:default [socket unavailable]",
+            "InternalServerError",
+            "500",
+            "backend_unavailable",
+        ),
+        ("Connect call failed ('192.0.2.1', 9000)", "InternalServerError", "500", "backend_unavailable"),
+        (
+            "Cannot connect to host worker.invalid:9000 [Connection timed out]",
+            "InternalServerError",
+            "500",
+            "backend_timeout",
+        ),
+        ("Provider returned an internal error", "InternalServerError", "500", "backend_5xx"),
+        (
+            "hosted_vllm Chat bridge cannot replay encrypted reasoning; use plaintext reasoning content",
+            "BadRequestError",
+            "400",
+            "protocol_capability_limit",
+        ),
+        (
+            "Unsupported chat content part type: 'file'. Supported types: text",
+            "BadRequestError",
+            "400",
+            "file_adaptation_unverified",
+        ),
+        ("Unsupported reasoning effort 'unknown-level'.", "UnsupportedParamsError", "400", "unsupported_parameter"),
+        (
+            "Conflicting output token limits: max_tokens=400, max_completion_tokens=200",
+            "BadRequestError",
+            "400",
+            "client_request_format",
+        ),
+        (
+            "This model always has reasoning enabled and cannot be disabled.",
+            "UnsupportedParamsError",
+            "400",
+            "expected_policy",
+        ),
+        ("Exceeded max_agentic_loops=3", "AgenticLoopLimitError", "", "expected_policy"),
+        ("Transaction already closed", "TransactionExpiredError", "", "gateway_database"),
+        ("key lookup did not answer within 0.5s", "DBLookupDeadlineExceeded", "", "gateway_database"),
+        (
+            '504: {"error_code":"P2028","message":"Unable to start a transaction in the given time."}',
+            "EngineRequestError",
+            "",
+            "gateway_database",
+        ),
+        (
+            '500: {"error_code": "P1017", "message":"Server has closed the connection."}',
+            "EngineRequestError",
+            "",
+            "gateway_database",
+        ),
+        ("Provider returned an internal error", "EngineRequestError", "500", "backend_5xx"),
+        ("", "ReadTimeout", "", "backend_timeout"),
+        ("", "WriteTimeout", "", "backend_timeout"),
+        ("", "ConnectTimeout", "", "backend_timeout"),
+        (
+            "Request decoded media exceeds the serving limit",
+            "BadRequestError",
+            "400",
+            "client_media_limit",
+        ),
+        (
+            "custom tool arguments must include a content field",
+            "BadGatewayError",
+            "502",
+            "backend_invalid_response",
+        ),
+        ("body.tools validation errors", "BadRequestError", "400", "client_request_format"),
+        (
+            "max_tokens=700 exceeds the configured output token limit of 500",
+            "BadRequestError",
+            "400",
+            "client_context_limit",
+        ),
+    ),
+)
+def test_spendlogs_report_classifies_failure_causes(
+    postgresql_connection: Connection[tuple[object, ...]],
+    message: str,
+    error_class: str,
+    error_code: str,
+    expected: str,
+) -> None:
+    script: Final = (
+        Path(__file__).resolve().parents[3] / "litellm/scripts/skills/inspect-errors/scripts/spendlogs_report.sh"
+    ).read_text()
+    classification: Final = re.search(
+        r"SELECT \$classification\$(.*?)\$classification\$ AS classification_sql", script, re.DOTALL
+    )
+    assert classification is not None
+    result: Final = postgresql_connection.execute(
+        sql.SQL(
+            "WITH failures(message, error_class, error_code) AS "
+            "(VALUES ({}::text, {}::text, {}::text)) SELECT {} FROM failures"
+        ).format(
+            sql.Literal(message), sql.Literal(error_class), sql.Literal(error_code), sql.SQL(classification.group(1))
+        ),
+    ).fetchone()
+    assert result == (expected,)
+
+
+@pytest.mark.parametrize(("recorded_failures", "expected_state"), ((2, "consistent"), (3, "mismatch")))
+def test_spendlogs_report_reconciles_call_failures_by_request_start_day(
+    postgresql_connection: Connection[tuple[object, ...]], recorded_failures: int, expected_state: str
+) -> None:
+    script: Final = (
+        Path(__file__).resolve().parents[3] / "litellm/scripts/skills/inspect-errors/scripts/spendlogs_report.sh"
+    ).read_text()
+    reconciliation: Final = re.search(r"\\echo 'CALL_FAILURE_RECONCILIATION'\n(.*?)\n\\echo", script, re.DOTALL)
+    assert reconciliation is not None
+    postgresql_connection.execute(
+        'CREATE TEMP TABLE "LiteLLM_SpendLogs" ("startTime" timestamp, "endTime" timestamp, status text); '
+        'CREATE TEMP TABLE "LiteLLM_DailyGlobalSpend" (date text, failed_requests bigint); '
+        'CREATE TEMP TABLE "LiteLLM_DailyRequestErrors" (date text, failed_requests bigint); '
+        'INSERT INTO "LiteLLM_SpendLogs" VALUES '
+        "('2026-11-08 15:59:00', '2026-11-08 16:01:00', 'failure'), "
+        "('2026-11-08 10:00:00', '2026-11-08 10:00:01', 'failure'), "
+        "('2026-11-08 10:00:00', '2026-11-08 10:00:01', 'success')"
+    )
+    for table in ("LiteLLM_DailyGlobalSpend", "LiteLLM_DailyRequestErrors"):
+        postgresql_connection.execute(
+            sql.SQL("INSERT INTO {} VALUES (%s, %s)").format(sql.Identifier(table)),
+            ("2026-11-08", recorded_failures),
+        )
+    rows: Final = postgresql_connection.execute(sql.SQL(reconciliation.group(1))).fetchall()
+    assert rows == [("2026-11-08", recorded_failures, recorded_failures, 2, recorded_failures - 2, expected_state)]

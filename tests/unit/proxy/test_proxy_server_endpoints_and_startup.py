@@ -805,48 +805,52 @@ def test_admin_ui_export_serves_nested_extensionless_routes():
     assert "<html" in landed.text.lower()
 
 
-def test_restructure_always_happens(monkeypatch):
-    """
-    Test that restructuring logic always executes regardless of LITELLM_NON_ROOT setting.
-    In development (is_non_root=False), restructuring happens directly in _experimental/out.
-    In non-root Docker (is_non_root=True), restructuring happens in /var/lib/litellm/ui.
-    """
-    # Test Case 1: is_non_root is True - restructuring happens in /var/lib/litellm/ui
-    monkeypatch.setenv("LITELLM_NON_ROOT", "true")
+def test_unbaked_ui_applies_runtime_prefix_without_changing_packaged_files(tmp_path: Path) -> None:
+    packaged: Final = tmp_path / "packaged"
+    runtime: Final = tmp_path / "runtime"
+    assets: Final = packaged / "_next" / "static"
+    assets.mkdir(parents=True)
+    html: Final = '<link href="/get_favicon"><script src="/litellm-asset-prefix/_next/static/app.js"></script>'
+    script: Final = (
+        'fetch("/litellm/.well-known/litellm-ui-config");'
+        'const icon=\\"/get_favicon\\";const external="/other/get_favicon"'
+    )
+    (packaged / "index.html").write_text(html)
+    (packaged / "login.html").write_text("login")
+    (assets / "app.js").write_text(script)
+    (assets / "image.png").write_bytes(b"\xff\x00")
 
-    runtime_ui_path = "/var/lib/litellm/ui"
-    packaged_ui_path = "/some/packaged/ui/path"
+    success, error = proxy_server_module._try_populate_ui_directory(str(packaged), str(runtime))
+    assert success, error
+    proxy_server_module._apply_ui_root_path(str(runtime), "/gateway")
+    proxy_server_module._apply_ui_root_path(str(runtime), "/gateway")
+    proxy_server_module._restructure_ui_html_files(str(runtime))
 
-    # Simulate the logic from proxy_server.py
-    is_non_root = os.getenv("LITELLM_NON_ROOT", "").lower() == "true"
-    if is_non_root:
-        ui_path = runtime_ui_path
-    else:
-        ui_path = packaged_ui_path
+    assert (runtime / "index.html").read_text() == (
+        '<link href="/gateway/get_favicon"><script src="/gateway/_next/static/app.js"></script>'
+    )
+    assert (runtime / "_next" / "static" / "app.js").read_text() == (
+        'fetch("/gateway/.well-known/litellm-ui-config");'
+        'const icon=\\"/gateway/get_favicon\\";const external="/other/get_favicon"'
+    )
+    assert (runtime / "login" / "index.html").read_text() == "login"
+    assert (runtime / "_next" / "static" / "image.png").read_bytes() == b"\xff\x00"
+    assert (packaged / "index.html").read_text() == html
+    assert (packaged / "login.html").read_text() == "login"
+    assert (assets / "app.js").read_text() == script
 
-    # Restructuring always happens now, regardless of ui_path vs packaged_ui_path
-    should_restructure = True
 
-    assert is_non_root is True
-    assert should_restructure is True
-    assert ui_path == runtime_ui_path
+def test_baked_ui_keeps_build_time_paths(tmp_path: Path) -> None:
+    (tmp_path / ".litellm_ui_root_path_baked").touch()
+    html: Final = '<link href="/gateway/get_favicon"><script src="/gateway/_next/static/app.js"></script>'
+    script: Final = 'const fallback="/litellm/.well-known/litellm-ui-config"'
+    (tmp_path / "index.html").write_text(html)
+    (tmp_path / "app.js").write_text(script)
 
-    # Test Case 2: is_non_root is False - restructuring happens directly in packaged_ui_path
-    monkeypatch.delenv("LITELLM_NON_ROOT", raising=False)
+    proxy_server_module._apply_ui_root_path(str(tmp_path), "/gateway")
 
-    # Simulate the logic from proxy_server.py
-    is_non_root = os.getenv("LITELLM_NON_ROOT", "").lower() == "true"
-    if is_non_root:
-        ui_path = runtime_ui_path
-    else:
-        ui_path = packaged_ui_path
-
-    # Restructuring always happens now, even when ui_path == packaged_ui_path
-    should_restructure = True
-
-    assert is_non_root is False
-    assert should_restructure is True
-    assert ui_path == packaged_ui_path
+    assert (tmp_path / "index.html").read_text() == html
+    assert (tmp_path / "app.js").read_text() == script
 
 
 def _mock_scheduled_proxy_config() -> MagicMock:

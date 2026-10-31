@@ -1,0 +1,150 @@
+rule_files:
+  - prometheus.alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: gateway and worker availability alerts resolve after recovery
+    interval: 1m
+    input_series:
+      - series: 'up{job="litellm", instance="gateway:4000"}'
+        values: '0+0x3 1+0x5'
+      - series: 'vllm_router_active_workers{job="vllm", instance="router:8000"}'
+        values: '0+0x6 2+0x2'
+    promql_expr_test:
+      - expr: 'count by (alertname) (ALERTS{alertname=~"LiteLLMProxyDown|VLLMRouterNoWorkers", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{alertname="LiteLLMProxyDown"}'
+            value: 1
+          - labels: '{alertname="VLLMRouterNoWorkers"}'
+            value: 1
+      - expr: 'ALERTS{alertname=~"LiteLLMProxyDown|VLLMRouterNoWorkers", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+
+  - name: target failures stay active when an outage spreads and resolve when targets return
+    interval: 1m
+    input_series:
+      - series: 'up{job="vllm", host="node-a", instance="worker-a:8000"}'
+        values: '0+0x8 1+0x3'
+      - series: 'up{job="vllm", host="node-b", instance="worker-b:8000"}'
+        values: '1+0x3 0+0x4 1+0x3'
+      - series: 'up{job="vllm-aux", service="embedding", instance="embedding:8000"}'
+        values: '1+0x4 0+0x3 1+0x3'
+    promql_expr_test:
+      - expr: 'count by (instance) (ALERTS{alertname="VLLMTargetDown", alertstate="firing"})'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{instance="worker-a:8000"}'
+            value: 1
+      - expr: 'count by (instance) (ALERTS{alertname="VLLMTargetDown", alertstate="firing"})'
+        eval_time: 7m
+        exp_samples:
+          - labels: '{instance="worker-a:8000"}'
+            value: 1
+          - labels: '{instance="worker-b:8000"}'
+            value: 1
+          - labels: '{instance="embedding:8000"}'
+            value: 1
+      - expr: 'ALERTS{alertname="VLLMTargetDown", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  - name: engine router and auxiliary queues alert and recover
+    interval: 1m
+    input_series:
+      - series: 'vllm:num_requests_waiting{job="vllm", host="node-a", service="llm", instance="worker:8000", model_name="chat"}'
+        values: '50+0x6 0+0x3'
+      - series: 'vllm:num_requests_waiting{job="vllm", host="node-b", service="llm", instance="router:8000"}'
+        values: '50+0x6 0+0x3'
+      - series: 'vllm_router_active_workers{job="vllm", host="node-b", service="llm", instance="router:8000"}'
+        values: '2+0x10'
+      - series: 'vllm:num_requests_waiting{job="vllm-aux", service="embedding", instance="embedding:8000", model_name="embedding"}'
+        values: '50+0x6 0+0x3'
+      - series: 'vllm:num_requests_waiting{job="vllm-aux", service="reranker", instance="embedding:8000", model_name="reranker"}'
+        values: '50+0x6 0+0x3'
+    promql_expr_test:
+      - expr: 'count by (instance, service) (ALERTS{alertname=~"VLLM.*QueueBacklog", alertstate="firing"})'
+        eval_time: 6m
+        exp_samples:
+          - labels: '{instance="worker:8000", service="llm"}'
+            value: 1
+          - labels: '{instance="router:8000", service="llm"}'
+            value: 1
+          - labels: '{instance="embedding:8000", service="embedding"}'
+            value: 1
+          - labels: '{instance="embedding:8000", service="reranker"}'
+            value: 1
+      - expr: 'ALERTS{alertname=~"VLLM.*QueueBacklog", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+
+  - name: stalled engines alert while progressing prefill and completed requests stay healthy
+    interval: 1m
+    input_series:
+      - series: 'vllm:num_requests_running{job="vllm", service="llm", instance="stalled:8000", model_name="chat"}'
+        values: '1+0x16 0+0x3'
+      - series: 'vllm:prompt_tokens_total{job="vllm", service="llm", instance="stalled:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:generation_tokens_total{job="vllm", service="llm", instance="stalled:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:request_success_total{job="vllm", service="llm", instance="stalled:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:num_requests_running{job="vllm", instance="prefill:8000", model_name="chat"}'
+        values: '1+0x20'
+      - series: 'vllm:prompt_tokens_total{job="vllm", instance="prefill:8000", model_name="chat"}'
+        values: '0+100x20'
+      - series: 'vllm:generation_tokens_total{job="vllm", instance="prefill:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:request_success_total{job="vllm", instance="prefill:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:num_requests_running{job="vllm", instance="completing:8000", model_name="chat"}'
+        values: '1+0x20'
+      - series: 'vllm:prompt_tokens_total{job="vllm", instance="completing:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:generation_tokens_total{job="vllm", instance="completing:8000", model_name="chat"}'
+        values: '0+0x20'
+      - series: 'vllm:request_success_total{job="vllm", instance="completing:8000", model_name="chat"}'
+        values: '0+1x20'
+    promql_expr_test:
+      - expr: 'count by (instance, service) (ALERTS{alertname="VLLMEngineStalled", alertstate="firing"})'
+        eval_time: 16m
+        exp_samples:
+          - labels: '{instance="stalled:8000", service="llm"}'
+            value: 1
+      - expr: 'ALERTS{alertname="VLLMEngineStalled", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples: []
+
+  - name: deployment outage and server failures are distinct and client errors do not page
+    interval: 1m
+    input_series:
+      - series: 'litellm_deployment_state{job="litellm", model_id="offline", litellm_model_name="offline", api_base="https://offline.invalid"}'
+        values: '2+0x16 0+0x3'
+      - series: 'litellm_deployment_state{job="litellm", model_id="failing", litellm_model_name="failing", api_base="https://failing.invalid"}'
+        values: '1+0x20'
+      - series: 'litellm_deployment_failure_responses_total{job="litellm", model_id="failing", litellm_model_name="failing", api_base="https://failing.invalid", exception_status="500"}'
+        values: '0+200x20'
+      - series: 'litellm_deployment_total_requests_total{job="litellm", model_id="failing", litellm_model_name="failing", api_base="https://failing.invalid"}'
+        values: '0+500x20'
+      - series: 'litellm_deployment_state{job="litellm", model_id="client-errors", litellm_model_name="client-errors", api_base="https://client.invalid"}'
+        values: '1+0x20'
+      - series: 'litellm_deployment_failure_responses_total{job="litellm", model_id="client-errors", litellm_model_name="client-errors", api_base="https://client.invalid", exception_status="400"}'
+        values: '0+200x20'
+      - series: 'litellm_deployment_total_requests_total{job="litellm", model_id="client-errors", litellm_model_name="client-errors", api_base="https://client.invalid"}'
+        values: '0+500x20'
+    promql_expr_test:
+      - expr: 'count by (model_id) (ALERTS{alertname="LiteLLMDeploymentUnhealthy", alertstate="firing"})'
+        eval_time: 16m
+        exp_samples:
+          - labels: '{model_id="offline"}'
+            value: 1
+      - expr: 'count by (model_id) (ALERTS{alertname="LiteLLMDeploymentFailures", alertstate="firing"})'
+        eval_time: 16m
+        exp_samples:
+          - labels: '{model_id="failing"}'
+            value: 1
+      - expr: 'ALERTS{alertname="LiteLLMDeploymentUnhealthy", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples: []

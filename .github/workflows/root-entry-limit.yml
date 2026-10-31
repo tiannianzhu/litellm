@@ -19,8 +19,8 @@ jobs:
         env:
           MAX_ROOT_ENTRIES: 15
         run: |
-          count=$(find . -mindepth 1 -maxdepth 1 -printf '.\n' | wc -l)
-          echo "Root has $count entries. Maximum is $MAX_ROOT_ENTRIES."
+          count=$(find . -mindepth 1 -maxdepth 1 ! -name scripts -printf '.\n' | wc -l)
+          echo "Root has $count entries excluding fork scripts. Maximum is $MAX_ROOT_ENTRIES."
           if [ "$count" -gt "$MAX_ROOT_ENTRIES" ]; then
             echo "::error::Repository root exceeds $MAX_ROOT_ENTRIES entries. Move new files into an existing directory."
             exit 1

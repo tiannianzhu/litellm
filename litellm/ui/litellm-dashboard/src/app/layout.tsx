@@ -13,11 +13,12 @@ import { Toaster } from "@/components/ui/sonner";
 import I18nProvider from "@/i18n/I18nProvider";
 
 const inter = Inter({ subsets: ["latin"] });
+const faviconPath = process.env.NEXT_PUBLIC_LITELLM_FAVICON_PATH ?? "/get_favicon";
 
 export const metadata: Metadata = {
   title: "LiteLLM Dashboard",
   description: "LiteLLM Proxy Admin UI",
-  icons: { icon: "/get_favicon" },
+  icons: { icon: faviconPath },
 };
 
 export default function RootLayout({
