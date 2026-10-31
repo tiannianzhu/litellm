@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { setServerRootPath } from "@/lib/serverRootPath";
 import { normalizeBackendPageUrlToUiOrigin } from "./returnUrlUtils";
 import { navigateToUiPage } from "./uiNavigation";
 
@@ -16,13 +17,35 @@ describe("navigateToUiPage", () => {
     vi.stubGlobal("window", { location: { origin: "https://ui.example", assign, replace } });
   });
 
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => {
+    setServerRootPath("/");
+    vi.unstubAllGlobals();
+  });
 
   it.each([false, true])("uses document navigation with replace=%s", (replaceHistory) => {
     navigateToUiPage("/ui/teams?tab=all#members", replaceHistory);
 
     expect(replaceHistory ? replace : assign).toHaveBeenCalledWith("https://ui.example/ui/teams?tab=all#members");
     expect(replaceHistory ? assign : replace).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["https://attacker.example/ui", false],
+    ["http://[invalid", true],
+  ])("keeps the configured UI root when rejecting %s", (url, replaceHistory) => {
+    setServerRootPath("/sandbox/");
+
+    navigateToUiPage(url, replaceHistory);
+
+    expect(replaceHistory ? replace : assign).toHaveBeenCalledWith("/sandbox/ui");
+  });
+
+  it("keeps the fallback on the UI origin even if the configured root is malformed", () => {
+    setServerRootPath("/\\attacker.example");
+
+    navigateToUiPage("https://attacker.example/ui");
+
+    expect(assign).toHaveBeenCalledWith("/ui");
   });
 
   it.each([
