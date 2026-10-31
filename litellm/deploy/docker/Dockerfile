@@ -42,8 +42,18 @@ COPY litellm/ui/litellm-dashboard/package.json litellm/ui/litellm-dashboard/pack
 COPY litellm/ui/litellm-dashboard/vendor/ ./vendor/
 RUN --mount=type=cache,target=/root/.npm npm ci --prefer-offline
 
+ARG SERVER_ROOT_PATH
+ENV SERVER_ROOT_PATH=$SERVER_ROOT_PATH
+
 COPY litellm/ui/litellm-dashboard/ ./
-RUN npm run build
+COPY litellm/enterprise/enterprise_ui/ /tmp/enterprise_ui/
+RUN --mount=type=cache,target=/ui/.next/cache \
+    if [ -f /tmp/enterprise_ui/enterprise_colors.json ]; then cp /tmp/enterprise_ui/enterprise_colors.json ui_colors.json; fi && \
+    npm run build && \
+    touch /ui/out/.litellm_ui_ready && \
+    if [ -n "$(printf '%s' "$SERVER_ROOT_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s#^/*##;s#/*$##')" ]; then \
+        touch /ui/out/.litellm_ui_root_path_baked; \
+    fi
 
 # Builder stage
 FROM $LITELLM_BUILD_IMAGE AS builder
@@ -82,7 +92,8 @@ COPY litellm/proxy-extras/pyproject.toml litellm/proxy-extras/
 COPY litellm/packaging/litellm-proxy/pyproject.toml litellm/packaging/litellm-proxy/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
-RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --group admin-mcp \
@@ -92,22 +103,32 @@ RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-gr
     --extra bedrock-realtime \
     --python python3.13
 
+ARG MATURIN_PEP517_ARGS=""
+COPY litellm/rust/ litellm/rust/
+COPY model_prices_and_context_window.json ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/litellm/rust/target \
+    uv build --package litellm-proxy --wheel --out-dir /wheels
+
+COPY litellm/schema.prisma litellm/schema.prisma
+RUN --mount=type=cache,target=/root/.npm \
+    HOME=/opt/prisma XDG_CACHE_HOME=/opt/prisma/.cache PRISMA_BINARY_CACHE_DIR=/opt/prisma/binaries \
+    prisma generate --schema=litellm/schema.prisma
+
 # Copy full source tree
 COPY . .
 
-# Replace the committed UI bundle with the one built from this exact source.
-# Clearing first drops the committed bundle's content-hashed chunks that COPY
-# would otherwise leave behind alongside the fresh ones.
-RUN rm -rf litellm/proxy/_experimental/out
+# Install the UI built from this exact source.
 COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 
-# Build Admin UI before final sync (applies the enterprise color override when present)
-RUN sed -i 's/\r$//' litellm/deploy/docker/build_admin_ui.sh && chmod +x litellm/deploy/docker/build_admin_ui.sh && ./litellm/deploy/docker/build_admin_ui.sh
-
 # Install project and workspace packages (fast - deps already cached)
-ARG MATURIN_PEP517_ARGS=""
-RUN uv build --package litellm-proxy --wheel --out-dir /wheels
-RUN uv sync --frozen --no-install-package litellm-proxy --no-default-groups --no-editable \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/litellm/rust/target \
+    uv sync --frozen --no-install-package litellm-proxy --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --group admin-mcp \

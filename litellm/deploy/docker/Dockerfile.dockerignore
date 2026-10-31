@@ -52,6 +52,10 @@ build/
 litellm/ui/litellm-dashboard/.next
 litellm/ui/litellm-dashboard/out
 litellm/rust/target/
+litellm-rust/target/
+ui/litellm-dashboard/.next/
+ui/litellm-dashboard/out/
+litellm/proxy/_experimental/out
 litellm/rust_bridge/_native*.so
 *.log
 .env
@@ -62,3 +66,10 @@ litellm/deploy/**
 litellm/deploy/docker/**
 !litellm/deploy/docker/build_admin_ui.sh
 !litellm/deploy/docker/docker-entrypoint.sh
+.env.production
+
+# Runtime-mounted local configuration
+config.yaml
+callbacks/
+prometheus*.yml
+alertmanager*
