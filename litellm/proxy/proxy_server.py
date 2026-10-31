@@ -2734,57 +2734,44 @@ try:
     if not _validate_ui_directory(ui_path):
         verbose_proxy_logger.error("Selected UI path %s is invalid or incomplete. UI may not work correctly.", ui_path)
 
-    # Only modify files if a custom server root path is set AND filesystem is writable
-    if server_root_path and server_root_path != "/":
-        # Check if UI path is writable
-        is_writable = os.access(ui_path, os.W_OK)
-
-        if not is_writable:
+    def _apply_ui_root_path(ui_path: str, root_path: str) -> None:
+        if not root_path or root_path == "/":
+            return
+        if os.path.isfile(os.path.join(ui_path, ".litellm_ui_root_path_baked")):
+            verbose_proxy_logger.info(
+                "Using UI with build-time server_root_path=%s",
+                root_path,
+            )
+            return
+        if not os.access(ui_path, os.W_OK):
             verbose_proxy_logger.warning(
                 "Cannot apply server_root_path replacements to UI at %s: path is not writable. Ensure server_root_path is '/' or pre-process UI files in Dockerfile with custom server_root_path.",
                 ui_path,
             )
-        else:
-            # Iterate through files in the UI directory
-            for root, dirs, files in os.walk(ui_path):
-                for filename in files:
-                    file_path = os.path.join(root, filename)
-                    # Skip binary files and files that don't need path replacement
-                    if filename.endswith(
-                        (
-                            ".png",
-                            ".jpg",
-                            ".jpeg",
-                            ".gif",
-                            ".ico",
-                            ".woff",
-                            ".woff2",
-                            ".ttf",
-                            ".eot",
-                        )
-                    ):
-                        continue
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            content = f.read()
+            return
 
-                        # Replace the asset prefix with the server root path
-                        modified_content = content.replace(
-                            f"{litellm_asset_prefix}",
-                            f"{server_root_path}",
-                        )
+        def replace_file(file_path: str) -> None:
+            if file_path.endswith((".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot")):
+                return
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content: Final = f.read()
+                favicon_content: Final = re.sub(
+                    r"""(?<=["'])/get_favicon(?=["'\\])""", lambda _: f"{root_path}/get_favicon", content
+                )
+                modified_content: Final = favicon_content.replace(litellm_asset_prefix, root_path).replace(
+                    "/litellm/.well-known/litellm-ui-config", f"{root_path}/.well-known/litellm-ui-config"
+                )
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(modified_content)
+            except (UnicodeDecodeError, PermissionError, OSError):
+                return
 
-                        # Replace the /.well-known/litellm-ui-config with the server root path
-                        modified_content = modified_content.replace(
-                            "/litellm/.well-known/litellm-ui-config",
-                            f"{server_root_path}/.well-known/litellm-ui-config",
-                        )
+        for root, _, files in os.walk(ui_path):
+            for filename in files:
+                replace_file(os.path.join(root, filename))
 
-                        with open(file_path, "w", encoding="utf-8") as f:
-                            f.write(modified_content)
-                    except (UnicodeDecodeError, PermissionError, OSError):
-                        # Skip binary files or files we can't write to
-                        continue
+    _apply_ui_root_path(ui_path, server_root_path)
 
     # # Mount the _next directory at the root level
     app.mount(
