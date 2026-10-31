@@ -264,3 +264,13 @@ def test_no_head_output_is_refused_as_vacuous_before_any_base_lookup(capsys: pyt
         gate.cmd_check({}, "irrelevant-base-ref")
     assert exit_info.value.code == 1
     assert "vacuous" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("payload", ('{"generalDiagnostics": [], "summary": {"errorCount": 0}}\n', "invalid output"))
+def test_save_diagnostics_preserves_raw_output(
+    payload: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path: Final = tmp_path / "basedpyright-diagnostics.json"
+    gate.save_diagnostics(payload, path)
+    assert path.read_text() == payload
+    assert capsys.readouterr().out == f"Saved basedpyright diagnostics to {path}\n"
