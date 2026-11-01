@@ -7658,3 +7658,246 @@ def test_allowed_tools_makes_the_selected_tool_eager_when_search_is_removed() ->
     assert result["tools"][0]["function"]["name"] == "weather"
     assert result["tools"][0].get("defer_loading", False) is False
     assert result["tool_choice"] == "auto"
+
+
+@pytest.mark.parametrize("provider", ("hosted_vllm", "openai"))
+@pytest.mark.parametrize("previous_source", (("lookup", "workspace"), ("deliver", "relay")))
+def test_named_external_message_reaches_chat_without_inventing_a_call(
+    provider: str, previous_source: tuple[str, str]
+) -> None:
+    import httpx
+    from openai import OpenAI
+
+    from litellm.llms.custom_httpx.http_handler import HTTPHandler
+
+    previous_name, previous_namespace = previous_source
+    text: Final = '\n  脱敏交接示例\n完整保留空白和引号 "sample"\n'
+    external: Final = {
+        "type": "function_call_output",
+        "id": "external_message",
+        "namespace": "relay",
+        "name": "deliver",
+        "output": text,
+    }
+    history: Final = [
+        {
+            "type": "function_call",
+            "id": "fc_existing",
+            "call_id": "call_existing",
+            "name": previous_name,
+            "namespace": previous_namespace,
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "id": "existing_result",
+            "call_id": "call_existing",
+            "name": previous_name,
+            "namespace": previous_namespace,
+            "output": "paired result",
+        },
+        external,
+    ]
+    original: Final = deepcopy(history)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body: Final = TypeAdapter(dict[str, object]).validate_json(request.content)
+        messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(body["messages"])
+        assert request.url.path == "/v1/chat/completions"
+        assert [message["role"] for message in messages] == ["assistant", "tool", "user"]
+        calls: Final = TypeAdapter(list[dict[str, object]]).validate_python(messages[0]["tool_calls"])
+        assert len(calls) == 1 and calls[0]["id"] == "call_existing"
+        assert messages[1]["tool_call_id"] == "call_existing"
+        assert messages[1]["content"] == "paired result"
+        content: Final = messages[2]["content"]
+        observed: Final = (
+            content
+            if isinstance(content, str)
+            else "".join(block["text"] for block in TypeAdapter(list[dict[str, str]]).validate_python(content))
+        )
+        assert all(value in observed for value in ("external_message", "relay", "deliver"))
+        assert text in observed
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "bridge-fixture",
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "received"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        api_client: Final = (
+            HTTPHandler(client=client)
+            if provider == "hosted_vllm"
+            else OpenAI(api_key="fixture", base_url="https://bridge.test/v1", http_client=client)
+        )
+        response: Final = litellm.responses(
+            model=f"{provider}/bridge-fixture",
+            input=history,
+            api_base="https://bridge.test/v1",
+            api_key="fixture",
+            client=api_client,
+            use_chat_completions_api=True,
+            num_retries=0,
+        )
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "received"
+    assert history == original
+
+
+def test_named_external_message_requires_id_while_source_call_is_pending() -> None:
+    call: Final = {"type": "function_call", "name": "deliver", "namespace": "relay", "arguments": "{}"}
+    history: Final = [
+        {**call, "call_id": "call_old"},
+        {"type": "function_call_output", "call_id": "call_old", "output": "old result"},
+        {**call, "call_id": "call_pending"},
+        {
+            "type": "function_call_output",
+            "id": "external_message",
+            "name": "deliver",
+            "namespace": "relay",
+            "output": "handoff",
+        },
+        {"type": "function_call_output", "call_id": "call_pending", "output": "later result"},
+    ]
+
+    with pytest.raises(litellm.BadRequestError, match="nonempty call_id") as error:
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model="fixture",
+            input=cast(ResponseInputParam, history),  # cast-ok: deliberately unassociated result tests input validation
+            responses_api_request={},
+            custom_llm_provider="hosted_vllm",
+        )
+    assert error.value.status_code == 400
+
+
+def test_compaction_releases_a_named_source_for_an_external_message() -> None:
+    text: Final = "Complete synthetic handoff after compaction"
+    history: Final = [
+        {"type": "function_call", "call_id": "call_old", "name": "deliver", "namespace": "relay", "arguments": "{}"},
+        {"type": "compaction", "id": "cmp_litellm", "encrypted_content": json.dumps(_COMPACTION_BLOCK)},
+        {
+            "type": "function_call_output",
+            "id": "external_message",
+            "name": "deliver",
+            "namespace": "relay",
+            "output": text,
+        },
+    ]
+
+    messages: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model="fixture",
+        input=cast(ResponseInputParam, history),  # cast-ok: fixture combines standard items with an external message
+        responses_api_request=_COMPACTION_REQUESTED,
+        custom_llm_provider="hosted_vllm",
+    )["messages"]
+
+    assert [message["role"] for message in messages] == ["user", "user"]
+    assert dict(messages[0]) == _SUMMARY_AS_TEXT
+    content: Final = messages[1]["content"]
+    observed: Final = (
+        content
+        if isinstance(content, str)
+        else "".join(block["text"] for block in TypeAdapter(list[dict[str, str]]).validate_python(content))
+    )
+    assert text in observed
+    assert all(value in observed for value in ("external_message", "relay", "deliver"))
+
+
+@pytest.mark.parametrize(
+    ("overrides", "preceding_call"),
+    (
+        ({"id": None}, None),
+        ({"namespace": None}, None),
+        ({"name": " "}, None),
+        ({"output": {"text": "malformed"}}, None),
+        ({"call_id": ""}, None),
+        ({"type": "custom_tool_call_output"}, None),
+        (
+            {},
+            {
+                "type": "function_call",
+                "id": "fc_local",
+                "call_id": "call_local",
+                "name": "deliver",
+                "namespace": "relay",
+                "arguments": "{}",
+            },
+        ),
+    ),
+)
+@pytest.mark.parametrize("provider", ("hosted_vllm", "openai"))
+def test_named_result_without_external_provenance_or_with_a_local_call_still_requires_an_id(
+    overrides: Mapping[str, object],
+    preceding_call: Mapping[str, object] | None,
+    provider: str,
+) -> None:
+    item: Final = {
+        "type": "function_call_output",
+        "id": "external_message",
+        "namespace": "relay",
+        "name": "deliver",
+        "output": "redacted message",
+        **overrides,
+    }
+    history: Final = [
+        *((preceding_call,) if preceding_call is not None else ()),
+        item,
+        *(({**preceding_call, "id": "fc_later", "call_id": "call_later"},) if preceding_call is not None else ()),
+    ]
+    with pytest.raises(litellm.BadRequestError, match="nonempty call_id") as error:
+        LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model="bridge-fixture",
+            input=cast(ResponseInputParam, history),  # cast-ok: malformed items exercise public input validation
+            responses_api_request={},
+            custom_llm_provider=provider,
+        )
+    assert error.value.status_code == 400
+
+
+def test_shared_message_resolution_keeps_named_external_message_visible() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import resolve_structured_messages
+
+    text: Final = "完整的脱敏交接正文\n下一行"
+    item: Final = {
+        "type": "function_call_output",
+        "id": "external_message",
+        "namespace": "relay",
+        "name": "deliver",
+        "output": text,
+    }
+    messages: Final = resolve_structured_messages(
+        None,
+        {
+            "input": [
+                item,
+                {
+                    "type": "function_call",
+                    "id": "fc_later",
+                    "call_id": "call_later",
+                    "name": "deliver",
+                    "namespace": "relay",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_later", "output": "later paired result"},
+            ],
+            "previous_response_id": "stored_response",
+            "litellm_metadata": {"user_api_key_request_route": "/v1/responses"},
+        },
+    )
+    assert messages is not None and [message["role"] for message in messages] == ["user", "assistant", "tool"]
+    assert messages[-1]["tool_call_id"] == "call_later"
+    content: Final = messages[0]["content"]
+    observed: Final = (
+        content
+        if isinstance(content, str)
+        else "".join(block["text"] for block in TypeAdapter(list[dict[str, str]]).validate_python(content))
+    )
+    assert text in observed
+    assert all(value in observed for value in ("external_message", "relay", "deliver"))

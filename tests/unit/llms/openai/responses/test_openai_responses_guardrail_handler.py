@@ -9,7 +9,7 @@ import copy
 import json
 import uuid
 from collections.abc import Callable
-from typing import Any, Final, List, Literal, Optional, Tuple
+from typing import Any, Final, List, Literal, Optional, Tuple, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import logging
@@ -19,7 +19,8 @@ import pytest
 
 
 from fastapi import HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
+from openai.types.responses.response_create_params import ResponseInputParam
 from openai.types.responses import (
     ResponseCustomToolCall,
     ResponseCustomToolCallInputDeltaEvent,
@@ -5056,8 +5057,9 @@ _MASKED_REFUSAL: Final = "I can't share where [NAME] lives."
 
 
 class NameMaskingGuardrail(CustomGuardrail):
-    def __init__(self, guardrail_name: str) -> None:
+    def __init__(self, guardrail_name: str, *, skip_tool: bool = False) -> None:
         super().__init__(guardrail_name=guardrail_name)
+        self.skip_tool_message_in_guardrail = skip_tool
         self.seen_texts: list[list[str]] = []
 
     async def apply_guardrail(
@@ -5070,6 +5072,96 @@ class NameMaskingGuardrail(CustomGuardrail):
         texts: Final = list(inputs.get("texts", []))
         self.seen_texts.append(texts)
         return {**inputs, "texts": [text.replace("Jane", "[NAME]") for text in texts]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("skip_tool", (False, True))
+async def test_external_named_message_source_and_body_are_masked_before_chat(skip_tool: bool) -> None:
+    guardrail: Final = NameMaskingGuardrail(guardrail_name="test", skip_tool=skip_tool)
+    text: Final = "  Jane\r\ncomplete handoff body  "
+    rewritten: Final = "  [NAME]\r\ncomplete handoff body  "
+    source: Final = {"id": "external_Jane", "name": "deliver_Jane", "namespace": "relay_Jane"}
+    masked_source: Final = {"id": "external_[NAME]", "name": "deliver_[NAME]", "namespace": "relay_[NAME]"}
+    data: Final = {
+        "model": "hosted_vllm/fixture",
+        "input": [{"type": "function_call_output", **source, "output": text}],
+    }
+
+    result: Final = await OpenAIResponsesHandler().process_input_messages(data, guardrail)
+
+    assert guardrail.seen_texts == [["External message source " + json.dumps(source, ensure_ascii=False), text]]
+    assert "Jane" not in str(result["input"])
+    request: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model="fixture",
+        input=cast(ResponseInputParam, result["input"]),  # cast-ok: the fixture and guardrail preserve Responses input
+        responses_api_request={},
+        custom_llm_provider="hosted_vllm",
+    )
+    messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(request["messages"])
+    assert len(messages) == 1 and messages[0]["role"] == "user"
+    content: Final = TypeAdapter(list[dict[str, str]]).validate_python(messages[0]["content"])
+    assert len(content) == 2
+    assert (
+        TypeAdapter(dict[str, str]).validate_json(content[0]["text"].removeprefix("External message source "))
+        == masked_source
+    )
+    assert content[1] == {"type": "text", "text": rewritten}
+
+
+@pytest.mark.asyncio
+async def test_structured_external_message_rewrite_does_not_restore_original_source() -> None:
+    data: Final = {
+        "model": "hosted_vllm/fixture",
+        "input": [
+            {
+                "type": "function_call_output",
+                "id": "external_Jane",
+                "name": "deliver_Jane",
+                "namespace": "relay_Jane",
+                "output": "Jane supplied the complete handoff body",
+            }
+        ],
+    }
+
+    result: Final = await OpenAIResponsesHandler().process_input_messages(data, StructuredRewriteGuardrail())
+
+    request: Final = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model="fixture",
+        input=cast(ResponseInputParam, result["input"]),  # cast-ok: the guardrail rewrites a validated Responses input
+        responses_api_request={},
+        custom_llm_provider="hosted_vllm",
+    )
+    messages: Final = TypeAdapter(list[dict[str, object]]).validate_python(request["messages"])
+    assert len(messages) == 1 and messages[0]["role"] == "user"
+    content: Final = messages[0]["content"]
+    observed: Final = (
+        content
+        if isinstance(content, str)
+        else "".join(block["text"] for block in TypeAdapter(list[dict[str, str]]).validate_python(content))
+    )
+    assert observed == COMPRESSED_MARKER
+    assert "Jane" not in str(result["input"])
+
+
+@pytest.mark.asyncio
+async def test_scan_only_tool_results_preserves_sdk_compaction_and_input_identity() -> None:
+    guardrail: Final = MockRecordingGuardrail(guardrail_name="test")
+    guardrail.scan_only_tool_results = True
+    compaction: Final = ResponseCompactionItem(
+        type="compaction", id="cmp_fixture", encrypted_content="opaque_compaction_fixture"
+    )
+    original_input: Final = [
+        compaction,
+        {"type": "function_call", "call_id": "call_fixture", "name": "lookup", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "call_fixture", "output": "paired result"},
+    ]
+    data: Final = {"model": "hosted_vllm/fixture", "input": original_input}
+
+    result: Final = await OpenAIResponsesHandler().process_input_messages(data, guardrail)
+
+    assert [inputs.get("texts") for inputs in guardrail.seen_inputs] == [["paired result"]]
+    assert result["input"] is original_input
+    assert result["input"][0] is compaction
 
 
 def _refused_message(*leading_text: str) -> GenericResponseOutputItem:

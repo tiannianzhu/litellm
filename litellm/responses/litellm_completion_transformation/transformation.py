@@ -34,7 +34,7 @@ from openai.types.responses.response_create_params import ResponseInputParam
 from openai.types.responses.tool_choice_custom_param import ToolChoiceCustomParam
 from openai.types.responses.tool_choice_function_param import ToolChoiceFunctionParam
 from openai.types.responses.tool_param import FunctionToolParam
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from typing_extensions import ReadOnly, TypedDict
 
 import litellm
@@ -787,6 +787,71 @@ def with_compaction_items_as_params(input: str | ResponseInputParam) -> str | Re
     )
 
 
+def _named_source(item: Mapping[str, object]) -> tuple[str, str] | None:
+    name: Final = item.get("name")
+    namespace: Final = item.get("namespace")
+    if isinstance(name, str) and name.strip() and isinstance(namespace, str) and namespace.strip():
+        return name, namespace
+    return None
+
+
+def _external_named_message(
+    item: Mapping[str, object], pending_sources: Mapping[tuple[str, str], int]
+) -> Mapping[str, object]:
+    if item.get("type") != "function_call_output" or "call_id" in item:
+        return item
+    source: Final = _named_source(item)
+    message_id: Final = item.get("id")
+    output: Final = item.get("output")
+    if source is None or not isinstance(message_id, str) or not message_id.strip() or not isinstance(output, str):
+        return item
+    if pending_sources.get(source, 0):
+        return item
+    provenance: Final = {"id": message_id, "name": source[0], "namespace": source[1]}
+    return {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "External message source " + json.dumps(provenance, ensure_ascii=False)},
+            {"type": "input_text", "text": output},
+        ],
+    }
+
+
+def _external_named_message_items(input: ResponseInputParam) -> Iterator[object]:
+    pending_calls: Final[dict[str, tuple[str, str]]] = {}  # mutable-ok: one-pass call ID index avoids history rescans
+    pending_sources: Final[dict[tuple[str, str], int]] = {}  # mutable-ok: source counts avoid rescanning pending calls
+    for original in input:
+        item = _STR_KEY_DICT_ADAPTER.validate_python(
+            original.model_dump(exclude_none=True) if isinstance(original, BaseModel) else original
+        )
+        source = _named_source(item)
+        call_id = item.get("call_id")
+        match item.get("type"):
+            case "compaction":
+                pending_calls.clear()
+                pending_sources.clear()
+            case "function_call" | "custom_tool_call" if source is not None:
+                pending_sources[source] = pending_sources.get(source, 0) + 1
+                if isinstance(call_id, str) and call_id:
+                    pending_calls[call_id] = source
+            case "function_call_output" | "custom_tool_call_output" if isinstance(call_id, str) and call_id:
+                answered_source = pending_calls.pop(call_id, None)
+                if answered_source is not None:
+                    pending_sources[answered_source] -= 1
+            case _:
+                pass
+        converted = _external_named_message(item, pending_sources)
+        yield original if converted is item else converted
+
+
+def with_external_named_messages(input: str | ResponseInputParam) -> str | ResponseInputParam:
+    if not isinstance(input, list):
+        return input
+    return cast(  # cast-ok: preserves input items and replaces an external result with a valid user message
+        ResponseInputParam, list(_external_named_message_items(input))
+    )
+
+
 def _input_to_read(
     input: str | ResponseInputParam, only_since_compaction: bool, native_compaction: bool
 ) -> str | ResponseInputParam:
@@ -1203,18 +1268,23 @@ class LiteLLMCompletionResponsesConfig:
         return ResponsesReasoningChatForm(effort=effort, summary=summary if forwards_summary else None)
 
     @staticmethod
-    def _hosted_bridge_input_error(input: object) -> str | None:
+    def _chat_bridge_input_error(input: object, hosted: bool) -> str | None:
         if isinstance(input, str):
             return None
-        for item in _DICT_ITEMS_LIST_ADAPTER.validate_python(input):
-            if item.get("encrypted_content") and item.get("type") != "compaction":
+        for item in _DICT_ITEMS_LIST_ADAPTER.validate_python(
+            [
+                original.model_dump(exclude_none=True) if isinstance(original, BaseModel) else original
+                for original in _OBJECT_LIST_ADAPTER.validate_python(input)
+            ]
+        ):
+            if hosted and item.get("encrypted_content") and item.get("type") != "compaction":
                 return "hosted_vllm Chat bridge cannot replay encrypted reasoning; use plaintext reasoning content"
             if item.get("type") not in ("function_call_output", "custom_tool_call_output"):
                 continue
             if not item.get("call_id"):
                 return "Chat bridge tool results require a nonempty call_id"
             output = item.get("output")
-            if not isinstance(output, list):
+            if not hosted or not isinstance(output, list):
                 continue
             for part in _OBJECT_LIST_ADAPTER.validate_python(output):
                 error = LiteLLMCompletionResponsesConfig._hosted_tool_output_part_error(part)
@@ -1255,7 +1325,7 @@ class LiteLLMCompletionResponsesConfig:
         """
         Transform a Responses API request into a Chat Completion request
         """
-        dumped_input: Final = with_compaction_items_as_params(input)
+        dumped_input: Final = with_external_named_messages(with_compaction_items_as_params(input))
         sanitized_tools: Final = LiteLLMCompletionResponsesConfig._without_malformed_tool_flags_when_dropping_params(
             responses_api_request.get("tools"), drop_params
         )
@@ -1281,12 +1351,11 @@ class LiteLLMCompletionResponsesConfig:
             if normalized is not None
             else dumped_input
         )
-        if normalized is not None:
-            input_error: Final = LiteLLMCompletionResponsesConfig._hosted_bridge_input_error(
-                without_items_before_compaction(bridge_input)
-            )
-            if input_error is not None:
-                raise BadRequestError(message=input_error, model=model, llm_provider="hosted_vllm")
+        input_error: Final = LiteLLMCompletionResponsesConfig._chat_bridge_input_error(
+            without_items_before_compaction(bridge_input), hosted=normalized is not None
+        )
+        if input_error is not None:
+            raise BadRequestError(message=input_error, model=model, llm_provider=custom_llm_provider or "")
         request_tools: Final = LiteLLMCompletionResponsesConfig._without_unsupported_tool_search(
             bridge_request.get("tools") if normalized is not None else sanitized_tools,
             model=model,
@@ -1495,7 +1564,7 @@ class LiteLLMCompletionResponsesConfig:
                 )
             )
 
-        dumped_input: Final = with_compaction_items_as_params(input)
+        dumped_input: Final = with_external_named_messages(with_compaction_items_as_params(input))
         read_input: Final = _input_to_read(dumped_input, only_since_compaction, native_compaction)
         sent_input: Final = _without_item_keys(
             read_input, _dropped_item_keys(item_cache_control, tool_call_provider_fields)
