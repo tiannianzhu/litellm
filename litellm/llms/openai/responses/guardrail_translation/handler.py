@@ -96,6 +96,7 @@ from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
     claude_web_search_call_tool_call,
     tool_output_to_chat_content,
+    with_external_named_messages,
 )
 from litellm.types.llms.base import LiteLLMBaseModel
 from litellm.types.llms.openai import (
@@ -1298,10 +1299,14 @@ class OpenAIResponsesHandler(BaseTranslation):
 
         Handles both string input and list of message objects.
         """
-        raw_input: Final[str | ResponseInputParam | None] = data.get("input")
-        if not isinstance(raw_input, (str, list)):
+        raw_input: Final[object] = data.get("input")
+        input_items: Final = [raw_input] if isinstance(raw_input, Mapping) else raw_input
+        if not isinstance(input_items, (str, list)):
             return data
-        input_data: Final = cast("str | ResponseInputParam", raw_input)  # cast-ok: fields read via stream_item_field
+        typed_input: Final = cast("str | ResponseInputParam", input_items)  # cast-ok: fields read via stream_item_field
+        normalized_input: Final = with_external_named_messages(typed_input)
+        input_data: Final = typed_input if normalized_input == typed_input else normalized_input
+        data["input"] = input_data  # rebind-ok: extraction and writeback must share the normalized input objects
         skip_system: Final = effective_skip_system_message_for_guardrail(guardrail_to_apply)
         skip_tool: Final = effective_skip_tool_message_for_guardrail(guardrail_to_apply)
         scan_only: Final = effective_scan_only_tool_results_for_guardrail(guardrail_to_apply)
