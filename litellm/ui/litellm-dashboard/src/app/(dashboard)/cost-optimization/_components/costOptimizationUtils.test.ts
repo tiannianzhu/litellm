@@ -232,17 +232,43 @@ describe("computeCacheLeakage by model", () => {
     expect(rows[0].sublabel).toBeNull();
   });
 
-  it("prices model leakage at the realized cache-read discount across providers", () => {
+  it("prices each model at its own realized cache-read discount", () => {
+    const models = {
+      "high-discount": { prompt_tokens: 2000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2.0 },
+      "low-discount": { prompt_tokens: 2500, cache_read_input_tokens: 500, prompt_caching_savings_spend: 0.25 },
+      "no-cache-sample": { prompt_tokens: 3000 },
+      "net-negative": { prompt_tokens: 5000, cache_read_input_tokens: 500, prompt_caching_savings_spend: -0.1 },
+      "net-zero": { prompt_tokens: 4000, cache_read_input_tokens: 500, prompt_caching_savings_spend: 0 },
+    };
+    const results = [modelDay("2026-07-01", models)];
+    const { rows, netSavingsPerCachedToken } = computeCacheLeakage(results, "model");
+    expect(netSavingsPerCachedToken).toBeCloseTo(2.15 / 2500, 6);
+    expect(rows.map((r) => r.id)).toEqual([
+      "high-discount",
+      "low-discount",
+      "net-negative",
+      "net-zero",
+      "no-cache-sample",
+    ]);
+    expect(rows[0].potentialSavings).toBeCloseTo(2.0, 6);
+    expect(rows[1].potentialSavings).toBeCloseTo(1.0, 6);
+    expect(rows.slice(2).map((r) => r.potentialSavings)).toEqual([null, null, null]);
+    expect(rows.slice(2).map((r) => r.uncachedPromptTokens)).toEqual([4500, 3500, 3000]);
+  });
+
+  it("keeps model leakage visible when no model has historical cache samples", () => {
     const results = [
       modelDay("2026-07-01", {
-        "claude-sonnet-5": { prompt_tokens: 1000, cache_read_input_tokens: 1000, prompt_caching_savings_spend: 2.0 },
-        "gemini-2.5-flash": { prompt_tokens: 500 },
+        "large-uncached": { prompt_tokens: 9000 },
+        "small-uncached": { prompt_tokens: 1000 },
       }),
     ];
-    const { rows, netSavingsPerCachedToken } = computeCacheLeakage(results, "model");
-    expect(netSavingsPerCachedToken).toBeCloseTo(0.002, 6);
-    expect(rows.map((r) => r.id)).toEqual(["gemini-2.5-flash"]);
-    expect(rows[0].potentialSavings).toBeCloseTo(1.0, 6);
+    const { rows } = computeCacheLeakage(results, "model");
+
+    expect(rows.map((r) => [r.id, r.uncachedPromptTokens, r.potentialSavings])).toEqual([
+      ["large-uncached", 9000, null],
+      ["small-uncached", 1000, null],
+    ]);
   });
 
   it("merges rows logged under a deployment's resolved and requested names into one model group row", () => {

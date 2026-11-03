@@ -3931,7 +3931,8 @@
         },
         "potentialSavings": {
           "label": "Potential savings",
-          "info": "About how much you'd save if this uncached input used prompt caching. Estimated as uncached input tokens times what your cached traffic already nets per cached token (realized cache savings, after write premiums, ÷ cache read and write tokens). Blank when caching is not currently saving anything overall."
+          "info": "Estimated from cached traffic across all keys: net cache savings after write premiums, divided by cache read and write tokens. Shown as “Cannot estimate” when caching is not currently net positive or there is no cache sample.",
+          "infoModel": "Estimated from this model's own cached traffic: net cache savings after write premiums, divided by this model's cache read and write tokens. Shown as “Cannot estimate” when this model has no cache sample or caching is not currently net positive."
         }
       },
       "nouns": {
@@ -3940,9 +3941,11 @@
         "virtualKey": "virtual key"
       },
       "keyLoadFailed": "Could not load key usage for this range.",
+      "noUncachedInput": "No uncached input tokens in this range.",
+      "cannotEstimate": "Cannot estimate",
       "empty": "No {{noun}} usage in this range.",
       "title": "Cache leakage by {{dimension}}",
-      "description": "{{subject}} sending large volumes of uncached input with a low cache hit rate are likely missing prompt caching. Potential savings is approximate: uncached input priced at what your cached traffic nets per cached token, after cache-write premiums.",
+      "description": "{{subject}} sending large volumes of uncached input with a low cache hit rate may benefit from prompt caching. Potential savings are approximate and use observed net cache savings after cache-write premiums.",
       "tabs": {
         "byKey": "By virtual key",
         "byModel": "By model"
