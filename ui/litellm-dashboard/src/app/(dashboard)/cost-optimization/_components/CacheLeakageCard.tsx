@@ -10,11 +10,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { formatNumberWithCommas } from "@/utils/dataUtils";
 import {
   CacheLeakageDimension,
-  CacheLeakageRow,
+  CacheLeakageSort,
   computeCacheLeakage,
   leakageRowsFromKeyRows,
   netSavingsPerCachedToken,
   pct,
+  sortCacheLeakageRows,
   usd,
 } from "./costOptimizationUtils";
 import { DailyActivityRange } from "./useDailyActivityRange";
@@ -24,25 +25,13 @@ interface CacheLeakageCardProps {
   activity: DailyActivityRange;
 }
 
-type SortColumn = "uncachedPromptTokens" | "cacheHitRatio" | "potentialSavings";
-interface SortState {
-  column: SortColumn;
-  dir: "asc" | "desc";
-}
+type SortColumn = CacheLeakageSort["column"];
+type SortState = CacheLeakageSort;
 
 const NATURAL_DIR: Record<SortColumn, "asc" | "desc"> = {
   uncachedPromptTokens: "desc",
   cacheHitRatio: "asc",
   potentialSavings: "desc",
-};
-
-const compareRows = (a: CacheLeakageRow, b: CacheLeakageRow, sort: SortState): number => {
-  const av = a[sort.column];
-  const bv = b[sort.column];
-  if (av == null && bv == null) return 0;
-  if (av == null) return 1;
-  if (bv == null) return -1;
-  return sort.dir === "asc" ? av - bv : bv - av;
 };
 
 const InfoTooltip = ({ info }: { info: string }) => (
@@ -101,7 +90,7 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
         : computeCacheLeakage(results, "model").rows,
     [dimension, keyLeakage.rows, leakageRate, results],
   );
-  const rows = useMemo(() => [...unsortedRows].sort((a, b) => compareRows(a, b, sort)), [unsortedRows, sort]);
+  const rows = useMemo(() => sortCacheLeakageRows(unsortedRows, sort), [unsortedRows, sort]);
   const rowsLoading = dimension === "key" ? keyLeakage.loading : loading;
 
   const onSort = (column: SortColumn) =>
@@ -114,10 +103,20 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
   const subject = dimension === "model" ? "Models" : "Keys";
   const firstColumn = dimension === "model" ? "Model" : "Key";
   const emptyNoun = dimension === "model" ? "model" : "key";
-  const emptyMessage =
-    dimension === "key" && keyLeakage.failed
-      ? "Could not load key usage for this range."
-      : `No ${emptyNoun} usage in this range.`;
+  const hasUsage = computeCacheLeakage(results, dimension).hasUsage;
+  const emptyMessage = (() => {
+    if (dimension === "key" && keyLeakage.failed) {
+      return "Could not load key usage for this range.";
+    }
+    if (rowsLoading) {
+      return "Loading...";
+    }
+    return hasUsage ? "No uncached input tokens in this range." : `No ${emptyNoun} usage in this range.`;
+  })();
+  const savingsInfo =
+    dimension === "model"
+      ? "Estimated from this model's own cached traffic: net cache savings after write premiums, divided by this model's cache read and write tokens. Shown as “Cannot estimate” when this model has no cache sample or caching is not currently net positive."
+      : "Estimated from cached traffic across all keys: net cache savings after write premiums, divided by cache read and write tokens. Shown as “Cannot estimate” when caching is not currently net positive or there is no cache sample.";
 
   return (
     <TooltipProvider delay={300}>
@@ -127,9 +126,9 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
             <div className="min-w-0">
               <CardTitle>Cache leakage by {dimension === "model" ? "model" : "virtual key"}</CardTitle>
               <p className="mt-1 text-sm text-muted-foreground line-clamp-2">
-                {subject} sending large volumes of uncached input with a low cache hit rate are likely missing prompt
-                caching. Potential savings is approximate: uncached input priced at what your cached traffic nets per
-                cached token, after cache-write premiums.
+                {subject} sending large volumes of uncached input with a low cache hit rate may benefit from prompt
+                caching. Potential savings are approximate and use observed net cache savings after cache-write
+                premiums.
               </p>
             </div>
           </div>
@@ -142,9 +141,7 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
         </CardHeader>
         <CardContent>
           {rows.length === 0 ? (
-            <p className="py-8 text-center text-sm text-muted-foreground">
-              {rowsLoading ? "Loading..." : emptyMessage}
-            </p>
+            <p className="py-8 text-center text-sm text-muted-foreground">{emptyMessage}</p>
           ) : (
             <Table>
               <TableHeader>
@@ -167,7 +164,7 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
                   <SortableHead
                     column="potentialSavings"
                     label="Potential savings"
-                    info="About how much you'd save if this uncached input used prompt caching. Estimated as uncached input tokens times what your cached traffic already nets per cached token (realized cache savings, after write premiums, ÷ cache read and write tokens). Blank when caching is not currently saving anything overall."
+                    info={savingsInfo}
                     sort={sort}
                     onSort={onSort}
                   />
@@ -183,7 +180,7 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
                     <TableCell className="text-right">{formatNumberWithCommas(row.uncachedPromptTokens)}</TableCell>
                     <TableCell className="text-right">{pct(row.cacheHitRatio)}</TableCell>
                     <TableCell className="text-right">
-                      {row.potentialSavings == null ? "—" : usd(row.potentialSavings)}
+                      {row.potentialSavings == null ? "Cannot estimate" : usd(row.potentialSavings)}
                     </TableCell>
                   </TableRow>
                 ))}
