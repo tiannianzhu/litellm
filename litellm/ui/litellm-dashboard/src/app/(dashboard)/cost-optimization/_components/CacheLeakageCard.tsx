@@ -11,11 +11,12 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { formatNumberWithCommas } from "@/utils/dataUtils";
 import {
   CacheLeakageDimension,
-  CacheLeakageRow,
+  CacheLeakageSort,
   computeCacheLeakage,
   leakageRowsFromKeyRows,
   netSavingsPerCachedToken,
   pct,
+  sortCacheLeakageRows,
   usd,
 } from "./costOptimizationUtils";
 import { DailyActivityRange } from "./useDailyActivityRange";
@@ -25,25 +26,13 @@ interface CacheLeakageCardProps {
   activity: DailyActivityRange;
 }
 
-type SortColumn = "uncachedPromptTokens" | "cacheHitRatio" | "potentialSavings";
-interface SortState {
-  column: SortColumn;
-  dir: "asc" | "desc";
-}
+type SortColumn = CacheLeakageSort["column"];
+type SortState = CacheLeakageSort;
 
 const NATURAL_DIR: Record<SortColumn, "asc" | "desc"> = {
   uncachedPromptTokens: "desc",
   cacheHitRatio: "asc",
   potentialSavings: "desc",
-};
-
-const compareRows = (a: CacheLeakageRow, b: CacheLeakageRow, sort: SortState): number => {
-  const av = a[sort.column];
-  const bv = b[sort.column];
-  if (av == null && bv == null) return 0;
-  if (av == null) return 1;
-  if (bv == null) return -1;
-  return sort.dir === "asc" ? av - bv : bv - av;
 };
 
 const InfoTooltip = ({ info }: { info: string }) => (
@@ -97,14 +86,17 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
   const [sort, setSort] = useState<SortState>({ column: "potentialSavings", dir: "desc" });
   const leakageRate = useMemo(() => netSavingsPerCachedToken(results), [results]);
   const keyLeakage = useCacheLeakageKeys(activity, dimension === "key");
-  const unsortedRows = useMemo(
+  const { rows: unsortedRows, hasUsage } = useMemo(
     () =>
       dimension === "key"
-        ? leakageRowsFromKeyRows(keyLeakage.rows, leakageRate)
-        : computeCacheLeakage(results, "model").rows,
+        ? {
+            rows: leakageRowsFromKeyRows(keyLeakage.rows, leakageRate),
+            hasUsage: results.some((day) => Object.keys(day.breakdown?.api_keys ?? {}).length > 0),
+          }
+        : computeCacheLeakage(results, "model"),
     [dimension, keyLeakage.rows, leakageRate, results],
   );
-  const rows = useMemo(() => [...unsortedRows].sort((a, b) => compareRows(a, b, sort)), [unsortedRows, sort]);
+  const rows = useMemo(() => sortCacheLeakageRows(unsortedRows, sort), [unsortedRows, sort]);
   const rowsLoading = dimension === "key" ? keyLeakage.loading : loading;
 
   const onSort = (column: SortColumn) =>
@@ -126,10 +118,15 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
     dimension === "model"
       ? t("costOptimization.cacheLeakage.nouns.model")
       : t("costOptimization.cacheLeakage.nouns.key");
+  const emptyUsageMessage = hasUsage
+    ? t("costOptimization.cacheLeakage.noUncachedInput")
+    : t("costOptimization.cacheLeakage.empty", { noun: emptyNoun });
   const emptyMessage =
-    dimension === "key" && keyLeakage.failed
-      ? t("costOptimization.cacheLeakage.keyLoadFailed")
-      : t("costOptimization.cacheLeakage.empty", { noun: emptyNoun });
+    dimension === "key" && keyLeakage.failed ? t("costOptimization.cacheLeakage.keyLoadFailed") : emptyUsageMessage;
+  const savingsInfo =
+    dimension === "model"
+      ? t("costOptimization.cacheLeakage.columns.potentialSavings.infoModel")
+      : t("costOptimization.cacheLeakage.columns.potentialSavings.info");
 
   return (
     <TooltipProvider delay={300}>
@@ -184,7 +181,7 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
                   <SortableHead
                     column="potentialSavings"
                     label={t("costOptimization.cacheLeakage.columns.potentialSavings.label")}
-                    info={t("costOptimization.cacheLeakage.columns.potentialSavings.info")}
+                    info={savingsInfo}
                     sort={sort}
                     onSort={onSort}
                   />
@@ -200,7 +197,9 @@ const CacheLeakageCard: React.FC<CacheLeakageCardProps> = ({ activity }) => {
                     <TableCell className="text-right">{formatNumberWithCommas(row.uncachedPromptTokens)}</TableCell>
                     <TableCell className="text-right">{pct(row.cacheHitRatio)}</TableCell>
                     <TableCell className="text-right">
-                      {row.potentialSavings == null ? "—" : usd(row.potentialSavings)}
+                      {row.potentialSavings == null
+                        ? t("costOptimization.cacheLeakage.cannotEstimate")
+                        : usd(row.potentialSavings)}
                     </TableCell>
                   </TableRow>
                 ))}
