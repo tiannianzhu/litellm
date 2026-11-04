@@ -356,8 +356,13 @@ const UsagePage: React.FC<UsagePageProps> = ({ teams, organizations, teamsLoadin
   );
 
   const totals = useMemo(
-    () => overviewTotals(userSpendData.metadata, gatewayActivity),
-    [userSpendData.metadata, gatewayActivity],
+    () =>
+      overviewTotals(
+        userSpendData.metadata,
+        gatewayActivity,
+        startTime && endTime ? { start: startTime, end: endTime } : undefined,
+      ),
+    [userSpendData.metadata, gatewayActivity, startTime, endTime],
   );
   const providerSpend = useMemo(() => providerSpendRows(userSpendData.results), [userSpendData.results]);
   const {

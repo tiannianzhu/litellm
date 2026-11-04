@@ -262,14 +262,22 @@ export const ModelSection = ({
           <Stat
             label="Total Tokens"
             value={<StatValue>{metrics.total_tokens.toLocaleString()}</StatValue>}
-            hint={`${Math.round(metrics.total_tokens / metrics.total_successful_requests)} avg per successful request`}
+            hint={
+              metrics.total_successful_requests > 0
+                ? `${Math.round(metrics.total_tokens / metrics.total_successful_requests)} avg per successful request`
+                : undefined
+            }
           />
         </StatCell>
         <StatCell>
           <Stat
             label="Total Spend"
             value={<StatValue>${formatNumberWithCommas(metrics.total_spend, 2)}</StatValue>}
-            hint={`$${formatNumberWithCommas(metrics.total_spend / metrics.total_successful_requests, 3)} per successful request`}
+            hint={
+              metrics.total_successful_requests > 0
+                ? `$${formatNumberWithCommas(metrics.total_spend / metrics.total_successful_requests, 3)} per successful request`
+                : undefined
+            }
           />
         </StatCell>
         <StatCell>

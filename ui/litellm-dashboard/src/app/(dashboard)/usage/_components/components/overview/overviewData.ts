@@ -1,3 +1,4 @@
+import { formatISO } from "date-fns";
 import type { DailyData, SpendMetrics } from "@/components/UsagePage/types";
 import { stackedUsageColor } from "@/components/shared/charts";
 import { EMPTY_DAILY_ACTIVITY_METADATA, type DailyActivityMetadata } from "@/components/UsagePage/dailyActivityApi";
@@ -246,17 +247,36 @@ export const formatCompact = (value: number): string =>
 
 export const formatLatency = (ms: number): string => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
 
+type CalendarRange = { start: Date; end: Date };
+type RequestTrendPoint = { day: number; requests: number | null };
+
+const calendarDay = (date: Date): number => Date.parse(formatISO(date, { representation: "date" }));
+
+const gatewayRequestTrend = (gateway: GatewayActivity, range?: CalendarRange): RequestTrendPoint[] => {
+  const counts = new Map(
+    gateway.by_date.map((day) => [Date.parse(day.date), day.successful_requests + day.failed_requests]),
+  );
+  const recordedDays = [...counts.keys()].sort((a, b) => a - b);
+  const daysWithGaps = recordedDays.flatMap((day, index) => {
+    const previous = recordedDays[index - 1];
+    return previous !== undefined && day - previous > DAY_MS ? [previous + DAY_MS, day] : [day];
+  });
+  const days = range ? [calendarDay(range.start), ...daysWithGaps, calendarDay(range.end)] : daysWithGaps;
+  return [...new Set(days)].map((day) => ({ day, requests: counts.get(day) ?? null }));
+};
+
 export interface OverviewTotals {
   spend: number;
   requests: number;
   successful: number;
   failed: number;
+  gatewayRequestTrend: readonly RequestTrendPoint[] | null;
   tokens: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
-  avgCostPerRequest: number;
+  avgCostPerRequest: number | null;
   avgLatencyMs: number | null;
   successRate: number | null;
 }
@@ -265,7 +285,11 @@ export interface OverviewTotals {
  * Request counts prefer the gateway's own tallies, falling back to the spend
  * aggregate, the same precedence the request tiles have always used.
  */
-export const overviewTotals = (raw: DailyActivityMetadata, gateway: GatewayActivity | null): OverviewTotals => {
+export const overviewTotals = (
+  raw: DailyActivityMetadata,
+  gateway: GatewayActivity | null,
+  range?: CalendarRange,
+): OverviewTotals => {
   // The schema marks every total optional; filling the defaults once keeps the arithmetic below plain.
   const metadata = { ...EMPTY_DAILY_ACTIVITY_METADATA, ...raw };
   const successful = gateway?.total_successful_requests ?? metadata.total_successful_requests;
@@ -276,12 +300,13 @@ export const overviewTotals = (raw: DailyActivityMetadata, gateway: GatewayActiv
     requests: gateway ? successful + failed : metadata.total_api_requests,
     successful,
     failed,
+    gatewayRequestTrend: gateway ? gatewayRequestTrend(gateway, range) : null,
     tokens: metadata.total_tokens,
     inputTokens: metadata.total_prompt_tokens,
     outputTokens: metadata.total_completion_tokens,
     cacheReadTokens: metadata.total_cache_read_input_tokens,
     cacheWriteTokens: metadata.total_cache_creation_input_tokens,
-    avgCostPerRequest: metadata.total_spend / (metadata.total_api_requests || 1),
+    avgCostPerRequest: metadata.total_api_requests > 0 ? metadata.total_spend / metadata.total_api_requests : null,
     avgLatencyMs: timed > 0 ? metadata.total_response_time_ms / timed : null,
     successRate: successful + failed > 0 ? (successful / (successful + failed)) * 100 : null,
   };

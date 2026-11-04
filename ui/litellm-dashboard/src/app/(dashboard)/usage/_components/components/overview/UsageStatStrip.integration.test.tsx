@@ -9,6 +9,7 @@ const totals: OverviewTotals = {
   requests: 10,
   successful: 8,
   failed: 2,
+  gatewayRequestTrend: null,
   tokens: 9123456,
   inputTokens: 8123456,
   outputTokens: 1000000,
@@ -56,5 +57,24 @@ describe("UsageStatStrip token breakdown", () => {
     expect(screen.queryByRole("button", { name: "View token breakdown" })).not.toBeInTheDocument();
     expect(screen.queryByText("ok")).not.toBeInTheDocument();
     expect(screen.queryByText("failed")).not.toBeInTheDocument();
+  });
+
+  it("distinguishes a range missing Gateway data from a recorded zero and labels the cost denominator", () => {
+    const day = Date.UTC(2026, 10, 1);
+    const empty = { ...totals, requests: 0, successful: 0, failed: 0, avgCostPerRequest: null };
+    const { rerender } = render(
+      <UsageStatStrip {...defaultProps} totals={{ ...empty, gatewayRequestTrend: [{ day, requests: null }] }} />,
+    );
+
+    expect(screen.getByText("Gateway requests")).toBeInTheDocument();
+    expect(screen.getByText("No Gateway data in this range")).toBeInTheDocument();
+    expect(screen.queryByText("ok")).not.toBeInTheDocument();
+    expect(screen.getByText("Avg cost / logged caller request")).toBeInTheDocument();
+    expect(screen.queryByText("$0.0000")).not.toBeInTheDocument();
+
+    rerender(<UsageStatStrip {...defaultProps} totals={{ ...empty, gatewayRequestTrend: [{ day, requests: 0 }] }} />);
+
+    expect(screen.queryByText("No Gateway data in this range")).not.toBeInTheDocument();
+    expect(screen.getByText("ok")).toBeInTheDocument();
   });
 });

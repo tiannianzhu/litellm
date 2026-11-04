@@ -3,12 +3,11 @@
 import React, { type ReactNode } from "react";
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
 import { RadioGroup as RadioGroupPrimitive } from "@base-ui/react/radio-group";
-import { Area, AreaChart } from "recharts";
+import { Area, AreaChart, XAxis } from "recharts";
 import type { LucideIcon } from "lucide-react";
 import { ChartContainer } from "@/components/ui/chart";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/cva.config";
-import type { SeriesDay } from "./overviewData";
 
 const EMPTY_CONFIG = {};
 
@@ -61,14 +60,17 @@ export function Sparkline({
   dataKey,
   color,
   className,
+  calendarAxis = false,
 }: {
-  data: readonly SeriesDay[];
+  data: readonly Record<string, unknown>[];
   dataKey: string;
   color: string;
   className?: string;
+  calendarAxis?: boolean;
 }) {
   const gradientId = React.useId().replace(/:/g, "");
-  if (data.length < 2) return <div className={cn("h-10 w-full", className)} />;
+  const showPoints = calendarAxis && (data.length === 1 || data.some((point) => point[dataKey] === null));
+  if (data.length < 2 && !showPoints) return <div className={cn("h-10 w-full", className)} />;
   return (
     // Decorative: no focus ring, hover cursor or tooltip, since the number above it is the readout.
     <ChartContainer
@@ -77,6 +79,7 @@ export function Sparkline({
       className={cn("pointer-events-none aspect-auto h-10 w-full", className)}
     >
       <AreaChart data={[...data]} margin={{ top: 2, right: 0, bottom: 0, left: 0 }} accessibilityLayer={false}>
+        {calendarAxis && <XAxis dataKey="day" type="number" domain={["dataMin", "dataMax"]} hide />}
         <defs>
           <linearGradient id={`spark-${gradientId}`} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={color} stopOpacity={0.18} />
@@ -89,6 +92,7 @@ export function Sparkline({
           stroke={color}
           strokeWidth={1.5}
           fill={`url(#spark-${gradientId})`}
+          dot={showPoints ? { r: 2, fill: color, stroke: "none" } : false}
           isAnimationActive={false}
         />
       </AreaChart>

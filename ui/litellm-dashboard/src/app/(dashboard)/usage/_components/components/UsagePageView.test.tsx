@@ -695,6 +695,50 @@ describe("UsagePage", () => {
     expect(overview().queryByText("1,450")).not.toBeInTheDocument();
   });
 
+  it.each([
+    { scope: "global usage", filter: "", total: "64", rising: true },
+    { scope: "a selected user", filter: "&user=user-001", total: "2,000", rising: false },
+  ])("uses the same request source for the total and trend for $scope", async ({ filter, total, rising }) => {
+    const [firstDay] = mockSpendData.results;
+    mockUserDailyActivityAggregatedCall.mockResolvedValue({
+      results: [
+        firstDay,
+        {
+          ...firstDay,
+          date: "2025-01-02",
+          metrics: { ...firstDay.metrics, api_requests: 500, successful_requests: 450 },
+        },
+      ],
+      metadata: {
+        ...mockSpendData.metadata,
+        total_api_requests: 2000,
+        total_successful_requests: 1900,
+        total_failed_requests: 100,
+      },
+    });
+    const gatewayActivity = {
+      total_successful_requests: 60,
+      total_failed_requests: 4,
+      by_date: [
+        { date: "2025-01-01", successful_requests: 10, failed_requests: 1 },
+        { date: "2025-01-02", successful_requests: 50, failed_requests: 3 },
+      ],
+      by_route: [],
+    };
+    mockGatewayDailyActivityCall.mockResolvedValue(gatewayActivity);
+    renderWithProviders(<UsagePage {...defaultProps} />, { searchParams: `?from=2025-01-01&to=2025-01-02${filter}` });
+
+    expect(await overview().findByText(total)).toBeInTheDocument();
+    const curve = totalRequestsCell().parentElement?.querySelector(".recharts-area-curve");
+    const coordinates =
+      curve
+        ?.getAttribute("d")
+        ?.match(/-?\d+(?:\.\d+)?/g)
+        ?.map(Number) ?? [];
+    expect(coordinates.length).toBeGreaterThan(2);
+    expect(Math.sign(coordinates[coordinates.length - 1] - coordinates[1])).toBe(rising ? -1 : 1);
+  });
+
   it("should stop showing the previous range's totals while a new range is in flight", async () => {
     // The request tiles read the gateway counts and fall through to the
     // spend-derived ones. Withholding a superseded gateway result is only worth

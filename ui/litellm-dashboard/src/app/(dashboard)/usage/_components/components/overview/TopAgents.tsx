@@ -74,12 +74,14 @@ export function AgentMark({ agent }: { agent: Pick<AgentRow, "id" | "label" | "l
 
 function AgentItem({
   agent,
+  metric,
   rank,
   share,
   color,
   onOpen,
 }: {
   agent: AgentRow;
+  metric: UsageMetric;
   rank: number;
   share: number;
   color: string | undefined;
@@ -87,6 +89,9 @@ function AgentItem({
 }) {
   const term = useTerminology();
   const openRow = onOpen && agent.tags.length > 0 ? () => onOpen(agent) : undefined;
+  const value = formatMetricValue(agent[metric], metric);
+  const unit = metric === "spend" ? "" : ` ${metric}`;
+  const secondary = metric === "spend" ? `${formatCompact(agent.tokens)} tokens` : formatCompactUsd(agent.spend);
   const content = (
     <>
       <span className="text-sm tabular-nums text-muted-foreground">{rank}.</span>
@@ -112,10 +117,12 @@ function AgentItem({
         )}
       </span>
       <span className="text-right">
-        <span className="block text-sm tabular-nums text-foreground">{formatCompact(agent.tokens)} tokens</span>
-        <span className="block text-xs tabular-nums text-muted-foreground">
-          {formatCompactUsd(agent.spend)} · {share.toFixed(1)}%
+        <span className="block text-sm tabular-nums text-foreground">
+          {value}
+          {unit}
+          <span className="text-xs text-muted-foreground"> · {share.toFixed(1)}%</span>
         </span>
+        <span className="block text-xs tabular-nums text-muted-foreground">{secondary}</span>
       </span>
     </>
   );
@@ -144,15 +151,16 @@ function AgentItem({
 
 function TopAgentsBody({ loading, empty, children }: { loading: boolean; empty: boolean; children: React.ReactNode }) {
   if (loading) return <ChartSkeleton className="mx-5 h-64 w-auto" />;
-  if (empty) return <p className="py-10 text-center text-xs text-muted-foreground">No agent traffic in this range</p>;
+  if (empty)
+    return (
+      <p className="py-10 text-center text-xs text-muted-foreground">No agent usage for this metric in this range</p>
+    );
   return <>{children}</>;
 }
 
 /**
  * The agents and clients driving traffic, read from the proxy's `User-Agent:` tags: a daily stacked
- * chart (like Top models) over a ranked list. Named agents lead the list; SDKs and scripts follow,
- * so agents are not buried under raw HTTP clients that can outspend them. Each row opens User Agent
- * Activity filtered to that agent's tags.
+ * chart (like Top models) over a ranked list. Each row opens User Agent Activity filtered to that agent's tags.
  */
 export default function TopAgents({
   rows,
@@ -173,11 +181,11 @@ export default function TopAgents({
   const allAgents = useMemo(() => topAgents(rows ?? []), [rows]);
   const agents = useMemo(
     () =>
-      [
-        ...allAgents.filter((agent) => agent.kind === "agent"),
-        ...allAgents.filter((agent) => agent.kind === "sdk"),
-      ].slice(0, ROWS),
-    [allAgents],
+      allAgents
+        .filter((agent) => agent[metric] > 0)
+        .sort((a, b) => b[metric] - a[metric])
+        .slice(0, ROWS),
+    [allAgents, metric],
   );
   const series = useMemo(() => seriesBy(agentDailyData(daily), "models", metric, CHART_SERIES), [daily, metric]);
   const totalsByDay = useMemo(() => bucketTotals(series), [series]);
@@ -186,7 +194,7 @@ export default function TopAgents({
     return index === -1 ? undefined : series.colors[index];
   };
 
-  const totalShare = agents.reduce((sum, agent) => sum + agent.tokens, 0);
+  const metricTotal = allAgents.reduce((sum, agent) => sum + agent[metric], 0);
   const attributedTokens = allAgents.reduce((sum, agent) => sum + agent.tokens, 0);
   const coverage = totalTokens > 0 ? Math.min(attributedTokens / totalTokens, 1) : 1;
   const subtitle =
@@ -225,8 +233,9 @@ export default function TopAgents({
                 <AgentItem
                   key={agent.id}
                   agent={agent}
+                  metric={metric}
                   rank={columnIndex * half + index + 1}
-                  share={totalShare > 0 ? (agent.tokens / totalShare) * 100 : 0}
+                  share={metricTotal > 0 ? (agent[metric] / metricTotal) * 100 : 0}
                   color={colorOf(agent.label)}
                   onOpen={onOpenAgent}
                 />

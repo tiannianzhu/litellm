@@ -26,6 +26,10 @@ export default function UsageStatStrip({
   budget,
 }: UsageStatStripProps) {
   const daily = useMemo(() => dailyTotals(results), [results]);
+  const gatewayTrend = totals.gatewayRequestTrend;
+  const hasMissingGatewayDays = gatewayTrend?.some((day) => day.requests === null);
+  const hasNoGatewayData = gatewayTrend?.every((day) => day.requests === null);
+  const requestSource = gatewayTrend === null ? "Usage requests" : "Gateway requests";
   return (
     <div className="grid grid-cols-1 overflow-hidden rounded-xl border bg-card sm:grid-cols-2 lg:grid-cols-4 lg:divide-x">
       <StatCell trend={<Sparkline data={daily} dataKey="spend" color={BRAND} className="h-14" />}>
@@ -36,20 +40,44 @@ export default function UsageStatStrip({
           hint={budget ? `of ${formatUsd(budget)} budget` : "No budget set"}
         />
       </StatCell>
-      <StatCell trend={<Sparkline data={daily} dataKey="requests" color={BRAND} className="h-14" />}>
-        <Stat label="Total Requests" value={totals.requests.toLocaleString()} pending={requestCountsPending} />
+      <StatCell
+        trend={
+          <Sparkline
+            data={gatewayTrend ?? daily}
+            dataKey="requests"
+            color={BRAND}
+            className="h-14"
+            calendarAxis={gatewayTrend !== null}
+          />
+        }
+      >
+        <Stat
+          label="Total Requests"
+          value={hasNoGatewayData ? "—" : totals.requests.toLocaleString()}
+          pending={requestCountsPending}
+          hint={requestCountsPending ? undefined : requestSource}
+        />
         {!requestCountsPending && (
-          <div className="mt-0.5 flex gap-3 text-xs leading-4 text-muted-foreground">
-            <span>
-              <span className="text-success tabular-nums">{totals.successful.toLocaleString()}</span> ok
-            </span>
-            <span>
-              <span className={totals.failed > 0 ? "text-destructive tabular-nums" : "tabular-nums"}>
-                {totals.failed.toLocaleString()}
-              </span>{" "}
-              failed
-            </span>
-          </div>
+          <>
+            {!hasNoGatewayData && (
+              <div className="mt-0.5 flex gap-3 text-xs leading-4 text-muted-foreground">
+                <span>
+                  <span className="text-success tabular-nums">{totals.successful.toLocaleString()}</span> ok
+                </span>
+                <span>
+                  <span className={totals.failed > 0 ? "text-destructive tabular-nums" : "tabular-nums"}>
+                    {totals.failed.toLocaleString()}
+                  </span>{" "}
+                  failed
+                </span>
+              </div>
+            )}
+            {(hasNoGatewayData || hasMissingGatewayDays) && (
+              <p className="mt-0.5 text-xs leading-4 text-muted-foreground">
+                {hasNoGatewayData ? "No Gateway data in this range" : "Gaps show days without Gateway data"}
+              </p>
+            )}
+          </>
         )}
       </StatCell>
       <StatCell trend={<Sparkline data={daily} dataKey="tokens" color={BRAND} className="h-14" />}>
@@ -103,7 +131,11 @@ export default function UsageStatStrip({
       </StatCell>
       <StatCell>
         <div className="grid gap-3">
-          <Stat label="Avg cost / request" value={formatUsd(totals.avgCostPerRequest, 4)} pending={loading} />
+          <Stat
+            label="Avg cost / logged caller request"
+            value={totals.avgCostPerRequest === null ? null : formatUsd(totals.avgCostPerRequest, 4)}
+            pending={loading}
+          />
           <Stat
             label="Avg latency"
             value={totals.avgLatencyMs === null ? "—" : formatLatency(totals.avgLatencyMs)}
