@@ -7,10 +7,41 @@ import {
   labelForDate,
   modelColorMap,
   OTHER_COLOR,
+  overviewTotals,
   providerSpendRows,
   rollUpBreakdown,
   seriesBy,
 } from "./overviewData";
+
+describe("overviewTotals", () => {
+  it("keeps recorded zero-request days distinct from dates missing Gateway data", () => {
+    const activity = {
+      total_successful_requests: 8,
+      total_failed_requests: 1,
+      by_date: [
+        { date: "2026-10-31", successful_requests: 0, failed_requests: 0 },
+        { date: "2026-11-02", successful_requests: 8, failed_requests: 1 },
+      ],
+      by_route: [],
+    };
+    const range = { start: new Date(2026, 9, 30), end: new Date(2026, 10, 3) };
+    const totals = overviewTotals({ total_api_requests: 4, total_spend: 12 }, activity, range);
+
+    expect(totals.requests).toBe(9);
+    expect(totals.gatewayRequestTrend).toEqual([
+      { day: Date.UTC(2026, 9, 30), requests: null },
+      { day: Date.UTC(2026, 9, 31), requests: 0 },
+      { day: Date.UTC(2026, 10, 1), requests: null },
+      { day: Date.UTC(2026, 10, 2), requests: 9 },
+      { day: Date.UTC(2026, 10, 3), requests: null },
+    ]);
+    expect(totals.avgCostPerRequest).toBe(3);
+  });
+
+  it("omits average cost when spend exists without any usage requests", () => {
+    expect(overviewTotals({ total_spend: 12, total_api_requests: 0 }, null).avgCostPerRequest).toBeNull();
+  });
+});
 
 const metrics = (spend: number) => ({
   spend,

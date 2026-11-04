@@ -15317,9 +15317,9 @@
       "exportData": "Export Data",
       "gatewayByEndpoint": {
         "title": "Gateway Requests by Endpoint",
-        "subtitle": "Successful and failed requests per route",
-        "successful": "Successful",
-        "failed": "Failed"
+        "subtitle": "HTTP successes and failures per route",
+        "successful": "HTTP successful (2xx)",
+        "failed": "HTTP failed (non-2xx)"
       },
       "modelSearch": {
         "label": "Search models",
@@ -15455,8 +15455,16 @@
       "budgetHint": "of {{budget}} budget",
       "noBudget": "No budget set",
       "totalRequests": "Total Requests",
-      "successfulCount": "<count/> ok",
-      "failedCount": "<count/> failed",
+      "usageRequests": "Recorded calls",
+      "gatewayRequests": "Gateway requests",
+      "noGatewayData": "No Gateway data in this range",
+      "gatewayDataGaps": "Gaps show days without Gateway data",
+      "successfulCount": "<count/> recorded calls succeeded",
+      "failedCount": "<count/> recorded calls failed",
+      "httpSuccessfulCount": "<count/> HTTP successful (2xx)",
+      "httpFailedCount": "<count/> HTTP failed (non-2xx)",
+      "viewHttpDetails": "View HTTP details",
+      "httpDetailsNote": "HTTP 2xx can include a stream that later fails. Call failures use the final call result.",
       "totalTokens": "Total Tokens",
       "exactTokens": "{{tokens}} tokens",
       "cacheReadHint": "{{tokens}} cache read",
@@ -15471,9 +15479,10 @@
         "pricingNote": "Input includes cache reads and writes. Cached input has separate pricing, so total tokens alone cannot explain the cost.",
         "clientNote": "A client may show a different subset of tokens. Compare the same person, client and time range before comparing counts."
       },
-      "avgCostPerRequest": "Avg cost / request",
+      "avgCostPerRequest": "Avg cost / logged caller request",
       "avgLatency": "Avg latency",
-      "successRateHint": "{{rate}}% success rate"
+      "successRateHint": "{{rate}}% recorded call success rate",
+      "httpSuccessRateHint": "{{rate}}% HTTP success rate"
     },
     "overview": {
       "topVirtualKeys": "Top Virtual Keys",
@@ -15530,8 +15539,10 @@
       },
       "viewActivity": "View activity",
       "tokens": "{{tokens}} tokens",
+      "requests": "{{requests}} requests",
       "viewAgentUsage": "View {{agent}} usage",
       "empty": "No agent traffic in this range",
+      "emptyMetric": "No agent usage for this metric in this range",
       "subtitleLowCoverage": "Daily usage by agent. {{percent}}% of tokens came with a User-Agent; the rest is unattributed",
       "subtitle": "Daily usage by agent, from each request's User-Agent",
       "title": "Top agents",
@@ -15588,19 +15599,19 @@
       },
       "rateViews": {
         "total": "Total",
-        "status": "By status code"
+        "status": "By error code"
       },
       "entities": {
         "title": "Failures by identity",
-        "subtitle": "Keys, teams, users and models ranked by failed requests",
+        "subtitle": "Keys, teams, users and models ranked by failed recorded calls",
         "groupByLabel": "Group by",
-        "empty": "No {{entities}} with failed requests in this range",
-        "tableLabel": "{{entities}} ranked by failed requests",
+        "empty": "No {{entities}} with failed recorded calls in this range",
+        "tableLabel": "{{entities}} ranked by failed recorded calls",
         "columns": {
-          "requests": "Requests",
+          "requests": "Recorded calls",
           "failed": "Failed",
-          "errorRate": "Error rate",
-          "topStatus": "Top status"
+          "errorRate": "Failure rate",
+          "topStatus": "Top error code"
         }
       },
       "statusLabels": {
@@ -15625,11 +15636,11 @@
       },
       "series": {
         "other": "Other",
-        "noStatus": "No status"
+        "noStatus": "No error code"
       },
       "empty": {
-        "noRequests": "No requests in this range",
-        "noFailedRequests": "No failed requests in this range"
+        "noRequests": "No recorded calls in this range",
+        "noFailedRequests": "No failed recorded calls in this range"
       },
       "userScoped": {
         "title": "Errors are deployment-wide",
@@ -15637,34 +15648,34 @@
       },
       "failed": {
         "title": "Error activity could not be loaded",
-        "description": "The proxy did not answer the failed-request query. Reload the page to try again."
+        "description": "The proxy did not answer the recorded call failures query. Reload the page to try again."
       },
       "stats": {
-        "errorRate": "Error rate",
-        "failedOfTotal": "{{failed}} of {{total}} requests",
-        "failedRequests": "Failed requests",
-        "clientErrors": "Client errors (4xx)",
-        "serverErrors": "Server errors (5xx)",
-        "rateLimited": "Rate limited (429)",
-        "authFailures": "Auth failures (401/403)"
+        "errorRate": "Recorded call failure rate",
+        "failedOfTotal": "{{failed}} of {{total}} recorded calls",
+        "failedRequests": "Failed recorded calls",
+        "clientErrors": "4xx error codes",
+        "serverErrors": "5xx error codes",
+        "rateLimited": "Error code 429",
+        "authFailures": "Error codes 401/403"
       },
       "rateChart": {
-        "title": "Error rate over time",
-        "subtitle": "Failed requests as a share of all requests, per day",
+        "title": "Recorded call failure rate over time",
+        "subtitle": "Failed recorded calls as a share of all recorded calls, per day",
         "viewLabel": "Show"
       },
       "statusChart": {
-        "title": "Failed requests by status code",
-        "subtitle": "Per day, stacked by HTTP status",
-        "totalLabel": "failed",
-        "legendLabel": "Status codes in the chart"
+        "title": "Failed recorded calls by error code",
+        "subtitle": "Per day, stacked by error code",
+        "totalLabel": "failed recorded calls",
+        "legendLabel": "Error codes in the chart"
       },
       "statusList": {
-        "title": "By status code",
-        "subtitle": "Share of all failed requests",
-        "listLabel": "Failed requests by status code"
+        "title": "By error code",
+        "subtitle": "Share of all failed recorded calls",
+        "listLabel": "Failed recorded calls by error code"
       },
-      "inspectInLogs": "Inspect failed requests in Logs"
+      "inspectInLogs": "Inspect failed recorded calls in Logs"
     },
     "subscriptionCost": {
       "attributionRule": "A subscription fee is counted once for each monthly billing period whose start date falls inside the selected dates. Fixed costs sit beside metered spend and are never added to it, to key or team spend, or to budgets.",

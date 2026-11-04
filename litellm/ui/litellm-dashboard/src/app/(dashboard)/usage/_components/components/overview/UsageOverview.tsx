@@ -13,6 +13,7 @@ interface UsageOverviewProps {
   results: readonly DailyData[];
   totals: OverviewTotals;
   loading: boolean;
+  usageFailed: boolean;
   requestCountsPending: boolean;
   budget: number | null;
   subscriptionCosts: ReactNode;
@@ -27,6 +28,7 @@ export default function UsageOverview({
   results,
   totals,
   loading,
+  usageFailed,
   requestCountsPending,
   subscriptionCosts,
   topKeys,
@@ -43,6 +45,7 @@ export default function UsageOverview({
         results={results}
         totals={totals}
         loading={loading}
+        usageFailed={usageFailed}
         requestCountsPending={requestCountsPending}
         budget={budget}
       />

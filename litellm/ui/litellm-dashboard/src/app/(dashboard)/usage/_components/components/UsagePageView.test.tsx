@@ -12,6 +12,7 @@ import { chooseSelectOption, renderWithProviders, testQueryClient } from "@/../t
 import { toast } from "@/lib/toast";
 import { processActivityData } from "@/components/activity_metrics";
 import type { Organization } from "@/components/networking";
+import { EMPTY_DAILY_ACTIVITY_RESPONSE } from "@/components/UsagePage/dailyActivityApi";
 import type { ModelActivityData } from "@/components/UsagePage/types";
 import * as networking from "@/components/networking";
 import { STACKED_USAGE_PALETTE } from "@/components/shared/charts";
@@ -39,7 +40,6 @@ vi.mock("./ClientUsagePanel", () => ({
 // so assertions about the overview's request tiles are scoped here rather than to the whole page.
 const overview = () => within(screen.getByRole("tabpanel", { name: "Overview" }));
 
-// The Total Requests stat cell: its label, the count, and the "N ok / N failed" line beneath it.
 const totalRequestsCell = (): HTMLElement => {
   const cell = overview().getByText("Total Requests").parentElement?.parentElement;
   expect(cell).toBeTruthy();
@@ -681,17 +681,57 @@ describe("UsagePage", () => {
     // Check that key metrics are displayed
     const totalRequestElements = overview().getAllByText("Total Requests");
     expect(totalRequestElements.length).toBeGreaterThan(0);
-    await waitFor(() => {
-      expect(overview().getAllByText("424,242").length).toBeGreaterThan(0);
-    });
-    expect(overview().getAllByText("909").length).toBeGreaterThan(0);
+    await waitFor(() => expect(totalRequestsCell()).toHaveTextContent("50 recorded calls failed"));
     expect(overview().getByText("425,151")).toBeInTheDocument();
-    // Successful and failed counts now sit under Total Requests rather than in their own tiles.
     expect(totalRequestsCell()).toHaveTextContent("425,151");
-    expect(totalRequestsCell()).toHaveTextContent("424,242 ok");
-    expect(totalRequestsCell()).toHaveTextContent("909 failed");
+    expect(within(totalRequestsCell()).getByRole("button", { name: "View HTTP details" })).toBeInTheDocument();
+    expect(totalRequestsCell()).toHaveTextContent("50 recorded calls failed");
     expect(overview().queryByText("1,500")).not.toBeInTheDocument();
     expect(overview().queryByText("1,450")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { scope: "global usage", filter: "", total: "64", rising: true },
+    { scope: "a selected user", filter: "&user=user-001", total: "2,000", rising: false },
+  ])("uses the same request source for the total and trend for $scope", async ({ filter, total, rising }) => {
+    const [firstDay] = mockSpendData.results;
+    mockUserDailyActivityAggregatedCall.mockResolvedValue({
+      results: [
+        firstDay,
+        {
+          ...firstDay,
+          date: "2025-01-02",
+          metrics: { ...firstDay.metrics, api_requests: 500, successful_requests: 450 },
+        },
+      ],
+      metadata: {
+        ...mockSpendData.metadata,
+        total_api_requests: 2000,
+        total_successful_requests: 1900,
+        total_failed_requests: 100,
+      },
+    });
+    const gatewayActivity = {
+      total_successful_requests: 60,
+      total_failed_requests: 4,
+      by_date: [
+        { date: "2025-01-01", successful_requests: 10, failed_requests: 1 },
+        { date: "2025-01-02", successful_requests: 50, failed_requests: 3 },
+      ],
+      by_route: [],
+    };
+    mockGatewayDailyActivityCall.mockResolvedValue(gatewayActivity);
+    renderWithProviders(<UsagePage {...defaultProps} />, { searchParams: `?from=2025-01-01&to=2025-01-02${filter}` });
+
+    expect(await overview().findByText(total)).toBeInTheDocument();
+    const curve = totalRequestsCell().parentElement?.querySelector(".recharts-area-curve");
+    const coordinates =
+      curve
+        ?.getAttribute("d")
+        ?.match(/-?\d+(?:\.\d+)?/g)
+        ?.map(Number) ?? [];
+    expect(coordinates.length).toBeGreaterThan(2);
+    expect(Math.sign(coordinates[coordinates.length - 1] - coordinates[1])).toBe(rising ? -1 : 1);
   });
 
   it("should stop showing the previous range's totals while a new range is in flight", async () => {
@@ -773,8 +813,8 @@ describe("UsagePage", () => {
     });
     expect(overview().getByText("1,500")).toBeInTheDocument();
     expect(totalRequestsCell()).toHaveTextContent("1,500");
-    expect(totalRequestsCell()).toHaveTextContent("1,450 ok");
-    expect(totalRequestsCell()).toHaveTextContent("50 failed");
+    expect(totalRequestsCell()).toHaveTextContent("1,450 recorded calls succeeded");
+    expect(totalRequestsCell()).toHaveTextContent("50 recorded calls failed");
     expect(screen.queryByText("424,242")).not.toBeInTheDocument();
     expect(screen.queryByText("909")).not.toBeInTheDocument();
     expect(screen.queryByText("425,151")).not.toBeInTheDocument();
@@ -806,14 +846,14 @@ describe("UsagePage", () => {
     await waitFor(() => {
       expect(mockRequestErrorActivityCall).toHaveBeenCalled();
     });
-    expect(overview().queryByText(/Client errors \(4xx\)/)).not.toBeInTheDocument();
+    expect(overview().queryByText("4xx error codes")).not.toBeInTheDocument();
     expect(overview().queryByRole("button", { name: /Failed Requests/ })).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("tab", { name: "Errors" }));
     const errorsTab = within(await screen.findByTestId("usage-errors-tab"));
     expect(await errorsTab.findByText("10.0%")).toBeInTheDocument();
-    expect(errorsTab.getByRole("list", { name: "Failed requests by status code" })).toHaveTextContent("429");
-    const keys = errorsTab.getByRole("table", { name: "Virtual keys ranked by failed requests" });
+    expect(errorsTab.getByRole("list", { name: "Failed recorded calls by error code" })).toHaveTextContent("429");
+    const keys = errorsTab.getByRole("table", { name: "Virtual keys ranked by failed recorded calls" });
     expect(within(keys).getAllByRole("row")[1]).toHaveTextContent("prod-key");
   });
 
@@ -827,11 +867,7 @@ describe("UsagePage", () => {
     // Check for usage metrics cards
     const totalRequestElements = screen.getAllByText("Total Requests");
     expect(totalRequestElements.length).toBeGreaterThan(0);
-    // Successful and failed counts now sit under Total Requests rather than in their own tiles.
-    await waitFor(() => {
-      expect(totalRequestsCell()).toHaveTextContent(/\d+ ok/);
-    });
-    expect(totalRequestsCell()).toHaveTextContent(/\d+ failed/);
+    await waitFor(() => expect(totalRequestsCell()).toHaveTextContent("50 recorded calls failed"));
     const totalTokensElements = screen.getAllByText("Total Tokens");
     expect(totalTokensElements.length).toBeGreaterThan(0);
 
@@ -1375,6 +1411,22 @@ describe("UsagePage", () => {
   });
 
   describe("aggregated endpoint failure", () => {
+    it("does not show a recorded failure count until the usage aggregate succeeds", async () => {
+      mockUserDailyActivityAggregatedCall
+        .mockRejectedValueOnce(new Error("Aggregated endpoint not available"))
+        .mockResolvedValueOnce(EMPTY_DAILY_ACTIVITY_RESPONSE);
+
+      renderWithProviders(<UsagePage {...defaultProps} />);
+
+      const alert = await screen.findByRole("alert");
+      expect(within(totalRequestsCell()).getByRole("button", { name: "View HTTP details" })).toBeInTheDocument();
+      expect(totalRequestsCell()).not.toHaveTextContent("recorded calls failed");
+
+      fireEvent.click(within(alert).getByRole("button", { name: "Retry" }));
+      await waitFor(() => expect(totalRequestsCell()).toHaveTextContent("0 recorded calls failed"));
+      expect(within(totalRequestsCell()).getByRole("button", { name: "View HTTP details" })).toBeInTheDocument();
+    });
+
     it("shows the failure alert instead of retrying other routes when the aggregated call fails", async () => {
       mockUserDailyActivityAggregatedCall.mockRejectedValue(new Error("Aggregated endpoint not available"));
 

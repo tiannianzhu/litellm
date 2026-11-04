@@ -196,7 +196,7 @@ describe("entityRows", () => {
 
   it("switches source by kind and spells out an unrecorded top status", () => {
     expect(entityRows(activity(), "team")).toEqual([]);
-    expect(entityRows(activity(), "model")[0].topStatus).toBe("No status · 1");
+    expect(entityRows(activity(), "model")[0].topStatus).toBe("No error code · 1");
   });
 });
 

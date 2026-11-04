@@ -5989,8 +5989,8 @@ export interface paths {
         };
         /**
          * Get Request Error Activity
-         * @description Failed requests over time by HTTP status, and the keys, teams, users and
-         *     model groups they land on. Deployment-wide, so admin-only.
+         * @description Failed recorded calls over time by reported error code, and the keys,
+         *     teams, users and model groups they land on. Deployment-wide, so admin-only.
          */
         get: operations["get_request_error_activity_gateway_errors_activity_get"];
         put?: never;
