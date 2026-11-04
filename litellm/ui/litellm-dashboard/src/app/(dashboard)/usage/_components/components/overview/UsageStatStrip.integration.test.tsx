@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import i18n from "@/i18n/i18n";
-import type { OverviewTotals } from "./overviewData";
+import { overviewTotals, type OverviewTotals } from "./overviewData";
 import UsageStatStrip from "./UsageStatStrip";
 
 const totals: OverviewTotals = {
@@ -10,6 +10,8 @@ const totals: OverviewTotals = {
   requests: 10,
   successful: 8,
   failed: 2,
+  recordedFailed: 2,
+  gatewayRequestTrend: null,
   tokens: 9123456,
   inputTokens: 8123456,
   outputTokens: 1000000,
@@ -37,15 +39,53 @@ const defaultProps = {
   budget: null,
 };
 
+describe("UsageStatStrip request counts", () => {
+  it("shows call failures first and keeps HTTP outcomes in details with the usage fallback labelled", async () => {
+    const user = userEvent.setup();
+    const metadata = { total_api_requests: 70, total_successful_requests: 40, total_failed_requests: 30 };
+    const gateway = {
+      total_successful_requests: 8,
+      total_failed_requests: 2,
+      by_date: [{ date: "2026-11-01", successful_requests: 8, failed_requests: 2 }],
+      by_route: [],
+    };
+    const { rerender } = render(<UsageStatStrip {...defaultProps} totals={overviewTotals(metadata, gateway)} />);
+
+    expect(screen.getByText("10")).toBeInTheDocument();
+    expect(screen.getByText(/recorded calls failed/)).toHaveTextContent("30 recorded calls failed");
+    expect(screen.queryByText(/HTTP failed/)).not.toBeInTheDocument();
+    expect(screen.getByText("80.0% HTTP success rate")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "View HTTP details" }));
+    const details = await screen.findByRole("dialog", { name: "Gateway requests" });
+    expect(details).toHaveTextContent("8 HTTP successful (2xx)");
+    expect(details).toHaveTextContent("2 HTTP failed (non-2xx)");
+    expect(details).toHaveTextContent("Call failures use the final call result.");
+    await user.click(screen.getByRole("button", { name: "View HTTP details" }));
+
+    rerender(<UsageStatStrip {...defaultProps} loading totals={overviewTotals(metadata, gateway)} />);
+    expect(screen.getByRole("button", { name: "View HTTP details" })).toBeInTheDocument();
+    expect(screen.queryByText(/recorded calls failed/)).not.toBeInTheDocument();
+
+    rerender(<UsageStatStrip {...defaultProps} totals={overviewTotals(metadata, null)} />);
+
+    expect(screen.getByText("70")).toBeInTheDocument();
+    expect(screen.getByText(/recorded calls succeeded/)).toHaveTextContent("40 recorded calls succeeded");
+    expect(screen.getByText(/recorded calls failed/)).toHaveTextContent("30 recorded calls failed");
+    expect(screen.getByText("57.1% recorded call success rate")).toBeInTheDocument();
+    expect(screen.queryByText(/HTTP/)).not.toBeInTheDocument();
+  });
+});
+
 describe("UsageStatStrip token breakdown", () => {
   it("should render the existing totals and open the full token counts", async () => {
     const user = userEvent.setup();
     render(<UsageStatStrip {...defaultProps} />);
 
     expect(screen.getByText("Total Tokens")).toBeInTheDocument();
-    expect(screen.getByText("ok")).toBeInTheDocument();
-    expect(screen.getByText("failed")).toBeInTheDocument();
-    expect(screen.getByText("80.0% success rate")).toBeInTheDocument();
+    expect(screen.getByText(/recorded calls succeeded/)).toBeInTheDocument();
+    expect(screen.getByText(/recorded calls failed/)).toBeInTheDocument();
+    expect(screen.getByText("80.0% recorded call success rate")).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "View token breakdown" }));
@@ -64,8 +104,28 @@ describe("UsageStatStrip token breakdown", () => {
 
     expect(screen.getByText("Total Tokens")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "View token breakdown" })).not.toBeInTheDocument();
-    expect(screen.queryByText("ok")).not.toBeInTheDocument();
-    expect(screen.queryByText("failed")).not.toBeInTheDocument();
+    expect(screen.queryByText(/recorded calls succeeded/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/recorded calls failed/)).not.toBeInTheDocument();
+  });
+
+  it("distinguishes a range missing Gateway data from a recorded zero and labels the cost denominator", () => {
+    const day = Date.UTC(2026, 10, 1);
+    const empty = { ...totals, requests: 0, successful: 0, failed: 0, recordedFailed: 30, avgCostPerRequest: null };
+    const { rerender } = render(
+      <UsageStatStrip {...defaultProps} totals={{ ...empty, gatewayRequestTrend: [{ day, requests: null }] }} />,
+    );
+
+    expect(screen.getByText("Gateway requests")).toBeInTheDocument();
+    expect(screen.getByText("No Gateway data in this range")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View HTTP details" })).not.toBeInTheDocument();
+    expect(screen.getByText(/recorded calls failed/)).toHaveTextContent("30 recorded calls failed");
+    expect(screen.getByText("Avg cost / logged caller request")).toBeInTheDocument();
+    expect(screen.queryByText("$0.0000")).not.toBeInTheDocument();
+
+    rerender(<UsageStatStrip {...defaultProps} totals={{ ...empty, gatewayRequestTrend: [{ day, requests: 0 }] }} />);
+
+    expect(screen.queryByText("No Gateway data in this range")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View HTTP details" })).toBeInTheDocument();
   });
 });
 
@@ -95,7 +155,7 @@ describe("UsageStatStrip in another UI language", () => {
     expect(screen.getByText(asRendered(`of ${dollars.format(1500)} budget`))).toBeInTheDocument();
     expect(screen.getByText(asRendered(dollarsToFourPlaces.format(4.25)))).toBeInTheDocument();
     expect(screen.getByText(asRendered(milliseconds.format(250)))).toBeInTheDocument();
-    expect(screen.getByText(`${oneDecimal.format(80)}% success rate`)).toBeInTheDocument();
+    expect(screen.getByText(`${oneDecimal.format(80)}% recorded call success rate`)).toBeInTheDocument();
     expect(screen.getByTitle(`${german.format(9123456)} tokens`)).toBeInTheDocument();
     expect(screen.queryByText(asRendered(euros.format(42.5)))).not.toBeInTheDocument();
   });
