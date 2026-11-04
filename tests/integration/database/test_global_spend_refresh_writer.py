@@ -180,3 +180,40 @@ def test_global_spend_refresh_reports_failure_when_the_writer_refresh_errors(gat
             ("MonthlyGlobalSpend",),
             database_url=database.writer_url,
         ) == [{"relispopulated": False}]
+
+
+def test_error_activity_uses_recorded_calls_instead_of_gateway_http() -> None:
+    from psycopg.rows import dict_row
+
+    from integration._support.database import isolated_schema
+    from litellm.proxy.management_endpoints.request_error_endpoints import _DATE_ROWS, _DATE_SQL, fold_by_date
+
+    with isolated_schema() as database:
+        database.connection.execute("""
+            CREATE TABLE "LiteLLM_DailyGlobalSpend" (
+                date TEXT, successful_requests BIGINT, failed_requests BIGINT
+            );
+            CREATE TABLE "LiteLLM_DailyGatewayRequests" (
+                date TEXT, successful_requests BIGINT, failed_requests BIGINT
+            );
+            CREATE TABLE "LiteLLM_DailyGatewayFailedRequests" (
+                date TEXT, status_code INTEGER, failed_requests BIGINT
+            );
+            CREATE TABLE "LiteLLM_DailyRequestErrors" (
+                date TEXT, status_code INTEGER, failed_requests BIGINT
+            );
+            INSERT INTO "LiteLLM_DailyGlobalSpend" VALUES ('2026-04-12', 7, 3), ('2026-04-13', 50, 20);
+            INSERT INTO "LiteLLM_DailyGatewayRequests" VALUES ('2026-04-12', 99, 1);
+            INSERT INTO "LiteLLM_DailyGatewayFailedRequests" VALUES ('2026-04-12', 500, 1);
+            INSERT INTO "LiteLLM_DailyRequestErrors" VALUES
+                ('2026-04-12', 400, 2), ('2026-04-12', 500, 1), ('2026-04-13', 400, 20);
+        """)
+        with psycopg.RawCursor(database.connection, row_factory=dict_row) as cursor:
+            cursor.execute(_DATE_SQL, ('2026-04-12', '2026-04-12'))
+            rows: Final = _DATE_ROWS.validate_python(cursor.fetchall())
+        days: Final = fold_by_date(rows)
+        assert len(days) == 1
+        day: Final = days[0]
+        assert (day.date, day.successful_requests, day.failed_requests) == ('2026-04-12', 7, 3)
+        assert (day.client_errors, day.server_errors) == (2, 1)
+        assert [(code.status_code, code.failed_requests) for code in day.by_status_code] == [(400, 2), (500, 1)]

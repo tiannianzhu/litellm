@@ -1,14 +1,9 @@
 """
-FAILED REQUEST ANALYTICS
+Recorded call failures by reported error code and caller.
 
-GET /gateway/errors/activity - failure rate over time, failures by HTTP status, and
-the keys, teams, users and model groups the failures land on.
-
-Totals and the per-status time series come from the edge counters
-(LiteLLM_DailyGatewayRequests, LiteLLM_DailyGatewayFailedRequests), which count what
-the proxy answered. The caller breakdown reads the daily spend rollups for request
-volume and LiteLLM_DailyRequestErrors for the status each caller failed with.
-Deployment-wide, so admin-only.
+GET /gateway/errors/activity reads call totals from LiteLLM_DailyGlobalSpend,
+error codes from LiteLLM_DailyRequestErrors, and caller breakdowns from the
+matching daily spend rollups. Deployment-wide, so admin-only.
 """
 
 from collections.abc import Mapping, Sequence
@@ -41,12 +36,12 @@ _DATE_SQL: Final = """
     SELECT date, NULL::integer AS status_code,
         SUM(successful_requests)::bigint AS successful_requests,
         SUM(failed_requests)::bigint AS failed_requests
-    FROM "LiteLLM_DailyGatewayRequests"
+    FROM "LiteLLM_DailyGlobalSpend"
     WHERE date >= $1 AND date <= $2
     GROUP BY date
     UNION ALL
     SELECT date, status_code, 0::bigint, SUM(failed_requests)::bigint
-    FROM "LiteLLM_DailyGatewayFailedRequests"
+    FROM "LiteLLM_DailyRequestErrors"
     WHERE date >= $1 AND date <= $2
     GROUP BY date, status_code
 """
@@ -183,7 +178,7 @@ def _day_entry(date: str, rows: Sequence[_DateRow]) -> RequestErrorDailyEntry:
 
 
 def fold_by_date(rows: Sequence[_DateRow]) -> tuple[RequestErrorDailyEntry, ...]:
-    """Edge totals per day with the 4xx and 5xx share of the failures and the per-status counts."""
+    """Recorded call totals per day with failures grouped by their reported error code."""
     return tuple(_day_entry(date, rows) for date in sorted(frozenset(row.date for row in rows)))
 
 
@@ -230,8 +225,8 @@ async def get_request_error_activity(
     end_date: str | None = Query(default=None, description="End date in YYYY-MM-DD format"),
 ) -> RequestErrorActivityResponse:
     """
-    Failed requests over time by HTTP status, and the keys, teams, users and
-    model groups they land on. Deployment-wide, so admin-only.
+    Failed recorded calls over time by reported error code, and the keys,
+    teams, users and model groups they land on. Deployment-wide, so admin-only.
     """
     from litellm.proxy.proxy_server import prisma_client
 

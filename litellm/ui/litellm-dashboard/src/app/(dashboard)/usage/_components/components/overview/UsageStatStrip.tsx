@@ -19,6 +19,7 @@ interface UsageStatStripProps {
   results: readonly DailyData[];
   totals: OverviewTotals;
   loading: boolean;
+  usageFailed?: boolean;
   requestCountsPending: boolean;
   budget: number | null;
   showBudgetHint?: boolean;
@@ -30,6 +31,7 @@ export default function UsageStatStrip({
   results,
   totals,
   loading,
+  usageFailed = false,
   requestCountsPending,
   budget,
   showBudgetHint = true,
@@ -40,6 +42,36 @@ export default function UsageStatStrip({
   const budgetHint = budget
     ? t("usage.statStrip.budgetHint", { budget: t("format.usd", { val: budget }) })
     : t("usage.statStrip.noBudget");
+  const gatewayTrend = totals.gatewayRequestTrend;
+  const hasMissingGatewayDays = gatewayTrend?.some((day) => day.requests === null);
+  const hasNoGatewayData = gatewayTrend?.every((day) => day.requests === null);
+  const showRecordedFailures = !loading && !usageFailed && gatewayTrend !== null;
+  const requestSource =
+    gatewayTrend === null ? t("usage.statStrip.usageRequests") : t("usage.statStrip.gatewayRequests");
+  const requestOutcomes = (
+    <div className="flex flex-wrap gap-x-3 text-xs leading-4 text-muted-foreground">
+      <span>
+        <Trans
+          i18nKey={gatewayTrend === null ? "usage.statStrip.successfulCount" : "usage.statStrip.httpSuccessfulCount"}
+          components={{
+            count: <span className="text-success tabular-nums">{t("format.number", { val: totals.successful })}</span>,
+          }}
+        />
+      </span>
+      <span>
+        <Trans
+          i18nKey={gatewayTrend === null ? "usage.statStrip.failedCount" : "usage.statStrip.httpFailedCount"}
+          components={{
+            count: (
+              <span className={totals.failed > 0 ? "text-destructive tabular-nums" : "tabular-nums"}>
+                {t("format.number", { val: totals.failed })}
+              </span>
+            ),
+          }}
+        />
+      </span>
+    </div>
+  );
   return (
     <div className="grid grid-cols-1 overflow-hidden rounded-xl border bg-card sm:grid-cols-2 lg:grid-cols-4 lg:divide-x">
       <StatCell
@@ -55,39 +87,60 @@ export default function UsageStatStrip({
       </StatCell>
       <StatCell
         trend={
-          daily.length > 1 ? <Sparkline data={daily} dataKey="requests" color={BRAND} className="h-14" /> : undefined
+          gatewayTrend !== null || daily.length > 1 ? (
+            <Sparkline
+              data={gatewayTrend ?? daily}
+              dataKey="requests"
+              color={BRAND}
+              className="h-14"
+              calendarAxis={gatewayTrend !== null}
+            />
+          ) : undefined
         }
       >
         <Stat
           label={t("usage.statStrip.totalRequests")}
-          value={t("format.number", { val: totals.requests })}
+          value={hasNoGatewayData ? "—" : t("format.number", { val: totals.requests })}
           pending={requestCountsPending}
+          hint={requestCountsPending ? undefined : requestSource}
         />
         {!requestCountsPending && (
-          <div className="mt-0.5 flex gap-3 text-xs leading-4 text-muted-foreground">
-            <span>
-              <Trans
-                i18nKey="usage.statStrip.successfulCount"
-                components={{
-                  count: (
-                    <span className="text-success tabular-nums">{t("format.number", { val: totals.successful })}</span>
-                  ),
-                }}
-              />
-            </span>
-            <span>
-              <Trans
-                i18nKey="usage.statStrip.failedCount"
-                components={{
-                  count: (
-                    <span className={totals.failed > 0 ? "text-destructive tabular-nums" : "tabular-nums"}>
-                      {t("format.number", { val: totals.failed })}
-                    </span>
-                  ),
-                }}
-              />
-            </span>
-          </div>
+          <>
+            {showRecordedFailures && (
+              <p className="mt-0.5 text-xs leading-4 text-muted-foreground">
+                <Trans
+                  i18nKey="usage.statStrip.failedCount"
+                  components={{
+                    count: (
+                      <span className={totals.recordedFailed > 0 ? "text-destructive tabular-nums" : "tabular-nums"}>
+                        {t("format.number", { val: totals.recordedFailed })}
+                      </span>
+                    ),
+                  }}
+                />
+              </p>
+            )}
+            {!hasNoGatewayData &&
+              (gatewayTrend === null ? (
+                <div className="mt-0.5">{requestOutcomes}</div>
+              ) : (
+                <Popover>
+                  <PopoverTrigger className="mt-1 text-xs font-medium text-primary underline-offset-4 hover:underline">
+                    {t("usage.statStrip.viewHttpDetails")}
+                  </PopoverTrigger>
+                  <PopoverContent align="start" className="gap-3">
+                    <PopoverTitle>{t("usage.statStrip.gatewayRequests")}</PopoverTitle>
+                    {requestOutcomes}
+                    <p className="text-xs leading-5 text-muted-foreground">{t("usage.statStrip.httpDetailsNote")}</p>
+                  </PopoverContent>
+                </Popover>
+              ))}
+            {(hasNoGatewayData || hasMissingGatewayDays) && (
+              <p className="mt-0.5 text-xs leading-4 text-muted-foreground">
+                {hasNoGatewayData ? t("usage.statStrip.noGatewayData") : t("usage.statStrip.gatewayDataGaps")}
+              </p>
+            )}
+          </>
         )}
       </StatCell>
       <StatCell
@@ -147,7 +200,11 @@ export default function UsageStatStrip({
         <div className="grid gap-3">
           <Stat
             label={t("usage.statStrip.avgCostPerRequest")}
-            value={t("format.usd", { val: totals.avgCostPerRequest, ...FOUR_DECIMALS })}
+            value={
+              totals.avgCostPerRequest === null
+                ? null
+                : t("format.usd", { val: totals.avgCostPerRequest, ...FOUR_DECIMALS })
+            }
             pending={loading}
           />
           <Stat
@@ -157,7 +214,7 @@ export default function UsageStatStrip({
             hint={
               totals.successRate === null
                 ? undefined
-                : t("usage.statStrip.successRateHint", {
+                : t(gatewayTrend === null ? "usage.statStrip.successRateHint" : "usage.statStrip.httpSuccessRateHint", {
                     rate: t("format.number", { val: totals.successRate, ...ONE_DECIMAL }),
                   })
             }
