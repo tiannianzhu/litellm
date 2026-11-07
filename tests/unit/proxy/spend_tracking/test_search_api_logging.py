@@ -10,19 +10,91 @@ import asyncio
 import os
 import time
 from datetime import datetime
+from typing import Final
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 import litellm
 from litellm import Router
 from litellm.caching import DualCache
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.hooks.proxy_track_cost_callback import ProxyDBLogger
 from litellm.proxy.spend_tracking.spend_management_endpoints import view_spend_logs
 from litellm.proxy.utils import ProxyLogging, hash_token, update_spend
 from litellm.llms.base_llm.search.transformation import SearchResponse, SearchResult
 from tests._master_key import MASTER_KEY
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refreshed_price", (0.007, 0.0))
+async def test_search_logs_once_after_catalog_price_refresh(
+    monkeypatch: pytest.MonkeyPatch, refreshed_price: float
+) -> None:
+    from litellm.litellm_core_utils.get_model_cost_map import adopt_model_cost_map
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.llms.custom_httpx import llm_http_handler
+
+    class SearchRecorder(CustomLogger):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: asyncio.Queue[float] = asyncio.Queue()
+
+        async def async_log_success_event(
+            self,
+            kwargs: dict[str, object],
+            response_obj: object,
+            start_time: datetime,
+            end_time: datetime,
+        ) -> None:
+            if kwargs.get("call_type") != "asearch":
+                return
+            cost: Final = kwargs.get("response_cost")
+            assert isinstance(cost, (float, int))
+            self.records.put_nowait(float(cost))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"results": [{"title": "Result", "url": "https://example.com", "snippet": "Snippet"}]},
+            request=request,
+        )
+
+    router: Final = Router(
+        model_list=[],
+        search_tools=[
+            {
+                "search_tool_name": "test-search",
+                "litellm_params": {"search_provider": "deepseek", "api_key": "test-key"},
+            }
+        ],
+    )
+    handler: Final = AsyncHTTPHandler(transport=httpx.MockTransport(respond))
+    recorder: Final = SearchRecorder()
+    monkeypatch.setattr(llm_http_handler, "get_async_httpx_client", lambda **_: handler)
+    monkeypatch.setattr(litellm, "callbacks", [recorder])
+    catalog: Final = dict(litellm.model_cost)
+    entry: Final = {"litellm_provider": "deepseek", "mode": "search", "input_cost_per_query": 0.003}
+    monkeypatch.setattr(litellm, "model_cost", {**catalog})
+    try:
+        adopt_model_cost_map({**catalog, "deepseek/search": entry})
+        await router.asearch(search_tool_name="test-search", query="before refresh")
+        assert await asyncio.wait_for(recorder.records.get(), timeout=5) == pytest.approx(0.003)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        assert recorder.records.empty()
+
+        adopt_model_cost_map({**catalog, "deepseek/search": {**entry, "input_cost_per_query": refreshed_price}})
+        await router.asearch(search_tool_name="test-search", query="after refresh")
+        assert await asyncio.wait_for(recorder.records.get(), timeout=5) == pytest.approx(refreshed_price)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        assert recorder.records.empty()
+    finally:
+        adopt_model_cost_map(catalog)
+        router.retire()
+        await handler.client.aclose()
 
 
 @pytest.fixture

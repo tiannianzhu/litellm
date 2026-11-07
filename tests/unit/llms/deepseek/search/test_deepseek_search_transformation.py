@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import litellm
+from litellm.integrations.websearch_interception.transformation import WebSearchTransformation
 from litellm.llms.deepseek.search.transformation import DeepSeekSearchConfig
 
 
@@ -32,6 +33,7 @@ async def test_asearch_sends_deepseek_body_and_maps_results(monkeypatch):
                 "authority": 3,
             },
             {"title": None, "url": "https://example.com/degraded", "snippet": None, "date": None},
+            {"title": "Fallback", "url": "https://example.com/fallback", "snippet": "short fallback", "summary": ""},
         ]
     }
 
@@ -60,12 +62,12 @@ async def test_asearch_sends_deepseek_body_and_maps_results(monkeypatch):
     }
 
     assert response.object == "search"
-    assert len(response.results) == 2
+    assert len(response.results) == 3
     first: Final = response.results[0]
     assert (first.title, first.url, first.snippet) == (
         "DeepSeek V4 model released",
         "https://example.com/deepseek-v4",
-        "short snippet",
+        "long summary for the model",
     )
     assert first.date == "2026-06-01T00:00:00+00:00"
     assert first.last_updated is None
@@ -74,6 +76,11 @@ async def test_asearch_sends_deepseek_body_and_maps_results(monkeypatch):
     assert first.model_extra["rerank_score"] == 2.4
     degraded: Final = response.results[1]
     assert (degraded.title, degraded.snippet, degraded.date) == ("", "", None)
+    assert WebSearchTransformation.format_search_response(response) == (
+        "Title: DeepSeek V4 model released\nURL: https://example.com/deepseek-v4\nSnippet: long summary for the model"
+        "\n\nTitle: \nURL: https://example.com/degraded\nSnippet: "
+        "\n\nTitle: Fallback\nURL: https://example.com/fallback\nSnippet: short fallback"
+    )
 
 
 @pytest.mark.parametrize(

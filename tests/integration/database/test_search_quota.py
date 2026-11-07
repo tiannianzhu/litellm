@@ -79,10 +79,8 @@ def clock() -> Iterator[Mock]:
 
 @pytest_asyncio.fixture
 async def search_router(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[tuple[litellm.Router, Mock]]:
-    provider: Final = Mock(return_value=httpx.Response(200, json={"code": 200, "data": {"webPages": {"value": []}}}))
-    handler: Final = AsyncHTTPHandler()
-    await handler.client.aclose()
-    handler.client = httpx.AsyncClient(transport=httpx.MockTransport(provider))
+    provider: Final = Mock(return_value=httpx.Response(200, json={"results": []}))
+    handler: Final = AsyncHTTPHandler(transport=httpx.MockTransport(provider))
     monkeypatch.setattr(llm_http_handler, "get_async_httpx_client", lambda **_: handler)
     router: Final = litellm.Router(
         model_list=[],
@@ -91,7 +89,7 @@ async def search_router(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[tuple[
             {
                 "search_tool_name": "test-search",
                 "litellm_params": {
-                    "search_provider": "bocha",
+                    "search_provider": "deepseek",
                     "api_key": "test-key",
                     "api_base": "https://search.example/v1",
                 },
@@ -144,7 +142,7 @@ async def test_hook_shares_quota_across_providers_and_sessions_but_allows_chat(
     day: Final = date(2026, 9, 6)
     assert await quota.reserve("user:a", day, DAILY_LIMIT - 1)
     kwargs: Final[dict[str, object]] = {
-        "search_provider": "bocha",
+        "search_provider": "deepseek",
         "query": "first query",
         "session_id": "session-one",
         "litellm_metadata": {"user_api_key_end_user_id": "a", "user_api_key": "shared-key"},
@@ -166,7 +164,7 @@ async def test_hook_shares_quota_across_providers_and_sessions_but_allows_chat(
 @pytest.mark.asyncio
 async def test_unidentified_search_is_rejected_and_key_only_search_is_limited(database: PostgresDatabase) -> None:
     callback: Final = SearchQuota(DailySearchQuota(database))
-    kwargs: Final[dict[str, object]] = {"search_provider": "bocha", "query": "query"}
+    kwargs: Final[dict[str, object]] = {"search_provider": "deepseek", "query": "query"}
     with pytest.raises(RateLimitError, match="identified"):
         await callback.async_pre_call_deployment_hook(kwargs, CallTypes.asearch)
     await callback.async_pre_call_deployment_hook(
@@ -199,7 +197,7 @@ async def test_asearch_stops_before_provider_call_when_quota_is_exhausted(
         await asyncio.wait_for(
             litellm.asearch(
                 query="quota enforcement probe",
-                search_provider="bocha",
+                search_provider="deepseek",
                 api_key="test-key",
                 api_base="https://search.example/v1",
                 litellm_metadata={"user_api_key_end_user_id": "a"},
@@ -287,7 +285,7 @@ class UnavailableDatabase:
 async def test_database_outage_blocks_search_but_not_chat() -> None:
     callback: Final = SearchQuota(DailySearchQuota(UnavailableDatabase()))
     kwargs: Final[dict[str, object]] = {
-        "search_provider": "bocha",
+        "search_provider": "deepseek",
         "query": "query",
         "litellm_metadata": {"user_api_key_end_user_id": "a"},
     }
