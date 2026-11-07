@@ -161,7 +161,7 @@ def _to_search_result(item: Mapping[str, object]) -> SearchResult:
             **item,
             "title": _as_str(item.get("title")),
             "url": _as_str(item.get("url")),
-            "snippet": _as_str(item.get("snippet")),
+            "snippet": _as_str(item.get("summary")) or _as_str(item.get("snippet")),
             "date": date if isinstance(date, str) else None,
             "last_updated": None,
         }
