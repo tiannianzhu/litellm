@@ -363,9 +363,7 @@ def test_a_box_answer_without_confidence_reaches_the_caller_unchanged() -> None:
     ],
 )
 @pytest.mark.parametrize("confidence", ({}, {"confidence": None}))
-@pytest.mark.parametrize(
-    ("provider", "optional"), (("nace", False), ("fireworks_ai", False), ("parallel_ai", True))
-)
+@pytest.mark.parametrize(("provider", "optional"), (("nace", False), ("fireworks_ai", False), ("parallel_ai", True)))
 def test_only_a_provider_without_confidence_may_omit_it(
     question: Mapping[str, object],
     answer: Mapping[str, object],
@@ -392,8 +390,10 @@ def test_only_a_provider_without_confidence_may_omit_it(
     assert raised.value.status_code == 500
 
 
-@pytest.mark.parametrize("provider", ("nace", "openrouter", "fireworks_ai", "typesafe"))
-@pytest.mark.parametrize("legend", (["low", "high"], {"0": "low", "1": "high"}))
+@pytest.mark.parametrize("provider", ("nace", "openrouter", "fireworks_ai", "typesafe", "hosted_vllm"))
+@pytest.mark.parametrize(
+    "legend", (["low", "high"], {"0": "low", "1": "high"}, None), ids=("list", "mapping", "omitted")
+)
 def test_score_legends_preserve_labels_probabilities_and_metadata(provider: str, legend: object) -> None:
     config: Final = ProviderConfigManager.get_provider_decisions_config("drex-v2.0", LlmProviders(provider))
     assert config is not None
@@ -412,8 +412,9 @@ def test_score_legends_preserve_labels_probabilities_and_metadata(provider: str,
                 "type": "score",
                 "score": 0.75,
                 "confidence": 0.8,
-                "legend": legend,
+                **({"legend": legend} if legend is not None else {}),
                 "probabilities": {"0": 0.25, "1": 0.75},
+                "expected_level": 0.75,
             }
         },
         "usage": {"input_tokens": 20, "output_tokens": 30},
@@ -425,6 +426,7 @@ def test_score_legends_preserve_labels_probabilities_and_metadata(provider: str,
     answer: Final = response.answers[0]
     assert isinstance(answer, DecisionsIRScoreAnswer)
     assert (answer.score, answer.confidence) == (0.75, 0.8)
+    assert answer.extra == {"expected_level": 0.75}
     assert tuple((item.value, item.label, item.probability) for item in answer.probabilities) == (
         (0, "low", 0.25),
         (1, "high", 0.75),
