@@ -398,6 +398,8 @@ def _normalize_answer(value: object) -> object:
     if not isinstance(value, Mapping):
         return value
     answer: Final = _MAPPING.validate_python(value)
+    if answer.get("type") == "score" and "legend" not in answer:
+        return {**answer, "legend": {}}
     legend: Final = answer.get("legend")
     if answer.get("type") != "score" or not isinstance(legend, list):
         return answer
